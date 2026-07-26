@@ -27,10 +27,6 @@ async fn log_request(req: Request, next: middleware::Next) -> Response {
     next.run(req).await
 }
 
-async fn root() -> (StatusCode, &'static str) {
-    (StatusCode::NOT_FOUND, "Not Found")
-}
-
 #[derive(Serialize)]
 struct Health<'a> {
     version: &'a str,
