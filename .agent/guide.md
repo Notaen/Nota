@@ -50,7 +50,6 @@ crates/nota-infra/src/
 ```
 ~/.nota/
 ├── personas/          # persona workspaces (plural, not "persona"); each has solo.md, memory.md, chatlog.json
-├── plugins/           # user plugins (deno_core scanned from disk, hot-reloadable)
 ├── .logs/             # rotating logs (30-day)
 └── config.toml        # api_url, api_key, model
 ```

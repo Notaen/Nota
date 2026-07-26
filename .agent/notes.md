@@ -85,33 +85,10 @@
 - The runner returns all new messages; caller is responsible for persistence.
 
 ### Built-in tools (nota-infra)
-- `file_read`, `file_write` — sandboxed to persona workspace (`canonicalize` path checks).
-- `schedule` — stub implementation (scheduler not yet built).
-- `get_version` — returns `env!("CARGO_PKG_VERSION")`.
-- Registered via `register_builtin_tools(registry, personas_dir)`.
-
-## Plugin System (nota-runtime)
-
-### Architecture
-- `deno_core 0.408` embeds V8. Each plugin gets its own `JsRuntime` (isolate).
-- `PluginManager`: scans `~/.nota/plugins/` for `plugin.json`, loads/dispatches/reloads.
-- **Embedded plugins**: compiled in via `include_str!` + `PluginInstance::load_from_memory()`
-  — NO filesystem seeding. User plugins loaded from disk.
-- Plugin lifecycle: `register → start → stop`. Hot reload: stop → new isolate → register → start.
-
-### NotaContext
-- JS plugins access `ctx.tool.register({name, description, parameters, run})` via deno_core ops.
-- Tool metadata is stored; tool execution through JS (async op bridge) is TODO.
-- `JsRuntime` is `Send` but NOT `Sync` — cannot be shared via `Arc<dyn Tool>`. Channel-based
-  dispatch needed for cross-thread tool execution.
-
-### deno_core patterns
-- `#[op2(fast)]` for sync native functions: `state: &mut OpState`, `#[string]` for strings.
-- OpDecl is obtained by calling the op function: `op_register_tool()` returns `OpDecl`.
-- V8 function references can be passed through ops: `run_fn: v8::Local<v8::Function>`.
-  Creating `v8::Global` requires `CallbackScope::new(&run_fn)`.
-
-## LLM Client (nota-infra)
+- `file_read`, `file_write` — sandboxed to persona workspace, request permission on violation
+- `schedule` — stub implementation (scheduler not yet built)
+- `get_version` — returns `env!("CARGO_PKG_VERSION")`
+- Registered via `register_builtin_tools(registry, personas_dir)`
 
 ### OpenAiLlm
 - OpenAI-compatible chat completions API.

@@ -28,7 +28,7 @@ Then open <http://127.0.0.1:5173>. The browser talks to the Rust server on
 
 ## Architecture
 
-The Cargo workspace has four crates; dependency flow is strictly one-way
+The Cargo workspace has three crates; dependency flow is strictly one-way
 `nota-cli → nota-infra → nota-core`.
 
 | Crate | Role | Notable deps |
@@ -36,16 +36,15 @@ The Cargo workspace has four crates; dependency flow is strictly one-way
 | `nota-core` | Domain entities, port traits (`PersonaStore`, `LlmClient`, `Tool`, `ToolRegistry`, `AgentRunner`), `EventBus`, `PermissionRegistry`. Pure: no I/O, no JSON serialization. | `log`, `serde`, `async-trait`, `chrono`, `anyhow`, `tokio` (sync) |
 | `nota-infra` | Adapters: `axum` HTTP (REST + WebSocket), filesystem persona store, `OpenAiLlm`, TOML config, built-in tools. Implements the `nota-core` ports. | `nota-core`, `axum` (with `ws` feature), `reqwest`, `serde_json`, `tower-http` |
 | `nota-cli` | Binary (`nota`). Subcommands `onboard` (wizard) / `webui` (static server) / default (run server). Wires adapters and starts everything. | `nota-core`, `nota-infra`, `tracing`, `dialoguer` |
-| `nota-runtime` | Plugin system: `deno_core` V8 embedding, `PluginManager`. (Not wired into the server yet.) | `deno_core` |
 
 ### Runtime model
 
 ```
                          EventBus (mpsc broadcast)
                               │
-        ┌──────────────┬──────┴──────────────┬──────────────┐
-        ▼              ▼                     ▼              ▼
-  Persona "alice"  Persona "bob"       HTTP /ws/chat   other plugins
+        ┌──────────────┬──────┴──────────────┐
+        ▼              ▼                     ▼
+  Persona "alice"  Persona "bob"       HTTP /ws/chat
 ```
 
 - The bus carries `BusEvent { kind, sender, content, request_id, parent_request_id, target, … }`.
@@ -123,7 +122,6 @@ nota/
 │   ├── nota-core/    # domain + ports + EventBus + PermissionRegistry
 │   ├── nota-infra/   # adapters (axum HTTP/WS, persona_store, llm, config, tools)
 │   ├── nota-cli/     # binary: `nota` (server) / `nota webui` (static) / `nota onboard`
-│   └── nota-runtime/ # deno_core plugin host (work in progress)
 └── webui/            # git submodule → github.com/Notaen/Nota.Webui
 ```
 
@@ -136,7 +134,6 @@ Runtime data under the user's home directory:
 │       ├── solo.md        # system prompt
 │       ├── memory.md      # long-term memory
 │       └── chatlog.json   # recent conversation (rewritten on dream)
-├── plugins/               # user-defined deno_core plugins (future)
 ├── .logs/                 # rotating logs (30-day)
 └── config.toml            # api_url, api_key, model
 ```

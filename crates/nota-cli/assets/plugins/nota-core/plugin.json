@@ -1,7 +1,0 @@
-{
-  "name": "nota-core",
-  "version": "0.0.1",
-  "description": "Built-in Nota core tools",
-  "entry": "index.js",
-  "tools": ["get_version"]
-}

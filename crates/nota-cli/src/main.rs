@@ -27,7 +27,6 @@ use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
     http_serve, register_builtin_tools,
 };
-use nota_runtime::PluginManager;
 
 mod config_wizard;
 
@@ -57,7 +56,6 @@ fn ensure_dir(base: &Path) -> Result<()> {
     create_dir_all(base)?;
     create_dir_all(base.join(".logs"))?;
     create_dir_all(base.join("personas"))?;
-    create_dir_all(base.join("plugins"))?;
     Ok(())
 }
 
@@ -130,8 +128,6 @@ async fn run_server(
 
     let tool_registry: Arc<ToolRegistryImpl> = Arc::new(ToolRegistryImpl::new());
     register_builtin_tools(&tool_registry, base.join("personas"));
-
-    let _plugin_manager = PluginManager::new(base.join("plugins"), tool_registry.clone());
 
     let persona_names = persona_store.list_personas().await?;
     if persona_names.is_empty() {

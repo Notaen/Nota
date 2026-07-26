@@ -11,7 +11,6 @@ path = "src/main.rs"
 [dependencies]
 nota-core = { path = "../nota-core" }
 nota-infra = { path = "../nota-infra" }
-nota-runtime = { path = "../nota-runtime" }
 
 anyhow = { workspace = true }
 axum = { workspace = true, features = ["ws"] }

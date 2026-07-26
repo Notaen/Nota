@@ -27,7 +27,7 @@ REST（`/api/*`）与 Rust 服务通信。
 
 ## 架构
 
-Cargo 工作区有四个 crate；依赖方向严格单向
+Cargo 工作区有三个 crate；依赖方向严格单向
 `nota-cli → nota-infra → nota-core`。
 
 | Crate | 职责 | 关键依赖 |
@@ -35,16 +35,15 @@ Cargo 工作区有四个 crate；依赖方向严格单向
 | `nota-core` | 领域实体、端口 trait（`PersonaStore`、`LlmClient`、`Tool`、`ToolRegistry`、`AgentRunner`）、`EventBus`、`PermissionRegistry`。纯净：无 I/O，无 JSON 序列化。 | `log`、`serde`、`async-trait`、`chrono`、`anyhow`、`tokio`（sync） |
 | `nota-infra` | 适配器：`axum` HTTP（REST + WebSocket）、文件系统 persona store、`OpenAiLlm`、TOML 配置、内置工具。实现 `nota-core` 的端口。 | `nota-core`、`axum`（含 `ws` feature）、`reqwest`、`serde_json`、`tower-http` |
 | `nota-cli` | 二进制（`nota`）。子命令 `onboard`（向导）/ `webui`（静态服务）/ 默认（运行服务）。装配并启动一切。 | `nota-core`、`nota-infra`、`tracing`、`dialoguer` |
-| `nota-runtime` | 插件系统：`deno_core` V8 嵌入、`PluginManager`。（暂未接入服务器。） | `deno_core` |
 
 ### 运行时模型
 
 ```
                          EventBus (mpsc broadcast)
                               │
-        ┌──────────────┬──────┴──────────────┬──────────────┐
-        ▼              ▼                     ▼              ▼
-  Persona "alice"  Persona "bob"       HTTP /ws/chat   其他插件
+        ┌──────────────┬──────┴──────────────┐
+        ▼              ▼                     ▼
+  Persona "alice"  Persona "bob"       HTTP /ws/chat
 ```
 
 - 总线传递 `BusEvent { kind, sender, content, request_id, parent_request_id, target, … }`。
@@ -115,7 +114,6 @@ nota/
 │   ├── nota-core/    # 领域 + 端口 + EventBus + PermissionRegistry
 │   ├── nota-infra/   # 适配器（axum HTTP/WS、persona_store、llm、config、tools）
 │   ├── nota-cli/     # 二进制：`nota`（服务）/ `nota webui`（静态）/ `nota onboard`
-│   └── nota-runtime/ # deno_core 插件宿主（建设中）
 └── webui/            # git 子模块 → github.com/Notaen/Nota.Webui
 ```
 
@@ -128,7 +126,6 @@ nota/
 │       ├── solo.md        # 系统提示词
 │       ├── memory.md      # 长期记忆
 │       └── chatlog.json   # 最近对话（dream 时回看、改写）
-├── plugins/               # 用户自定义 deno_core 插件（未来）
 ├── .logs/                 # 日志（30 天轮转）
 └── config.toml            # api_url、api_key、model
 ```
