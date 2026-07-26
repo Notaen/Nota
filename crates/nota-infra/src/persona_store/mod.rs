@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use async_trait::async_trait;
 use nota_core::persona::{ChatLogEntry, PersonaStore};
+use tokio::fs;
 use tokio::sync::RwLock;
 
 const SOLO_FILENAME: &str = "solo.md";
@@ -36,7 +37,7 @@ impl FilePersonaStore {
     }
 
     async fn read_cached(&self, path: &Path) -> Result<Option<String>> {
-        match tokio::fs::metadata(path).await {
+        match fs::metadata(path).await {
             Ok(meta) => {
                 let mtime = meta.modified()?;
                 {
@@ -47,7 +48,7 @@ impl FilePersonaStore {
                         return Ok(Some(content.clone()));
                     }
                 }
-                let content = tokio::fs::read_to_string(path).await?;
+                let content = fs::read_to_string(path).await?;
                 let mut cache = ensure_cache().write().await;
                 cache.insert(path.to_path_buf(), (content.clone(), mtime));
                 Ok(Some(content))
@@ -81,23 +82,23 @@ impl PersonaStore for FilePersonaStore {
         content: &str,
     ) -> Result<()> {
         let path = self.workspace(name).join(filename);
-        tokio::fs::write(&path, content).await?;
+        fs::write(&path, content).await?;
         self.invalidate_cache(&path).await;
         Ok(())
     }
 
     async fn create_persona(&self, name: &str) -> Result<()> {
         let workspace = self.workspace(name);
-        tokio::fs::create_dir_all(&workspace).await?;
+        fs::create_dir_all(&workspace).await?;
 
         let solo_path = workspace.join(SOLO_FILENAME);
-        if !tokio::fs::try_exists(&solo_path).await.unwrap_or(false) {
-            tokio::fs::write(&solo_path, include_str!("../../assets/solo.md")).await?;
+        if !fs::try_exists(&solo_path).await.unwrap_or(false) {
+            fs::write(&solo_path, include_str!("../../assets/solo.md")).await?;
         }
 
         let memory_path = workspace.join(MEMORY_FILENAME);
-        if !tokio::fs::try_exists(&memory_path).await.unwrap_or(false) {
-            tokio::fs::write(&memory_path, "").await?;
+        if !fs::try_exists(&memory_path).await.unwrap_or(false) {
+            fs::write(&memory_path, "").await?;
         }
 
         Ok(())
@@ -105,8 +106,8 @@ impl PersonaStore for FilePersonaStore {
 
     async fn delete_persona(&self, name: &str) -> Result<()> {
         let workspace = self.workspace(name);
-        if tokio::fs::try_exists(&workspace).await.unwrap_or(false) {
-            tokio::fs::remove_dir_all(&workspace).await?;
+        if fs::try_exists(&workspace).await.unwrap_or(false) {
+            fs::remove_dir_all(&workspace).await?;
         }
         Ok(())
     }
@@ -119,7 +120,7 @@ impl PersonaStore for FilePersonaStore {
         };
         existing.extend(entries.iter().cloned());
         let json = serde_json::to_string(&existing)?;
-        tokio::fs::write(&path, &json).await?;
+        fs::write(&path, &json).await?;
         self.invalidate_cache(&path).await;
         Ok(())
     }
@@ -145,11 +146,11 @@ impl PersonaStore for FilePersonaStore {
 
     async fn list_personas(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
-        let mut entries = tokio::fs::read_dir(&self.personas_dir).await?;
+        let mut entries = fs::read_dir(&self.personas_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_dir() {
                 let solo_path = entry.path().join(SOLO_FILENAME);
-                if tokio::fs::try_exists(&solo_path).await.unwrap_or(false) {
+                if fs::try_exists(&solo_path).await.unwrap_or(false) {
                     if let Some(name) = entry.file_name().to_str() {
                         names.push(name.to_string());
                     }

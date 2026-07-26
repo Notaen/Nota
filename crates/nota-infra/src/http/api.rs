@@ -8,12 +8,13 @@ use axum::{
 };
 use nota_core::persona::{ChatLogEntry, PersonaStore};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 
 use crate::config::{Config, ConfigStore};
 
 pub struct ApiState {
     pub persona_store: Arc<dyn PersonaStore>,
-    pub config: Arc<tokio::sync::RwLock<Config>>,
+    pub config: Arc<RwLock<Config>>,
     pub config_path: std::path::PathBuf,
 }
 
@@ -161,12 +162,13 @@ fn err(status: StatusCode, msg: String) -> (StatusCode, Json<ErrorBody>) {
     (status, Json(ErrorBody { error: msg }))
 }
 
+// TODO: 这api有问题，和设计冲突。
 pub fn router() -> Router<Arc<ApiState>> {
     Router::new()
         .route("/personas", get(list_personas).post(create_persona))
-        .route("/personas/:name", delete(delete_persona).get(get_persona_info))
-        .route("/personas/:name/files/:filename", get(read_file).put(write_file))
-        .route("/personas/:name/chatlog", get(read_chatlog))
+        .route("/personas/{name}", delete(delete_persona).get(get_persona_info))
+        .route("/personas/{name}/files/{filename}", get(read_file).put(write_file))
+        .route("/personas/{name}/chatlog", get(read_chatlog))
         .route("/settings", get(get_settings).put(put_settings))
 }
 

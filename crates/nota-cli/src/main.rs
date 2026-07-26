@@ -225,16 +225,11 @@ fn locate_webui_dist() -> Result<PathBuf> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let base = dirs::home_dir().unwrap().join(".nota");
-    let _guard = if !matches!(cli.command, Some(Command::Webui)) {
-        ensure_dir(&base)?;
-        Some(init_tracing(&base)?)
-    } else {
-        None
-    };
+    ensure_dir(&base)?;
+    let _guard = init_tracing(&base)?;
 
     match cli.command {
         Some(Command::Onboard) => {
-            ensure_dir(&base)?;
             let config_store = ConfigStore::new(&base);
             let existing = config_store.load().ok().and_then(|_| config_store.get());
             let cfg = config_wizard::run_wizard(existing.as_ref())?;
@@ -252,7 +247,6 @@ async fn main() -> Result<()> {
         }
         None => {
             info!("Nota started");
-            ensure_dir(&base)?;
             let config_store = ConfigStore::new(&base);
             let cancel_token = CancellationToken::new();
             let config = load_or_create_config(&config_store)?;
