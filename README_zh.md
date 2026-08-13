@@ -44,6 +44,10 @@ group_ids = []                     # 群白名单：只回复这些群
 - 引用（回复）消息段会带上消息 id：`[回复消息ID:…]`；`get_msg` 工具可按
   该 id 取回被引用的那条消息，群历史每行也带 `消息ID:…`，persona 能把
   引用和历史对应起来。
+- **收发分离**：入站消息只送达 persona，不会再被自动回复。persona 通过
+  `reply` 工具显式回复（目标已注入，不用猜 QQ 号），因此可以决定不回复
+  （"不要回答"会真的不回）、连续发多条，或用 `send_private_msg` /
+  `send_group_msg` 主动发消息（目标必须在白名单内）。
 - **白名单机制**：persona 只对 `friend_ids` / `group_ids` 里指定的人/群回复；
   其他人发来的消息会在调用 LLM 之前直接被丢弃。列表为空 = 该类别谁也不回复。
 - `read_group_chat` 工具：persona 可以主动拉取**任意群**的最近消息（通过
@@ -52,6 +56,8 @@ group_ids = []                     # 群白名单：只回复这些群
   带上发言人的 QQ 号。
 - `get_login_info` 工具：persona 可以通过标准 OneBot API 查询 bot 自己的
   QQ 号和昵称。
+- OneBot 工具统一由 `OneBotBridge::register_tools` 注册，CLI 不直接接触
+  具体的 OneBot 工具类型。
 - OneBot 目前没有在线授权通道，工具需要授权时会自动拒绝并在聊天里提示。
 - `enabled = true` 时至少需要一个 persona（或配置有效的 `persona` 名字），
   否则服务拒绝启动。

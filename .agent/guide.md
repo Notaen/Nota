@@ -24,7 +24,7 @@ The project is a Cargo workspace; dependency flow is one-way
 |-------|------|--------------|
 | `nota-core` | Domain entities + **port traits** (`PersonaStore`, `LlmClient`, `Tool`, `ToolRegistry`, `AgentRunner`), `EventBus`, `PermissionRegistry`. No global state (DI). Logging via `log` facade only. | `log`, `serde`, `async-trait`, `chrono`, `anyhow`, `tokio` (sync) |
 | `nota-infra` | Adapters implementing the ports: `axum` HTTP (REST + WebSocket), filesystem persona store, `OpenAiLlm`, TOML config, built-in tools. | `nota-core`, `nota-onebot`, `axum`, `tokio`, `reqwest`, `serde_json` |
-| `nota-onebot` | OneBot 11 forward-WS transport: protocol types, WS client, bus bridge, OneBot tools (`read_group_chat`, `get_msg`, `get_login_info`), `OnebotConfig`. Depends only on `nota-core`. | `nota-core`, `tokio-tungstenite`, `serde_json`, `uuid` |
+| `nota-onebot` | OneBot 11 forward-WS transport: protocol types, WS client, bus bridge, OneBot tools (`reply`, `send_private_msg`, `send_group_msg`, `read_group_chat`, `get_msg`, `get_login_info`), `OnebotConfig`. Depends only on `nota-core`. | `nota-core`, `tokio-tungstenite`, `serde_json`, `uuid` |
 | `nota-cli` | Binary: tracing init + `tracing-log` bridge, config wizard, adapter wiring (DI), HTTP start, graceful shutdown. | `nota-core`, `nota-infra`, `tracing`, `dialoguer` |
 
 ### Directory Layout (source)
@@ -51,7 +51,7 @@ crates/nota-onebot/src/
 ├── client.rs               # forward-WS client (reconnect, echo correlation)
 ├── api.rs                  # OneBotApi::call (echo -> oneshot, 15s timeout)
 ├── bridge.rs               # bus bridge: allowlist filter, reply routing, permission auto-deny
-└── tools.rs                # read_group_chat / get_msg / get_login_info (OneBot APIs)
+└── tools.rs                # reply / send_* / read_group_chat / get_msg / get_login_info
 ```
 
 ### Runtime Layout

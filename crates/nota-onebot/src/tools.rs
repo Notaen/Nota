@@ -8,9 +8,10 @@ use chrono::TimeZone;
 use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams};
 
 use crate::api::OneBotApi;
+use crate::bridge::Outbound;
 use crate::types::{
     ActionRequest, GetMsgData, GroupMsgHistoryData, LoginInfoData, format_history,
-    identity,
+    identity, ReplyRoute,
 };
 
 /// Actively read recent messages of any QQ group via NapCat's
@@ -218,5 +219,294 @@ impl Tool for GetMsgTool {
             "消息 {}（{}，{}）{}: {}",
             data.message_id, kind, ts, who, text
         ))
+    }
+}
+
+/// Reply to the message that triggered this turn. The target chat comes from
+/// the turn context, so the persona never has to guess the QQ number.
+pub struct ReplyTool {
+    outbound: Outbound,
+}
+
+impl ReplyTool {
+    pub fn new(outbound: Outbound) -> Self {
+        Self { outbound }
+    }
+}
+
+#[async_trait]
+impl Tool for ReplyTool {
+    fn name(&self) -> &str {
+        "reply"
+    }
+
+    fn description(&self) -> &str {
+        "Reply to the message that triggered this turn. The target chat is already known. Call this to send a reply; do NOT call it if the user asked you not to reply."
+    }
+
+    fn parameters(&self) -> ToolParams {
+        let mut props = HashMap::new();
+        props.insert(
+            "content".to_string(),
+            PropertyDef {
+                prop_type: "string".to_string(),
+                description: "The reply text to send".to_string(),
+                r#enum: vec![],
+            },
+        );
+        ToolParams::object(props, vec!["content".to_string()])
+    }
+
+    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
+        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        let content = args["content"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
+        let target = ctx
+            .reply_target
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no reply target for this turn"))?;
+        let route = ReplyRoute::from_context(target)
+            .ok_or_else(|| anyhow::anyhow!("invalid reply target {target}"))?;
+        match route {
+            ReplyRoute::Private { user_id } => {
+                self.outbound.send_private(user_id, content)?;
+            }
+            ReplyRoute::Group { group_id } => {
+                self.outbound.send_group(group_id, content)?;
+            }
+        }
+        Ok("已发送回复".to_string())
+    }
+}
+
+/// Proactively send a private message to a friend (must be allowlisted).
+pub struct SendPrivateMsgTool {
+    outbound: Outbound,
+}
+
+impl SendPrivateMsgTool {
+    pub fn new(outbound: Outbound) -> Self {
+        Self { outbound }
+    }
+}
+
+#[async_trait]
+impl Tool for SendPrivateMsgTool {
+    fn name(&self) -> &str {
+        "send_private_msg"
+    }
+
+    fn description(&self) -> &str {
+        "Proactively send a private message to a QQ friend. The target must be in the friend allowlist."
+    }
+
+    fn parameters(&self) -> ToolParams {
+        let mut props = HashMap::new();
+        props.insert(
+            "user_id".to_string(),
+            PropertyDef {
+                prop_type: "integer".to_string(),
+                description: "QQ number of the friend to message".to_string(),
+                r#enum: vec![],
+            },
+        );
+        props.insert(
+            "content".to_string(),
+            PropertyDef {
+                prop_type: "string".to_string(),
+                description: "Message text to send".to_string(),
+                r#enum: vec![],
+            },
+        );
+        ToolParams::object(props, vec!["user_id".to_string(), "content".to_string()])
+    }
+
+    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
+        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        let user_id = args["user_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid 'user_id'"))?;
+        let content = args["content"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
+        self.outbound.send_private(user_id, content)?;
+        Ok("已发送".to_string())
+    }
+}
+
+/// Proactively send a message to a group (must be allowlisted).
+pub struct SendGroupMsgTool {
+    outbound: Outbound,
+}
+
+impl SendGroupMsgTool {
+    pub fn new(outbound: Outbound) -> Self {
+        Self { outbound }
+    }
+}
+
+#[async_trait]
+impl Tool for SendGroupMsgTool {
+    fn name(&self) -> &str {
+        "send_group_msg"
+    }
+
+    fn description(&self) -> &str {
+        "Proactively send a message to a QQ group. The target must be in the group allowlist."
+    }
+
+    fn parameters(&self) -> ToolParams {
+        let mut props = HashMap::new();
+        props.insert(
+            "group_id".to_string(),
+            PropertyDef {
+                prop_type: "integer".to_string(),
+                description: "QQ group id to message".to_string(),
+                r#enum: vec![],
+            },
+        );
+        props.insert(
+            "content".to_string(),
+            PropertyDef {
+                prop_type: "string".to_string(),
+                description: "Message text to send".to_string(),
+                r#enum: vec![],
+            },
+        );
+        ToolParams::object(props, vec!["group_id".to_string(), "content".to_string()])
+    }
+
+    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
+        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        let group_id = args["group_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid 'group_id'"))?;
+        let content = args["content"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
+        self.outbound.send_group(group_id, content)?;
+        Ok("已发送".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::OnebotConfig;
+    use crate::types::ActionParams;
+    use nota_core::bus::EventBus;
+    use nota_core::permissions::PermissionRegistry;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn tool_context(reply_target: Option<String>) -> ToolContext {
+        ToolContext {
+            persona_name: "bob".to_string(),
+            bus: Arc::new(EventBus::new()),
+            request_id: None,
+            permissions: Arc::new(PermissionRegistry::new()),
+            reply_target,
+        }
+    }
+
+    fn outbound(
+        friend_ids: Vec<i64>,
+        group_ids: Vec<i64>,
+    ) -> (Outbound, mpsc::UnboundedReceiver<ActionRequest>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let out = Outbound {
+            action_tx: tx,
+            cfg: OnebotConfig {
+                enabled: true,
+                mode: "ws".to_string(),
+                ws_url: String::new(),
+                access_token: String::new(),
+                persona: "bob".to_string(),
+                prefix: String::new(),
+                friend_ids,
+                group_ids,
+            },
+        };
+        (out, rx)
+    }
+
+    #[tokio::test]
+    async fn reply_tool_sends_to_context_target() {
+        let (out, mut rx) = outbound(vec![42], vec![]);
+        let tool = ReplyTool::new(out);
+        let ctx = tool_context(Some("private:42".to_string()));
+
+        tool.run(r#"{"content":"hello"}"#, ctx).await.unwrap();
+
+        let action = rx.recv().await.unwrap();
+        assert_eq!(action.action, "send_private_msg");
+        let ActionParams::Private { user_id, message } = action.params else {
+            panic!("expected private action");
+        };
+        assert_eq!(user_id, 42);
+        assert_eq!(message[0].data.text, "hello");
+    }
+
+    #[tokio::test]
+    async fn reply_tool_without_target_fails() {
+        let (out, _rx) = outbound(vec![42], vec![]);
+        let tool = ReplyTool::new(out);
+        let ctx = tool_context(None);
+
+        let err = tool.run(r#"{"content":"hi"}"#, ctx).await.unwrap_err();
+        assert!(err.to_string().contains("reply target"));
+    }
+
+    #[tokio::test]
+    async fn proactive_send_respects_allowlist() {
+        let (out, mut rx) = outbound(vec![42], vec![30003]);
+        let tool = SendPrivateMsgTool::new(out.clone());
+
+        // Allowlisted target sends.
+        tool.run(r#"{"user_id":42,"content":"hi"}"#, tool_context(None))
+            .await
+            .unwrap();
+        let action = rx.recv().await.unwrap();
+        assert_eq!(action.action, "send_private_msg");
+
+        // Non-allowlisted target is rejected.
+        let err = tool
+            .run(r#"{"user_id":99,"content":"hi"}"#, tool_context(None))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("allowlist"));
+
+        let group_tool = SendGroupMsgTool::new(out);
+        group_tool
+            .run(r#"{"group_id":30003,"content":"yo"}"#, tool_context(None))
+            .await
+            .unwrap();
+        let action = rx.recv().await.unwrap();
+        assert_eq!(action.action, "send_group_msg");
+    }
+
+    #[tokio::test]
+    async fn outbound_chunks_long_text() {
+        let (out, mut rx) = outbound(vec![42], vec![]);
+        out.send_private(42, &"a".repeat(9000)).unwrap();
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        let third = rx.recv().await.unwrap();
+        let ActionParams::Private { message, .. } = first.params else {
+            panic!("expected private action");
+        };
+        let ActionParams::Private { message: m2, .. } = second.params else {
+            panic!("expected private action");
+        };
+        let ActionParams::Private { message: m3, .. } = third.params else {
+            panic!("expected private action");
+        };
+        assert_eq!(message[0].data.text.len(), 4000);
+        assert_eq!(m2[0].data.text.len(), 4000);
+        assert_eq!(m3[0].data.text.len(), 1000);
     }
 }

@@ -68,6 +68,28 @@ impl BusEvent {
         }
     }
 
+    /// Like [`BusEvent::targeted_message`] but also carries the inbound
+    /// routing context (e.g. the originating OneBot chat) so the persona can
+    /// reply through the same channel.
+    pub fn targeted_message_with_context(
+        sender: String,
+        content: String,
+        request_id: Option<String>,
+        target: String,
+        context: String,
+    ) -> Self {
+        Self {
+            kind: EventKind::Message,
+            sender,
+            content,
+            timestamp: chrono::Utc::now().timestamp(),
+            context,
+            request_id,
+            parent_request_id: None,
+            target: Some(target),
+        }
+    }
+
     pub fn permission_request(
         sender: String,
         prompt: String,

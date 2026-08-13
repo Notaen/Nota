@@ -47,6 +47,12 @@ Notes:
 - A `reply` quote segment carries its message id as `[回复消息ID:…]`; the
   `get_msg` tool fetches the quoted message by that id, and group history
   lines include `消息ID:…` so the persona can correlate quotes to messages.
+- **Send/receive are separated**: inbound messages only reach the persona;
+  nothing is auto-sent back. The persona sends replies explicitly via the
+  `reply` tool (target chat is injected, no QQ number guessing), so it can
+  choose not to reply ("不要回答" is honored), send several messages in a
+  row, or proactively message someone with `send_private_msg` /
+  `send_group_msg` (targets must be allowlisted).
 - **Allowlist**: the persona only responds to `friend_ids` / `group_ids`.
   Messages from anyone else are dropped before the LLM is ever called.
   Empty list means nobody in that category is allowed.
@@ -56,6 +62,8 @@ Notes:
   speaking in the group. Each line includes the speaker's QQ number.
 - `get_login_info` tool: the persona can query the bot's own QQ number and
   nickname via the standard OneBot API.
+- OneBot tools are registered together by `OneBotBridge::register_tools`;
+  the CLI never touches individual OneBot tool types.
 - OneBot has no interactive permission channel yet, so tool permission
   requests are auto-denied with a notice to the chat.
 - `enabled = true` requires at least one persona to exist (or a valid

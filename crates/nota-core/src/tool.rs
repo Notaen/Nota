@@ -14,6 +14,10 @@ pub struct ToolContext {
     pub bus: Arc<EventBus>,
     pub request_id: Option<String>,
     pub permissions: Arc<PermissionRegistry>,
+    /// Outbound chat target for replying to the current message, encoded by
+    /// the channel (e.g. `"private:2961354039"` / `"group:30003"`). `None`
+    /// when the turn was not driven by a chat message.
+    pub reply_target: Option<String>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -21,6 +25,7 @@ impl std::fmt::Debug for ToolContext {
         f.debug_struct("ToolContext")
             .field("persona_name", &self.persona_name)
             .field("request_id", &self.request_id)
+            .field("reply_target", &self.reply_target)
             .finish()
     }
 }

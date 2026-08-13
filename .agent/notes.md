@@ -318,3 +318,18 @@ cloned as a git submodule.
   verified live against NapCat: `get_msg` / `get_friend_msg_history` return
   numeric `message_id` + `message_seq`).
 - `get_login_info` tool exposes the bot's own QQ number/nickname.
+
+### Send/receive separation (2026-08-13)
+- The bridge no longer auto-routes persona replies. Inbound OneBot events
+  only reach the persona; the encoded reply target travels in
+  `BusEvent.context` (`private:<user_id>` / `group:<group_id>`), and
+  `PersonaRuntime` copies it into the new `ToolContext.reply_target`.
+- The persona sends messages explicitly:
+  - `reply` — answers the current message using the injected target;
+    not calling it means no reply (so "不要回答" is actually honored).
+  - `send_private_msg` / `send_group_msg` — proactive messages; multiple
+    calls per turn allow consecutive messages and proactive outreach.
+- All sends go through `Outbound` (allowlist re-check + 4000-char chunking);
+  `send_reply` remains only for the auto-denied permission notices.
+- OneBot tools are registered via `OneBotBridge::register_tools`; the CLI
+  no longer names individual OneBot tool types.

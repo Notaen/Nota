@@ -358,6 +358,26 @@ pub enum ReplyRoute {
 }
 
 impl ReplyRoute {
+    /// Encode as the bus event `context` so the persona can reply via the
+    /// `reply` tool without guessing the target.
+    pub fn to_context(&self) -> String {
+        match self {
+            ReplyRoute::Private { user_id } => format!("private:{user_id}"),
+            ReplyRoute::Group { group_id } => format!("group:{group_id}"),
+        }
+    }
+
+    /// Decode a context string produced by [`ReplyRoute::to_context`].
+    pub fn from_context(context: &str) -> Option<Self> {
+        let (channel, id) = context.split_once(':')?;
+        let id: i64 = id.parse().ok()?;
+        match channel {
+            "private" => Some(ReplyRoute::Private { user_id: id }),
+            "group" => Some(ReplyRoute::Group { group_id: id }),
+            _ => None,
+        }
+    }
+
     pub fn to_action(&self, text: &str) -> ActionRequest {
         match self {
             ReplyRoute::Private { user_id } => {
@@ -595,5 +615,23 @@ mod tests {
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks.iter().map(String::len).sum::<usize>(), 9000);
         assert_eq!(chunk_text("short", 4000), vec!["short".to_string()]);
+    }
+
+    #[test]
+    fn reply_route_context_roundtrip() {
+        let private = ReplyRoute::Private { user_id: 42 };
+        assert_eq!(private.to_context(), "private:42");
+        assert!(matches!(
+            ReplyRoute::from_context(&private.to_context()),
+            Some(ReplyRoute::Private { user_id: 42 })
+        ));
+
+        let group = ReplyRoute::Group { group_id: 30003 };
+        assert_eq!(group.to_context(), "group:30003");
+        assert!(matches!(
+            ReplyRoute::from_context(&group.to_context()),
+            Some(ReplyRoute::Group { group_id: 30003 })
+        ));
+        assert!(ReplyRoute::from_context("bogus").is_none());
     }
 }

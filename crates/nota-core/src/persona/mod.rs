@@ -114,6 +114,8 @@ impl PersonaRuntime {
                 bus: bus.clone(),
                 request_id: event.request_id.clone(),
                 permissions: self.permissions.clone(),
+                reply_target: (!event.context.is_empty())
+                    .then(|| event.context.clone()),
             };
 
             let _ = self

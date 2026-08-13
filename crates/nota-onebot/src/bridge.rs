@@ -11,12 +11,17 @@ use std::sync::Arc;
 
 use nota_core::bus::{BusEvent, EventBus, EventKind};
 use nota_core::permissions::PermissionRegistry;
+use nota_core::tool::ToolRegistry;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use uuid::Uuid;
 
 use crate::config::OnebotConfig;
 use crate::api::OneBotApi;
 use crate::client::{self, PendingResponses};
+use crate::tools::{
+    GetLoginInfoTool, GetMsgTool, ReadGroupChatTool, ReplyTool, SendGroupMsgTool,
+    SendPrivateMsgTool,
+};
 use crate::types::{
     ActionRequest, MessageEvent, PostEvent, ReplyRoute, chunk_text, identity,
 };
@@ -31,6 +36,38 @@ pub struct OneBotBridge {
     cfg: OnebotConfig,
     api: OneBotApi,
     action_rx: Option<mpsc::UnboundedReceiver<ActionRequest>>,
+}
+
+/// Shared handle for persona-initiated sends (replies and proactive
+/// messages). Enforces the allowlist before any action reaches the socket.
+#[derive(Clone)]
+pub struct Outbound {
+    pub(crate) action_tx: UnboundedSender<ActionRequest>,
+    pub(crate) cfg: OnebotConfig,
+}
+
+impl Outbound {
+    pub fn send_private(&self, user_id: i64, text: &str) -> anyhow::Result<()> {
+        if !self.cfg.friend_ids.contains(&user_id) {
+            anyhow::bail!("target user {user_id} is not in the friend allowlist");
+        }
+        for chunk in chunk_text(text, MAX_MESSAGE_CHARS) {
+            self.action_tx
+                .send(ActionRequest::send_private_msg(user_id, &chunk))?;
+        }
+        Ok(())
+    }
+
+    pub fn send_group(&self, group_id: i64, text: &str) -> anyhow::Result<()> {
+        if !self.cfg.group_ids.contains(&group_id) {
+            anyhow::bail!("target group {group_id} is not in the group allowlist");
+        }
+        for chunk in chunk_text(text, MAX_MESSAGE_CHARS) {
+            self.action_tx
+                .send(ActionRequest::send_group_msg(group_id, &chunk))?;
+        }
+        Ok(())
+    }
 }
 
 impl OneBotBridge {
@@ -57,6 +94,26 @@ impl OneBotBridge {
     /// group history) before the bridge is spawned.
     pub fn api(&self) -> OneBotApi {
         self.api.clone()
+    }
+
+    /// Shared handle for persona-initiated sends (reply / proactive tools).
+    pub fn outbound(&self) -> Outbound {
+        Outbound {
+            action_tx: self.api.sender(),
+            cfg: self.cfg.clone(),
+        }
+    }
+
+    /// Register every OneBot tool into `registry`. The CLI never touches the
+    /// individual tool types.
+    pub fn register_tools(&self, registry: &dyn ToolRegistry) {
+        let outbound = self.outbound();
+        registry.register(Arc::new(ReadGroupChatTool::new(self.api())));
+        registry.register(Arc::new(GetLoginInfoTool::new(self.api())));
+        registry.register(Arc::new(GetMsgTool::new(self.api())));
+        registry.register(Arc::new(ReplyTool::new(outbound.clone())));
+        registry.register(Arc::new(SendPrivateMsgTool::new(outbound.clone())));
+        registry.register(Arc::new(SendGroupMsgTool::new(outbound)));
     }
 
     /// Run the bridge forever: forward OneBot events to the bus and route
@@ -155,13 +212,14 @@ impl OneBotBridge {
         };
 
         let request_id = Uuid::new_v4().to_string();
-        routes.insert(request_id.clone(), route);
+        routes.insert(request_id.clone(), route.clone());
         log::info!("OneBot -> {}: {text}", self.persona);
-        self.bus.send(BusEvent::targeted_message(
+        self.bus.send(BusEvent::targeted_message_with_context(
             "user".to_string(),
             text,
             Some(request_id),
             self.persona.clone(),
+            route.to_context(),
         ));
     }
 
@@ -190,14 +248,12 @@ impl OneBotBridge {
 
         match event.kind {
             EventKind::Message => {
-                let Some(rid) = event.request_id else { return };
-                let Some(route) = routes.get(&rid).cloned() else { return };
-                log::debug!(
-                    "OneBot reply for {rid} (context={})",
-                    event.context
-                );
-                self.send_reply(action_tx, &route, &event.content);
-                routes.remove(&rid);
+                // Replies are no longer auto-routed: the persona sends them
+                // explicitly via the `reply` / `send_*` tools (send/receive
+                // separation). Just drop the stale route.
+                if let Some(rid) = event.request_id {
+                    routes.remove(&rid);
+                }
             }
             EventKind::PermissionRequest => {
                 let Some(parent) = event.parent_request_id else { return };
@@ -313,6 +369,7 @@ mod tests {
         assert_eq!(event.sender, "user");
         assert_eq!(event.content, "[私聊 Alice(42) → bot(7)] hello");
         assert_eq!(event.target.as_deref(), Some("bob"));
+        assert_eq!(event.context, "private:42");
         let rid = event.request_id.clone().unwrap();
         assert!(matches!(
             routes.get(&rid),
@@ -346,6 +403,7 @@ mod tests {
 
         let event = bus_rx.recv().await.unwrap();
         assert_eq!(event.content, "[群 30003 Alice(42) → bot(7)] hi");
+        assert_eq!(event.context, "group:30003");
         let rid = event.request_id.clone().unwrap();
         assert!(matches!(
             routes.get(&rid),
@@ -433,7 +491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_reply_back_to_private_chat() {
+    async fn does_not_auto_send_persona_reply() {
         let mut bridge = test_bridge();
         bridge.cfg.friend_ids = vec![42];
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
@@ -451,14 +509,13 @@ mod tests {
             )
             .await;
 
-        let action = action_rx.recv().await.unwrap();
-        assert_eq!(action.action, "send_private_msg");
-        let ActionParams::Private { user_id, message } = action.params else {
-            panic!("expected private action");
-        };
-        assert_eq!(user_id, 42);
-        assert_eq!(message[0].data.text, "hi");
         assert!(routes.is_empty());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), action_rx.recv())
+                .await
+                .is_err(),
+            "persona replies are only sent via the reply/send tools, never auto-routed"
+        );
     }
 
     #[tokio::test]

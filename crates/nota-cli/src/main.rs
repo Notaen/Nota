@@ -23,10 +23,7 @@ use tracing_subscriber::{
 use nota_core::bus::EventBus;
 use nota_core::permissions::PermissionRegistry;
 use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
-use nota_core::tool::ToolRegistry;
-use nota_onebot::{
-    GetLoginInfoTool, GetMsgTool, OneBotBridge, OnebotConfig, ReadGroupChatTool,
-};
+use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
     http_serve, register_builtin_tools,
@@ -226,9 +223,7 @@ async fn start_onebot(
     };
 
     let bridge = OneBotBridge::new(bus, permissions, persona.clone(), cfg.clone());
-    tool_registry.register(Arc::new(ReadGroupChatTool::new(bridge.api())));
-    tool_registry.register(Arc::new(GetLoginInfoTool::new(bridge.api())));
-    tool_registry.register(Arc::new(GetMsgTool::new(bridge.api())));
+    bridge.register_tools(tool_registry.as_ref());
     tokio::spawn(async move { bridge.run().await });
     info!(
         "OneBot bridge started (mode={}, url={}, persona={persona})",
