@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::llm::{ChatMessage, LlmClient, ToolCall, ToolDef};
+use crate::llm::{LlmClient, LlmItem, MessageRole, ToolCall, ToolDef};
 use crate::tool::{ToolContext, ToolRegistry};
 
 const MAX_ITERATIONS: usize = 16;
@@ -20,11 +20,11 @@ impl AgentRunner {
     pub async fn run(
         &self,
         system: &str,
-        messages: &[ChatMessage],
+        items: &[LlmItem],
         tool_ctx: ToolContext,
-    ) -> Result<Vec<ChatMessage>> {
-        let mut conversation: Vec<ChatMessage> = messages.to_vec();
-        let mut new_messages: Vec<ChatMessage> = Vec::new();
+    ) -> Result<Vec<LlmItem>> {
+        let mut conversation: Vec<LlmItem> = items.to_vec();
+        let mut new_items: Vec<LlmItem> = Vec::new();
         let tool_defs = self.build_tool_defs();
 
         for _iteration in 0..MAX_ITERATIONS {
@@ -34,36 +34,30 @@ impl AgentRunner {
                 .await?;
 
             if !response.tool_calls.is_empty() {
-                let tc_msg = ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: Some(response.tool_calls.clone()),
-                    tool_call_id: None,
-                };
-                conversation.push(tc_msg.clone());
-                new_messages.push(tc_msg);
-
                 for tc in &response.tool_calls {
+                    // Each function_call is immediately followed by its
+                    // function_call_output: DeepSeek's Responses endpoint
+                    // rejects interleaved items between a call and its result.
+                    let call_item = LlmItem::FunctionCall(tc.clone());
+                    conversation.push(call_item.clone());
+                    new_items.push(call_item);
+
                     match self.execute_tool(tc, &tool_ctx).await {
                         Ok(result) => {
-                            let tr_msg = ChatMessage {
-                                role: "tool".to_string(),
-                                content: Some(result),
-                                tool_calls: None,
-                                tool_call_id: Some(tc.id.clone()),
+                            let output_item = LlmItem::FunctionCallOutput {
+                                call_id: tc.id.clone(),
+                                output: result,
                             };
-                            conversation.push(tr_msg.clone());
-                            new_messages.push(tr_msg);
+                            conversation.push(output_item.clone());
+                            new_items.push(output_item);
                         }
                         Err(e) => {
-                            let err_msg = ChatMessage {
-                                role: "tool".to_string(),
-                                content: Some(format!("tool error: {e}")),
-                                tool_calls: None,
-                                tool_call_id: Some(tc.id.clone()),
+                            let output_item = LlmItem::FunctionCallOutput {
+                                call_id: tc.id.clone(),
+                                output: format!("tool error: {e}"),
                             };
-                            conversation.push(err_msg.clone());
-                            new_messages.push(err_msg);
+                            conversation.push(output_item.clone());
+                            new_items.push(output_item);
                         }
                     }
                 }
@@ -71,17 +65,15 @@ impl AgentRunner {
             }
 
             if let Some(content) = response.content {
-                let assistant_msg = ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(content),
-                    tool_calls: None,
-                    tool_call_id: None,
+                let assistant_item = LlmItem::Message {
+                    role: MessageRole::Assistant,
+                    content,
                 };
-                new_messages.push(assistant_msg);
-                return Ok(new_messages);
+                new_items.push(assistant_item);
+                return Ok(new_items);
             }
 
-            return Ok(new_messages);
+            return Ok(new_items);
         }
 
         anyhow::bail!("agent loop exceeded max iterations ({MAX_ITERATIONS})");

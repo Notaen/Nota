@@ -54,10 +54,6 @@ pub struct Config {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
-    /// LLM API format: "responses" (default, OpenAI Responses API) or
-    /// "chat" (legacy Chat Completions).
-    #[serde(default = "default_api_mode")]
-    pub api_mode: String,
     /// Attach the provider's built-in `web_search` tool to Responses API
     /// requests by default (DeepSeek executes it server-side).
     #[serde(default = "default_web_search")]
@@ -65,10 +61,6 @@ pub struct Config {
     /// Optional OneBot 11 adapter configuration (`[onebot]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onebot: Option<OnebotConfig>,
-}
-
-fn default_api_mode() -> String {
-    "responses".to_string()
 }
 
 fn default_web_search() -> bool {

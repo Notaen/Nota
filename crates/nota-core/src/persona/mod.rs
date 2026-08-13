@@ -6,7 +6,7 @@ use async_trait::async_trait;
 
 use crate::agent::AgentRunner;
 use crate::history::{HistoryEntry, HistoryKind, HistoryStore};
-use crate::llm::{ChatMessage, LlmClient};
+use crate::llm::{LlmClient, LlmItem, MessageRole};
 use crate::permissions::PermissionRegistry;
 use crate::session::{InboundMessage, Session, SessionManager};
 use crate::tool::{ToolContext, ToolRegistry};
@@ -87,11 +87,9 @@ impl PersonaRuntime {
 
             let mut messages = history;
             let display = format!("{}{}", msg.prefix, msg.content);
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(display.clone()),
-                tool_calls: None,
-                tool_call_id: None,
+            messages.push(LlmItem::Message {
+                role: MessageRole::User,
+                content: display.clone(),
             });
 
             let suppress_reply = Arc::new(AtomicBool::new(false));
@@ -117,38 +115,27 @@ impl PersonaRuntime {
                 .await;
 
             match agent.run(&system, &messages, tool_ctx).await {
-                Ok(new_msgs) => {
+                Ok(new_items) => {
                     let mut history_entries: Vec<HistoryEntry> = Vec::new();
                     let now = chrono::Utc::now().timestamp();
 
-                    for msg in &new_msgs {
-                        let role_str = &msg.role;
-                        let entry_content = match &msg.content {
-                            Some(c) => c.clone(),
-                            // Tool calls are stored with their raw payload,
-                            // rendered by the llm module.
-                            None if msg
-                                .tool_calls
-                                .as_ref()
-                                .is_some_and(|t| !t.is_empty()) =>
-                            {
-                                msg.raw_json()
+                    for item in &new_items {
+                        // Tool items keep their raw call/output payload in
+                        // history, rendered by the llm module.
+                        let (kind, content) = match item {
+                            LlmItem::Message { role, content } => match role {
+                                MessageRole::User => (HistoryKind::User, content.clone()),
+                                MessageRole::Assistant => {
+                                    (HistoryKind::Assistant, content.clone())
+                                }
+                            },
+                            LlmItem::FunctionCall(_) | LlmItem::FunctionCallOutput { .. } => {
+                                (HistoryKind::Tool, item.raw_json())
                             }
-                            None => format!("[{role_str}]"),
-                        };
-                        let sender = if msg.role == "tool"
-                            || msg
-                                .tool_calls
-                                .as_ref()
-                                .is_some_and(|t| !t.is_empty())
-                        {
-                            HistoryKind::Tool
-                        } else {
-                            HistoryKind::Assistant
                         };
                         history_entries.push(HistoryEntry {
-                            kind: sender,
-                            content: entry_content.clone(),
+                            kind,
+                            content,
                             timestamp: now,
                         });
                     }
@@ -159,9 +146,10 @@ impl PersonaRuntime {
                         .await;
 
                     if !suppress_reply.load(Ordering::SeqCst)
-                        && let Some(last) = new_msgs.last()
-                        && let Some(content) = &last.content
-                        && last.role == "assistant"
+                        && let Some(LlmItem::Message {
+                            role: MessageRole::Assistant,
+                            content,
+                        }) = new_items.last()
                         && !content.trim().is_empty()
                     {
                         manager
@@ -195,26 +183,26 @@ impl PersonaRuntime {
         parts.join("\n\n")
     }
 
-    async fn load_chatlog_context(&self, session: &Session) -> Result<Vec<ChatMessage>> {
+    async fn load_chatlog_context(&self, session: &Session) -> Result<Vec<LlmItem>> {
         let entries = self.history.read_context(session).await?;
 
-        let mut messages = Vec::new();
+        let mut items = Vec::new();
         for entry in entries {
-            let role = match entry.kind {
-                // Tool results are replayed as assistant context (they carry
-                // no `tool_call_id`, which OpenAI-compatible APIs require for
-                // a real `tool` role message).
-                HistoryKind::Assistant | HistoryKind::Tool => "assistant",
-                HistoryKind::User => "user",
+            let item = match entry.kind {
+                // Tool calls/results are replayed as assistant text so the
+                // stored raw JSON payload stays in the model context.
+                HistoryKind::Assistant | HistoryKind::Tool => LlmItem::Message {
+                    role: MessageRole::Assistant,
+                    content: entry.content,
+                },
+                HistoryKind::User => LlmItem::Message {
+                    role: MessageRole::User,
+                    content: entry.content,
+                },
                 HistoryKind::ClearBoundary => continue,
             };
-            messages.push(ChatMessage {
-                role: role.to_string(),
-                content: Some(entry.content),
-                tool_calls: None,
-                tool_call_id: None,
-            });
+            items.push(item);
         }
-        Ok(messages)
+        Ok(items)
     }
 }

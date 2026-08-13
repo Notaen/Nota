@@ -72,20 +72,6 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
         .default(default_model)
         .interact_text()?;
 
-    let mode_items = vec!["Responses API (recommended)", "Chat Completions"];
-    let default_mode_idx = existing
-        .map(|cfg| match cfg.api_mode.as_str() {
-            "chat" => 1,
-            _ => 0,
-        })
-        .unwrap_or(0);
-    let mode_selection = Select::new()
-        .with_prompt("LLM API format")
-        .items(&mode_items)
-        .default(default_mode_idx)
-        .interact()?;
-    let api_mode = if mode_selection == 0 { "responses" } else { "chat" }.to_string();
-
     let web_search = Confirm::new()
         .with_prompt("Enable the built-in web_search tool (Responses API)?")
         .default(existing.map(|cfg| cfg.web_search).unwrap_or(true))
@@ -97,7 +83,6 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
         api_url,
         api_key,
         model,
-        api_mode,
         web_search,
         onebot,
     };
@@ -110,7 +95,6 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
     println!("  API URL : {}", cfg.api_url);
     println!("  API Key : {}", mask_key(&cfg.api_key));
     println!("  Model   : {}", cfg.model);
-    println!("  API Mode: {}", cfg.api_mode);
     println!("  WebSearch: {}", if cfg.web_search { "enabled" } else { "disabled" });
     match &cfg.onebot {
         Some(ob) if ob.enabled => {

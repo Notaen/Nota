@@ -91,14 +91,20 @@
 ### Built-in tools (nota-infra)
 - `file_read`, `file_write` — sandboxed to persona workspace, request permission on violation
 - `schedule` — stub implementation (scheduler not yet built)
-- `get_version` — returns `env!("CARGO_PKG_VERSION")`
+- `status` — detailed runtime info: version, platform (os/arch/family),
+  pid, uptime, and the current persona/session/request
 - Registered via `register_builtin_tools(registry, personas_dir)`
 
 ### OpenAiLlm
-- OpenAI-compatible chat completions API.
-- Request uses typed structs (`ChatMessage`, `ApiTool`), NOT raw `serde_json::Value` or `json!()`.
-- Tool role translation: `tool_call` → assistant with `tool_calls`, `tool_result` → tool with `tool_call_id`.
-- `ChatMessage` has optional `content`, `tool_calls`, `tool_call_id` fields.
+- OpenAI Responses API (`POST {api_url}/responses`) since 2026-08-13; the
+  legacy Chat Completions path was removed later the same day (see below).
+- Request uses typed structs (`ResponsesRequest`, `ResponsesInputItem`,
+  `ResponsesTool`), NOT raw `serde_json::Value` or `json!()`.
+- History roles map to Responses input items: `tool_call` → `function_call`,
+  `tool_result` → `function_call_output`.
+- Core conversation items are `LlmItem`s (`Message` / `FunctionCall` /
+  `FunctionCallOutput`) with a typed `MessageRole`; see the core refactor
+  note below.
 
 ## Hexagonal Refactor (workspace split)
 
@@ -448,13 +454,10 @@ cloned as a git submodule.
   exposed via `GET /api/personas/{name}/chatlog/{session_id}`.
 
 ### Responses API as the default LLM format (2026-08-13)
-- `Config.api_mode` selects the LLM API format: `"responses"` (default) or
-  `"chat"` (legacy Chat Completions fallback). Existing `config.toml` files
-  without the field default to `"responses"` via `#[serde(default)]`; the
-  onboard wizard now asks which format to use (defaults to Responses).
-- `OpenAiLlm` in responses mode posts to `{api_url}/responses`:
+- `OpenAiLlm` posts to `{api_url}/responses` (no mode switch; the legacy
+  Chat Completions path and `Config.api_mode` were removed, see below):
   - the system prompt becomes the top-level `instructions`;
-  - history `ChatMessage`s become `input` items (`message` with
+  - history `LlmItem`s map one-to-one onto `input` items (`message` with
     `input_text` / `output_text` parts, `function_call`,
     `function_call_output`);
   - tools use the flat Responses shape
@@ -488,3 +491,27 @@ cloned as a git submodule.
   `status: completed` with multiple `web_search_call` items and a final
   answer containing real-time news; the same flow works end-to-end through
   persona Nota over the local WS channel.
+
+### Chat Completions API removed (2026-08-13)
+- The legacy `chat/completions` fallback was deleted: `OpenAiLlm` only
+  speaks the Responses API now. `Config.api_mode`, the wizard's API format
+  prompt, and all Chat Completions wire types are gone; `OpenAiLlm::new`
+  takes `(api_url, api_key, model, web_search)`.
+- Existing `config.toml` files may still contain `api_mode`; serde ignores
+  the unknown field, so no user-side change is needed.
+
+### Core LLM types redesigned around Responses items (2026-08-13)
+- `ChatMessage` was removed from `nota-core::llm`. Conversation history is
+  now a `Vec<LlmItem>`: `Message { role: MessageRole, content }`,
+  `FunctionCall(ToolCall)`, and `FunctionCallOutput { call_id, output }`.
+  `MessageRole` is a typed enum (`User` / `Assistant`) instead of a free-form
+  string.
+- `AgentRunner` emits one `FunctionCall` item immediately followed by its
+  `FunctionCallOutput` per tool execution (interleaved pairs), so the
+  DeepSeek adjacency requirement holds by construction; the infra adapter no
+  longer re-pairs calls and outputs.
+- History storage keeps the raw JSON payload per item via `LlmItem::raw_json`
+  (still no `serde_json` in core): tool rows are replayed as assistant text
+  carrying that raw payload, so the model sees the exact call/output content.
+- `LlmClient::chat(system, items, tools)` returns `LlmResponse { content,
+  tool_calls }`.

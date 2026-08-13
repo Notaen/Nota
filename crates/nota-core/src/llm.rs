@@ -29,45 +29,56 @@ impl ToolCall {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct LlmResponse {
-    pub content: Option<String>,
-    pub tool_calls: Vec<ToolCall>,
+/// Message roles accepted by the Responses API `message` input items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    User,
+    Assistant,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ChatMessage {
-    pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+impl MessageRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        }
+    }
 }
 
-impl ChatMessage {
-    /// Raw JSON of the message (role / content / tool_calls / tool_call_id),
-    /// rendered here in the llm module so history can store the original
-    /// tool-call payload without `serde_json` in core.
+/// One unit of conversation history, mirroring the Responses API `input`
+/// item model: text messages, function calls, and function outputs.
+#[derive(Debug, Clone, Serialize)]
+pub enum LlmItem {
+    Message {
+        role: MessageRole,
+        content: String,
+    },
+    FunctionCall(ToolCall),
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+}
+
+impl LlmItem {
+    /// Render the raw JSON payload for history storage (no `serde_json` in
+    /// core): messages keep their role/content, tool items keep their
+    /// original call/output payload.
     pub fn raw_json(&self) -> String {
-        let mut s = format!(r#"{{"role":"{}""#, escape_json(&self.role));
-        if let Some(content) = &self.content {
-            s.push_str(&format!(r#","content":"{}""#, escape_json(content)));
+        match self {
+            LlmItem::Message { role, content } => format!(
+                r#"{{"role":"{}","content":"{}"}}"#,
+                role.as_str(),
+                escape_json(content)
+            ),
+            LlmItem::FunctionCall(call) => call.raw_json(),
+            LlmItem::FunctionCallOutput { call_id, output } => format!(
+                r#"{{"call_id":"{}","output":"{}"}}"#,
+                escape_json(call_id),
+                escape_json(output)
+            ),
         }
-        if let Some(calls) = &self.tool_calls {
-            let calls_json = calls
-                .iter()
-                .map(ToolCall::raw_json)
-                .collect::<Vec<_>>()
-                .join(",");
-            s.push_str(&format!(r#","tool_calls":[{calls_json}]"#));
-        }
-        if let Some(id) = &self.tool_call_id {
-            s.push_str(&format!(r#","tool_call_id":"{}""#, escape_json(id)));
-        }
-        s.push('}');
-        s
     }
 }
 
@@ -79,12 +90,18 @@ fn escape_json(s: &str) -> String {
         .replace('\t', "\\t")
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmResponse {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn chat(
         &self,
         system: &str,
-        messages: &[ChatMessage],
+        items: &[LlmItem],
         tools: &[ToolDef],
     ) -> Result<LlmResponse>;
 }
