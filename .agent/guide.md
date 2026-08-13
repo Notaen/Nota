@@ -23,7 +23,8 @@ The project is a Cargo workspace; dependency flow is one-way
 | Crate | Role | Notable deps |
 |-------|------|--------------|
 | `nota-core` | Domain entities + **port traits** (`PersonaStore`, `LlmClient`, `Tool`, `ToolRegistry`, `AgentRunner`), `EventBus`, `PermissionRegistry`. No global state (DI). Logging via `log` facade only. | `log`, `serde`, `async-trait`, `chrono`, `anyhow`, `tokio` (sync) |
-| `nota-infra` | Adapters implementing the ports: `axum` HTTP (REST + WebSocket), filesystem persona store, `OpenAiLlm`, TOML config, built-in tools. | `nota-core`, `axum`, `tokio`, `reqwest`, `serde_json`, `tower-http` |
+| `nota-infra` | Adapters implementing the ports: `axum` HTTP (REST + WebSocket), filesystem persona store, `OpenAiLlm`, TOML config, built-in tools. | `nota-core`, `nota-onebot`, `axum`, `tokio`, `reqwest`, `serde_json` |
+| `nota-onebot` | OneBot 11 forward-WS transport: protocol types, WS client, bus bridge, OneBot tools (`read_group_chat`, `get_msg`, `get_login_info`), `OnebotConfig`. Depends only on `nota-core`. | `nota-core`, `tokio-tungstenite`, `serde_json`, `uuid` |
 | `nota-cli` | Binary: tracing init + `tracing-log` bridge, config wizard, adapter wiring (DI), HTTP start, graceful shutdown. | `nota-core`, `nota-infra`, `tracing`, `dialoguer` |
 
 ### Directory Layout (source)
@@ -43,6 +44,14 @@ crates/nota-infra/src/
 ├── config/mod.rs           # Config + ConfigStore
 ├── tool/{mod,builtin}.rs   # ToolRegistryImpl + file_read/file_write/schedule/get_version
 └── http/{mod,ws,api,admin}.rs  # axum router: REST /api/*, WS /ws/chat, /admin/stop
+
+crates/nota-onebot/src/
+├── config.rs               # OnebotConfig (enabled/mode/ws_url/token/persona/prefix + allowlists)
+├── types.rs                # OneBot 11 events, segments, actions, history types
+├── client.rs               # forward-WS client (reconnect, echo correlation)
+├── api.rs                  # OneBotApi::call (echo -> oneshot, 15s timeout)
+├── bridge.rs               # bus bridge: allowlist filter, reply routing, permission auto-deny
+└── tools.rs                # read_group_chat / get_msg / get_login_info (OneBot APIs)
 ```
 
 ### Runtime Layout
@@ -65,7 +74,6 @@ crates/nota-infra/src/
 - serde, serde_json, TOML
 - log (core/infra) / tracing (cli only, via `tracing-log::LogTracer`)
 - dialoguer (cli onboarding wizard)
-- Frontend: Bun + React 19 + Vite 6 + Tailwind 3 (in separate `Nota.Webui` repo, see WebUI section)
 
 ## Event Bus
 
@@ -115,6 +123,14 @@ other's messages.
 | GET | `/ws/chat` | WebSocket: chat channel |
 | POST | `/admin/stop` | Graceful shutdown |
 
+## OneBot 11 (QQ bot)
+
+The `nota-onebot` crate implements the OneBot 11 forward-WebSocket transport
+in plain Rust (no JS runtime). Config lives in `[onebot]` inside `config.toml`;
+`nota-cli` starts the bridge when `enabled = true`. Only `mode = "ws"` is
+implemented. See README for the config example and `.agent/notes.md` for the
+design decisions (routing, permission auto-deny, chunking).
+
 ### WebSocket protocol (`/ws/chat`)
 
 Client → Server:
@@ -130,18 +146,6 @@ Server → Client:
 { "type": "error", "content": "..." }
 ```
 
-## Web UI (submodule)
-
-`webui/` is a **git submodule** tracking `https://github.com/Notaen/Nota.Webui.git`.
-It is a separate TypeScript + React + Vite project. See `AGENTS.md` "Web UI
-submodule" for clone/build instructions.
-
-`nota webui` (a subcommand of the CLI) serves `webui/dist/` on port 5173
-using `tower-http::services::ServeDir` with SPA fallback to `index.html`. The
-web UI connects to the running `nota` server (default port 2349) for WS + REST.
-
-Override the webui directory via the `NOTA_WEBUI_DIR` env var.
-
 ## Pitfalls
 
 1. **Chinese comments are authoritative** — they may be self-criticism, TODOs, or rules. If a comment describes a concrete fix, implement it and record the decision in `.agent/notes.md`. Never delete a comment without understanding why it was there.
@@ -152,3 +156,9 @@ Override the webui directory via the `NOTA_WEBUI_DIR` env var.
 6. **Async blocking** — never call `blocking_*` on a tokio RwLock from inside an async context. Use `.write().await`. `blocking_*` panics the runtime.
 7. **WebSocket ↔ bus routing** — the WS handler filters events by `request_id` in its `active_request_ids` set. Events with mismatched `request_id` are silently dropped (don't echo other clients' messages).
 8. **Default persona is gone** — `nota` no longer auto-creates any persona. Use `nota onboard` or manually create files under `~/.nota/personas/<name>/`.
+9. **NapCat forward WS drops client pings** — NapCat (and likely other OneBot
+   implementations) resets the WebSocket connection immediately when the
+   *client* sends an unsolicited Ping frame (observed: disconnect exactly at
+   the client ping interval). The OneBot WS client must NOT send pings; just
+   respond to the server's pings with pongs. Verified end-to-end with NapCat
+   on 2026-08-13.

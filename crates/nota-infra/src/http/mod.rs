@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -83,13 +82,4 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown_future)
         .await
         .unwrap();
-}
-
-pub fn find_static_dir(start: &PathBuf) -> Option<PathBuf> {
-    let candidates = [
-        start.join("webui"),
-        PathBuf::from("webui/dist"),
-        PathBuf::from("../webui/dist"),
-    ];
-    candidates.into_iter().find(|p| p.join("index.html").exists())
 }

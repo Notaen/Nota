@@ -2,6 +2,7 @@ use anyhow::Result;
 use dialoguer::{Confirm, Input, Password, Select};
 
 use nota_infra::{Config, provider_default_model, provider_ids, provider_name, provider_url};
+use nota_onebot::OnebotConfig;
 
 /// Run the interactive config wizard. If `existing` is provided, its values
 /// are used as defaults so the user can edit an existing configuration.
@@ -71,10 +72,13 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
         .default(default_model)
         .interact_text()?;
 
+    let onebot = prompt_onebot(existing)?;
+
     let cfg = Config {
         api_url,
         api_key,
         model,
+        onebot,
     };
 
     // 展示最终配置，让用户检查
@@ -85,6 +89,12 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
     println!("  API URL : {}", cfg.api_url);
     println!("  API Key : {}", mask_key(&cfg.api_key));
     println!("  Model   : {}", cfg.model);
+    match &cfg.onebot {
+        Some(ob) if ob.enabled => {
+            println!("  OneBot  : enabled ({} -> {})", ob.mode, ob.ws_url);
+        }
+        _ => println!("  OneBot  : disabled"),
+    }
     println!("══════════════════════════════════════");
     println!();
 
@@ -98,6 +108,89 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
     }
 
     Ok(cfg)
+}
+
+/// Ask whether to enable OneBot 11 and collect its connection settings.
+/// Returns `None` when the user opts out.
+fn prompt_onebot(existing: Option<&Config>) -> Result<Option<OnebotConfig>> {
+    println!();
+    let enable = Confirm::new()
+        .with_prompt("Enable OneBot 11 (QQ bot) support?")
+        .default(
+            existing
+                .and_then(|c| c.onebot.as_ref())
+                .map(|ob| ob.enabled)
+                .unwrap_or(false),
+        )
+        .interact()?;
+
+    if !enable {
+        return Ok(None);
+    }
+
+    let defaults = existing.and_then(|c| c.onebot.clone());
+    let default_url = defaults
+        .as_ref()
+        .map(|ob| ob.ws_url.clone())
+        .unwrap_or_else(|| "ws://127.0.0.1:3001".to_string());
+    let ws_url: String = Input::new()
+        .with_prompt("OneBot WebSocket URL (forward, e.g. ws://127.0.0.1:3001)")
+        .default(default_url)
+        .interact_text()?;
+
+    let access_token: String = Password::new()
+        .with_prompt("OneBot access token (leave empty if none)")
+        .allow_empty_password(true)
+        .interact()?;
+
+    let default_persona = defaults
+        .as_ref()
+        .map(|ob| ob.persona.clone())
+        .unwrap_or_default();
+    let persona: String = Input::new()
+        .with_prompt("Persona name to handle OneBot messages (empty = first persona)")
+        .default(default_persona)
+        .allow_empty(true)
+        .interact_text()?;
+
+    let default_friends = defaults
+        .as_ref()
+        .map(|ob| ob.friend_ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let friends: String = Input::new()
+        .with_prompt("Allowed friend QQ ids, comma separated (empty = none)")
+        .default(default_friends)
+        .allow_empty(true)
+        .interact_text()?;
+
+    let default_groups = defaults
+        .as_ref()
+        .map(|ob| ob.group_ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
+    let groups: String = Input::new()
+        .with_prompt("Allowed group ids, comma separated (empty = none)")
+        .default(default_groups)
+        .allow_empty(true)
+        .interact_text()?;
+
+    Ok(Some(OnebotConfig {
+        enabled: true,
+        mode: "ws".to_string(),
+        ws_url,
+        access_token,
+        persona,
+        prefix: String::new(),
+        friend_ids: parse_id_list(&friends),
+        group_ids: parse_id_list(&groups),
+    }))
+}
+
+/// Parse a comma/whitespace separated list of numeric ids.
+fn parse_id_list(input: &str) -> Vec<i64> {
+    input
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter_map(|s| s.trim().parse::<i64>().ok())
+        .collect()
 }
 
 fn prompt_for_key(prompt: &str, existing: Option<String>) -> Result<String> {

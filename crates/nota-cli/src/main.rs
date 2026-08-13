@@ -1,6 +1,6 @@
 use std::fs::create_dir_all;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -23,6 +23,10 @@ use tracing_subscriber::{
 use nota_core::bus::EventBus;
 use nota_core::permissions::PermissionRegistry;
 use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
+use nota_core::tool::ToolRegistry;
+use nota_onebot::{
+    GetLoginInfoTool, GetMsgTool, OneBotBridge, OnebotConfig, ReadGroupChatTool,
+};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
     http_serve, register_builtin_tools,
@@ -40,7 +44,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Onboard,
-    Webui,
 }
 
 #[derive(Clone)]
@@ -153,6 +156,19 @@ async fn run_server(
         info!("Persona '{}' started", name);
     }
 
+    if let Some(onebot) = &config.onebot
+        && onebot.enabled
+    {
+        start_onebot(
+            bus.clone(),
+            permissions.clone(),
+            persona_store.clone(),
+            tool_registry.clone(),
+            onebot,
+        )
+        .await?;
+    }
+
     let config_path = base.join("config.toml");
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
@@ -177,48 +193,48 @@ async fn run_server(
     Ok(())
 }
 
-async fn run_webui(cancel_token: CancellationToken) -> Result<()> {
-    let dir = locate_webui_dist()?;
-    info!("Serving web UI from {}", dir.display());
+/// Wire the OneBot 11 adapter: resolve the target persona and start the bridge.
+async fn start_onebot(
+    bus: Arc<EventBus>,
+    permissions: Arc<PermissionRegistry>,
+    persona_store: Arc<dyn PersonaStore>,
+    tool_registry: Arc<ToolRegistryImpl>,
+    cfg: &OnebotConfig,
+) -> Result<()> {
+    if cfg.mode != "ws" {
+        anyhow::bail!(
+            "onebot.mode = '{}' is not supported yet; only 'ws' (forward WebSocket) is implemented",
+            cfg.mode
+        );
+    }
 
-    let addr: SocketAddr = "127.0.0.1:5173".parse()?;
-    let listener = TcpListener::bind(addr).await?;
-
-    let serve_dir = tower_http::services::ServeDir::new(&dir)
-        .precompressed_gzip()
-        .fallback(tower_http::services::ServeFile::new(dir.join("index.html")));
-
-    let app = axum::Router::new().fallback_service(serve_dir);
-    info!("Web UI available at http://{}", addr);
-
-    let shutdown = async move {
-        cancel_token.cancelled().await;
+    let personas = persona_store.list_personas().await?;
+    let persona = if cfg.persona.is_empty() {
+        personas.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "OneBot is enabled but no persona exists; create one or set [onebot].persona"
+            )
+        })?
+    } else {
+        if !personas.iter().any(|p| p == &cfg.persona) {
+            anyhow::bail!(
+                "onebot.persona '{}' does not exist under ~/.nota/personas",
+                cfg.persona
+            );
+        }
+        cfg.persona.clone()
     };
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .ok();
-
+    let bridge = OneBotBridge::new(bus, permissions, persona.clone(), cfg.clone());
+    tool_registry.register(Arc::new(ReadGroupChatTool::new(bridge.api())));
+    tool_registry.register(Arc::new(GetLoginInfoTool::new(bridge.api())));
+    tool_registry.register(Arc::new(GetMsgTool::new(bridge.api())));
+    tokio::spawn(async move { bridge.run().await });
+    info!(
+        "OneBot bridge started (mode={}, url={}, persona={persona})",
+        cfg.mode, cfg.ws_url
+    );
     Ok(())
-}
-
-fn locate_webui_dist() -> Result<PathBuf> {
-    if let Ok(env) = std::env::var("NOTA_WEBUI_DIR") {
-        let p = PathBuf::from(env);
-        if p.join("index.html").exists() {
-            return Ok(p);
-        }
-    }
-    let candidates = [
-        PathBuf::from("webui/dist"),
-        PathBuf::from("../webui/dist"),
-        PathBuf::from("../../webui/dist"),
-    ];
-    candidates
-        .into_iter()
-        .find(|p| p.join("index.html").exists())
-        .ok_or_else(|| anyhow::anyhow!("could not locate webui/dist. Run `bun run build` in webui/ first."))
 }
 
 #[tokio::main]
@@ -240,10 +256,6 @@ async fn main() -> Result<()> {
             let persona_name = config_wizard::prompt_create_persona()?;
             persona_store.create_persona(&persona_name).await?;
             info!("Persona '{}' created", persona_name);
-        }
-        Some(Command::Webui) => {
-            let cancel_token = CancellationToken::new();
-            run_webui(cancel_token).await?;
         }
         None => {
             info!("Nota started");

@@ -11,10 +11,10 @@ pub mod persona_store;
 pub mod tool;
 
 pub use config::{
-    Config, ConfigStore,
+    Config, ConfigStore, OnebotConfig,
     provider_default_model, provider_ids, provider_name, provider_url,
 };
-pub use http::{api::ApiState, find_static_dir, serve as http_serve, AppContext};
+pub use http::{api::ApiState, serve as http_serve, AppContext};
 pub use llm::OpenAiLlm;
 pub use persona_store::FilePersonaStore;
 pub use tool::{ToolRegistryImpl, builtin::register_builtin_tools};

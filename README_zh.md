@@ -13,28 +13,60 @@ cargo run -p nota-cli -- onboard   # 配置 API + 创建首个 persona
 cargo run -p nota-cli              # 启动服务（REST + WS，端口 :2349）
 ```
 
-Web UI 在独立仓库（[`Notaen/Nota.Webui`](https://github.com/Notaen/Nota.Webui)），
-作为 git 子模块引入。构建一次后通过 CLI serve：
+## OneBot 11（QQ 机器人）
 
-```sh
-git submodule update --init
-cd webui && bun install && bun run build && cd ..
-cargo run -p nota-cli -- webui     # 在 :5173 serve webui/dist/
+OneBot 11 支持是独立 Rust crate `nota-onebot`（不再用 JS/插件运行时）。
+目前支持**正向 WebSocket**：`nota` 主动连接 OneBot 实现（NapCat /
+LLOneBot / Lagrange，默认 `ws://127.0.0.1:3001`），把收到的私聊/群聊消息
+交给 persona，再把 persona 的回复发回原会话。
+
+在 `~/.nota/config.toml` 里配置（或在 `nota onboard` 向导里按提示填写）：
+
+```toml
+[onebot]
+enabled = true
+mode = "ws"                        # 目前仅支持正向 WebSocket
+ws_url = "ws://127.0.0.1:3001"     # 你的 OneBot 实现的 WS 服务地址
+access_token = ""                  # 可选
+persona = "default"                # 处理消息的 persona；留空则用第一个
+prefix = ""                        # 可选：只响应以此开头的内容，并去掉前缀
+friend_ids = [123456789]           # 好友白名单：只回复这些好友的私聊
+group_ids = []                     # 群白名单：只回复这些群
 ```
 
-然后打开 <http://127.0.0.1:5173>。浏览器通过 WebSocket（`/ws/chat`）和
-REST（`/api/*`）与 Rust 服务通信。
+注意：
+
+- 非文本消息段（图片、表情、@ 等）会先转成占位符再交给 LLM；回复以纯文本
+  发送，超过 4000 字符会自动分段。
+- 入站消息会带上会话身份头和 QQ 号（`[私聊 昵称(QQ) → bot(QQ)]` /
+  `[群 群号 昵称(QQ) → bot(QQ)]`），persona 始终知道是谁在说话（发送者
+  QQ、群号、bot 自己的 QQ）。
+- 引用（回复）消息段会带上消息 id：`[回复消息ID:…]`；`get_msg` 工具可按
+  该 id 取回被引用的那条消息，群历史每行也带 `消息ID:…`，persona 能把
+  引用和历史对应起来。
+- **白名单机制**：persona 只对 `friend_ids` / `group_ids` 里指定的人/群回复；
+  其他人发来的消息会在调用 LLM 之前直接被丢弃。列表为空 = 该类别谁也不回复。
+- `read_group_chat` 工具：persona 可以主动拉取**任意群**的最近消息（通过
+  NapCat 的 `get_group_msg_history` 扩展接口，走同一条 WS），例如你问它
+  “群 123456 最近聊了什么”，它读完后回答你，但不会在群里发言。每行都会
+  带上发言人的 QQ 号。
+- `get_login_info` 工具：persona 可以通过标准 OneBot API 查询 bot 自己的
+  QQ 号和昵称。
+- OneBot 目前没有在线授权通道，工具需要授权时会自动拒绝并在聊天里提示。
+- `enabled = true` 时至少需要一个 persona（或配置有效的 `persona` 名字），
+  否则服务拒绝启动。
 
 ## 架构
 
-Cargo 工作区有三个 crate；依赖方向严格单向
+Cargo 工作区有四个 crate；依赖方向严格单向
 `nota-cli → nota-infra → nota-core`。
 
 | Crate | 职责 | 关键依赖 |
 |-------|------|---------|
 | `nota-core` | 领域实体、端口 trait（`PersonaStore`、`LlmClient`、`Tool`、`ToolRegistry`、`AgentRunner`）、`EventBus`、`PermissionRegistry`。纯净：无 I/O，无 JSON 序列化。 | `log`、`serde`、`async-trait`、`chrono`、`anyhow`、`tokio`（sync） |
-| `nota-infra` | 适配器：`axum` HTTP（REST + WebSocket）、文件系统 persona store、`OpenAiLlm`、TOML 配置、内置工具。实现 `nota-core` 的端口。 | `nota-core`、`axum`（含 `ws` feature）、`reqwest`、`serde_json`、`tower-http` |
-| `nota-cli` | 二进制（`nota`）。子命令 `onboard`（向导）/ `webui`（静态服务）/ 默认（运行服务）。装配并启动一切。 | `nota-core`、`nota-infra`、`tracing`、`dialoguer` |
+| `nota-infra` | 适配器：`axum` HTTP（REST + WebSocket）、文件系统 persona store、`OpenAiLlm`、TOML 配置、内置工具。实现 `nota-core` 的端口。 | `nota-core`、`nota-onebot`、`axum`（含 `ws` feature）、`reqwest`、`serde_json` |
+| `nota-onebot` | OneBot 11 传输适配器（正向 WebSocket）：协议类型、WS 客户端、总线桥接、`read_group_chat` 工具。不属于 core/infra。 | `nota-core`、`tokio-tungstenite`、`serde_json`、`uuid` |
+| `nota-cli` | 二进制（`nota`）。子命令 `onboard`（向导）/ 默认（运行服务）。装配并启动一切。 | `nota-core`、`nota-infra`、`nota-onebot`、`tracing`、`dialoguer` |
 
 ### 运行时模型
 
@@ -73,8 +105,6 @@ WS handler 直接调 `PermissionRegistry::resolve(id, approved)`（不再走总�
 Rust 2024 · Axum 0.8（REST + WebSocket）· Tokio · reqwest · serde ·
 serde_json · TOML · `log`（core/infra）/ `tracing`（cli）· dialoguer（向导）
 
-前端：Bun + React 19 + Vite 6 + Tailwind 3（位于 `Nota.Webui`）
-
 ## 接口
 
 REST：
@@ -110,11 +140,11 @@ WebSocket（`/ws/chat`）：
 
 ```
 nota/
-├── crates/
-│   ├── nota-core/    # 领域 + 端口 + EventBus + PermissionRegistry
-│   ├── nota-infra/   # 适配器（axum HTTP/WS、persona_store、llm、config、tools）
-│   ├── nota-cli/     # 二进制：`nota`（服务）/ `nota webui`（静态）/ `nota onboard`
-└── webui/            # git 子模块 → github.com/Notaen/Nota.Webui
+└── crates/
+    ├── nota-core/    # 领域 + 端口 + EventBus + PermissionRegistry
+    ├── nota-infra/   # 适配器（axum HTTP/WS、persona_store、llm、config、tools）
+    ├── nota-onebot/  # OneBot 11 正向 WS 传输 + read_group_chat 工具
+    └── nota-cli/     # 二进制：`nota`（服务）/ `nota onboard`
 ```
 
 运行时数据位于用户主目录：

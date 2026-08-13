@@ -118,29 +118,29 @@ async fn forward_event(
 ) {
     match event.kind {
         EventKind::Message => {
-            if let Some(ref rid) = event.request_id {
-                if active.contains(rid) {
-                    let payload = serde_json::to_string(&ServerEvent::Message {
-                        content: event.content,
-                        request_id: rid.clone(),
-                    })
-                    .unwrap();
-                    let _ = socket.send(Message::Text(payload.into())).await;
-                    active.remove(rid);
-                }
+            if let Some(ref rid) = event.request_id
+                && active.contains(rid)
+            {
+                let payload = serde_json::to_string(&ServerEvent::Message {
+                    content: event.content,
+                    request_id: rid.clone(),
+                })
+                .unwrap();
+                let _ = socket.send(Message::Text(payload.into())).await;
+                active.remove(rid);
             }
         }
         EventKind::PermissionRequest => {
-            if let Some(ref parent) = event.parent_request_id {
-                if active.contains(parent) {
-                    let payload = serde_json::to_string(&ServerEvent::PermissionNeeded {
-                        permission_id: event.request_id.unwrap_or_default(),
-                        prompt: event.content,
-                        request_id: parent.clone(),
-                    })
-                    .unwrap();
-                    let _ = socket.send(Message::Text(payload.into())).await;
-                }
+            if let Some(ref parent) = event.parent_request_id
+                && active.contains(parent)
+            {
+                let payload = serde_json::to_string(&ServerEvent::PermissionNeeded {
+                    permission_id: event.request_id.unwrap_or_default(),
+                    prompt: event.content,
+                    request_id: parent.clone(),
+                })
+                .unwrap();
+                let _ = socket.send(Message::Text(payload.into())).await;
             }
         }
     }

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::sync::RwLock;
+use std::sync::{LazyLock, RwLock};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+pub use nota_onebot::OnebotConfig;
 
 // ── 内置 provider 数据（编译时嵌入，仅 wizard 使用） ─────────────────
 
@@ -54,6 +54,9 @@ pub struct Config {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
+    /// Optional OneBot 11 adapter configuration (`[onebot]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onebot: Option<OnebotConfig>,
 }
 
 /// Owns the loaded [`Config`] and the path it is read from / written to.

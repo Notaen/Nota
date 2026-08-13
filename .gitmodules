@@ -1,4 +1,0 @@
-[submodule "webui"]
-	path = webui
-	url = https://github.com/Notaen/Nota.Webui.git
-	branch = main

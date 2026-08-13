@@ -88,10 +88,10 @@ impl PersonaRuntime {
             if event.sender == name {
                 continue;
             }
-            if let Some(ref t) = event.target {
-                if t != &name {
-                    continue;
-                }
+            if let Some(ref t) = event.target
+                && t != &name
+            {
+                continue;
             }
 
             let system = self.build_system_prompt().await;
@@ -157,10 +157,11 @@ impl PersonaRuntime {
                         && let Some(content) = &last.content
                         && last.role == "assistant"
                     {
-                        bus.send(BusEvent::message(
+                        bus.send(BusEvent::message_with_context(
                             name.clone(),
                             content.clone(),
                             event.request_id.clone(),
+                            event.context.clone(),
                         ));
                     }
                 }

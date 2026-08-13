@@ -26,12 +26,24 @@ impl BusEvent {
         content: String,
         request_id: Option<String>,
     ) -> Self {
+        Self::message_with_context(sender, content, request_id, String::new())
+    }
+
+    /// Same as [`BusEvent::message`] but carries the inbound routing context
+    /// (e.g. the chat identifier of the originating channel) so the reply can
+    /// be delivered back through the same adapter.
+    pub fn message_with_context(
+        sender: String,
+        content: String,
+        request_id: Option<String>,
+        context: String,
+    ) -> Self {
         Self {
             kind: EventKind::Message,
             sender,
             content,
             timestamp: chrono::Utc::now().timestamp(),
-            context: String::new(),
+            context,
             request_id,
             parent_request_id: None,
             target: None,

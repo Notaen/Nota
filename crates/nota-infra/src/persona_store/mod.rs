@@ -150,10 +150,10 @@ impl PersonaStore for FilePersonaStore {
         while let Some(entry) = entries.next_entry().await? {
             if entry.file_type().await?.is_dir() {
                 let solo_path = entry.path().join(SOLO_FILENAME);
-                if fs::try_exists(&solo_path).await.unwrap_or(false) {
-                    if let Some(name) = entry.file_name().to_str() {
-                        names.push(name.to_string());
-                    }
+                if fs::try_exists(&solo_path).await.unwrap_or(false)
+                    && let Some(name) = entry.file_name().to_str()
+                {
+                    names.push(name.to_string());
                 }
             }
         }
