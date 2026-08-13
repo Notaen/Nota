@@ -54,9 +54,17 @@ pub struct Config {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
+    /// LLM API format: "responses" (default, OpenAI Responses API) or
+    /// "chat" (legacy Chat Completions).
+    #[serde(default = "default_api_mode")]
+    pub api_mode: String,
     /// Optional OneBot 11 adapter configuration (`[onebot]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onebot: Option<OnebotConfig>,
+}
+
+fn default_api_mode() -> String {
+    "responses".to_string()
 }
 
 /// Owns the loaded [`Config`] and the path it is read from / written to.

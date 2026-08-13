@@ -446,3 +446,30 @@ cloned as a git submodule.
 - The LLM context query returns only rows after the last clear boundary
   (`id > MAX(id WHERE kind = 0)`); raw history (boundaries included) is
   exposed via `GET /api/personas/{name}/chatlog/{session_id}`.
+
+### Responses API as the default LLM format (2026-08-13)
+- `Config.api_mode` selects the LLM API format: `"responses"` (default) or
+  `"chat"` (legacy Chat Completions fallback). Existing `config.toml` files
+  without the field default to `"responses"` via `#[serde(default)]`; the
+  onboard wizard now asks which format to use (defaults to Responses).
+- `OpenAiLlm` in responses mode posts to `{api_url}/responses`:
+  - the system prompt becomes the top-level `instructions`;
+  - history `ChatMessage`s become `input` items (`message` with
+    `input_text` / `output_text` parts, `function_call`,
+    `function_call_output`);
+  - tools use the flat Responses shape
+    `{"type":"function", name, description, parameters}`.
+- DeepSeek's Responses endpoint strictly requires each
+  `function_call_output` to directly follow its matching `function_call`
+  (OpenAI tolerates interleaving; DeepSeek rejects it with
+  "No tool output found for tool call …"). `to_responses_input` therefore
+  pairs each tool result with its call on sight (`[fc, output, fc, output]`)
+  instead of batching all calls then all outputs.
+- Output parsing: `output[]` message items are concatenated into the reply
+  text; `function_call` items map to core `ToolCall` using `call_id`
+  (falling back to `id`); `reasoning`/unknown items are ignored. The
+  response-level `output_text` convenience field is a fallback.
+- Verified live against DeepSeek `deepseek-v4-flash`: plain text and
+  function-call round trips both return `status: completed` at
+  `https://api.deepseek.com/v1/responses`, and an end-to-end WS chat
+  through persona Nota produced a reply.

@@ -181,7 +181,7 @@ Runtime data under the user's home directory:
 ├── .logs/                 # rotating logs (30-day)
 ├── sessions/
 │   └── <session_id>/history.db  # conversation history (SQLite, per session)
-└── config.toml            # api_url, api_key, model
+└── config.toml            # api_url, api_key, model, api_mode (responses|chat)
 ```
 
 `base_dir()` is resolved in `nota-cli` (`dirs::home_dir().join(".nota")`) and

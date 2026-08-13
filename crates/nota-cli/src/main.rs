@@ -130,6 +130,7 @@ async fn run_server(
         &config.api_url,
         &config.api_key,
         &config.model,
+        &config.api_mode,
     ));
 
     let tool_registry: Arc<ToolRegistryImpl> = Arc::new(ToolRegistryImpl::new());

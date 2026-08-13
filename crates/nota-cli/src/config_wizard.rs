@@ -72,12 +72,27 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
         .default(default_model)
         .interact_text()?;
 
+    let mode_items = vec!["Responses API (recommended)", "Chat Completions"];
+    let default_mode_idx = existing
+        .map(|cfg| match cfg.api_mode.as_str() {
+            "chat" => 1,
+            _ => 0,
+        })
+        .unwrap_or(0);
+    let mode_selection = Select::new()
+        .with_prompt("LLM API format")
+        .items(&mode_items)
+        .default(default_mode_idx)
+        .interact()?;
+    let api_mode = if mode_selection == 0 { "responses" } else { "chat" }.to_string();
+
     let onebot = prompt_onebot(existing)?;
 
     let cfg = Config {
         api_url,
         api_key,
         model,
+        api_mode,
         onebot,
     };
 
@@ -89,6 +104,7 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
     println!("  API URL : {}", cfg.api_url);
     println!("  API Key : {}", mask_key(&cfg.api_key));
     println!("  Model   : {}", cfg.model);
+    println!("  API Mode: {}", cfg.api_mode);
     match &cfg.onebot {
         Some(ob) if ob.enabled => {
             println!("  OneBot  : enabled ({} -> {})", ob.mode, ob.ws_url);
