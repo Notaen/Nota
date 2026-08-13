@@ -181,8 +181,8 @@ Runtime data under the user's home directory:
 ├── .logs/                 # rotating logs (30-day)
 ├── sessions/
 │   └── <session_id>/      # per-conversation history (independent of personas)
-│       ├── deep.json      # LLM context — owned by the persona module
-│       └── shallow.json   # messages actually delivered — owned by sessions
+│       ├── deep.jsonl     # LLM context (JSONL) — owned by the persona module
+│       └── shallow.jsonl  # messages actually delivered (JSONL) — owned by sessions
 └── config.toml            # api_url, api_key, model
 ```
 

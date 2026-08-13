@@ -372,6 +372,9 @@ cloned as a git submodule.
   (`PersonaStore::append_deep/read_deep`), **shallow is owned by the session
   module** (`SessionStore::append_shallow/read_shallow`); both live under
   `~/.nota/sessions/<session_id>/`.
+- Session files are **JSONL** (`deep.jsonl` / `shallow.jsonl`, one entry per
+  line) and appended incrementally; legacy JSON arrays are parsed as a
+  fallback and migrated to JSONL on the next append.
 - The adapter-specific `send_private_msg` / `send_group_msg` tools were
   replaced by one channel-agnostic `send_message(target, content)` in
   `nota-infra` (`tool/chat.rs`, with `skip_reply`). Target format is

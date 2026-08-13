@@ -8,12 +8,13 @@ use async_trait::async_trait;
 use nota_core::persona::{ChatLogEntry, PersonaStore};
 use nota_core::session::{Session, SessionStore};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 const SOLO_FILENAME: &str = "solo.md";
 const MEMORY_FILENAME: &str = "memory.md";
-const DEEP_FILENAME: &str = "deep.json";
-const SHALLOW_FILENAME: &str = "shallow.json";
+const DEEP_FILENAME: &str = "deep.jsonl";
+const SHALLOW_FILENAME: &str = "shallow.jsonl";
 
 type FileCache = HashMap<PathBuf, (String, SystemTime)>;
 
@@ -48,6 +49,73 @@ async fn read_cached(path: &Path) -> Result<Option<String>> {
 async fn invalidate_cache(path: &Path) {
     if let Some(cache) = PERSONA_FILE_CACHE.get() {
         cache.write().await.remove(path);
+    }
+}
+
+/// Parse a session history file. New files are JSONL (one entry per line);
+/// legacy JSON arrays are still accepted and migrated to JSONL on append.
+fn parse_entries(content: &str) -> Vec<ChatLogEntry> {
+    if content.trim_start().starts_with('[') {
+        serde_json::from_str(content).unwrap_or_default()
+    } else {
+        content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    None
+                } else {
+                    serde_json::from_str(line).ok()
+                }
+            })
+            .collect()
+    }
+}
+
+/// Serialize entries as JSONL and append them to `path` (creating it if
+/// needed). A legacy JSON-array file is rewritten to JSONL first.
+async fn append_jsonl(
+    path: &Path,
+    entries: &[ChatLogEntry],
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    if let Some(content) = read_cached(path).await?
+        && content.trim_start().starts_with('[')
+    {
+        // Migrate the legacy JSON array to JSONL, then append.
+        let mut existing = parse_entries(&content);
+        existing.extend(entries.iter().cloned());
+        let jsonl = existing
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .join("\n");
+        fs::write(path, format!("{jsonl}\n")).await?;
+        invalidate_cache(path).await;
+        return Ok(());
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    for entry in entries {
+        file.write_all(serde_json::to_string(entry)?.as_bytes())
+            .await?;
+        file.write_all(b"\n").await?;
+    }
+    invalidate_cache(path).await;
+    Ok(())
+}
+
+async fn read_entries(path: &Path) -> Result<Vec<ChatLogEntry>> {
+    match read_cached(path).await? {
+        Some(content) => Ok(parse_entries(&content)),
+        None => Ok(Vec::new()),
     }
 }
 
@@ -145,19 +213,7 @@ impl PersonaStore for FilePersonaStore {
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()> {
-        let path = self.deep_path(session);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let mut existing: Vec<ChatLogEntry> = match read_cached(&path).await? {
-            Some(content) => serde_json::from_str(&content).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        existing.extend(entries.iter().cloned());
-        let json = serde_json::to_string(&existing)?;
-        fs::write(&path, &json).await?;
-        invalidate_cache(&path).await;
-        Ok(())
+        append_jsonl(&self.deep_path(session), entries).await
     }
 
     async fn read_deep(
@@ -165,13 +221,7 @@ impl PersonaStore for FilePersonaStore {
         session: &Session,
         since: Option<i64>,
     ) -> Result<Vec<ChatLogEntry>> {
-        let path = self.deep_path(session);
-        let content = match read_cached(&path).await? {
-            Some(c) => c,
-            None => return Ok(Vec::new()),
-        };
-        let entries: Vec<ChatLogEntry> =
-            serde_json::from_str(&content).unwrap_or_default();
+        let entries = read_entries(&self.deep_path(session)).await?;
         if let Some(ts) = since {
             Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
         } else {
@@ -207,19 +257,7 @@ impl SessionStore for FileSessionStore {
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()> {
-        let path = self.shallow_path(session);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let mut existing: Vec<ChatLogEntry> = match read_cached(&path).await? {
-            Some(content) => serde_json::from_str(&content).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        existing.extend(entries.iter().cloned());
-        let json = serde_json::to_string(&existing)?;
-        fs::write(&path, &json).await?;
-        invalidate_cache(&path).await;
-        Ok(())
+        append_jsonl(&self.shallow_path(session), entries).await
     }
 
     async fn read_shallow(
@@ -227,13 +265,7 @@ impl SessionStore for FileSessionStore {
         session: &Session,
         since: Option<i64>,
     ) -> Result<Vec<ChatLogEntry>> {
-        let path = self.shallow_path(session);
-        let content = match read_cached(&path).await? {
-            Some(c) => c,
-            None => return Ok(Vec::new()),
-        };
-        let entries: Vec<ChatLogEntry> =
-            serde_json::from_str(&content).unwrap_or_default();
+        let entries = read_entries(&self.shallow_path(session)).await?;
         if let Some(ts) = since {
             Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
         } else {
