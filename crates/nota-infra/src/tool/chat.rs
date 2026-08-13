@@ -63,12 +63,15 @@ impl Tool for SendMessageTool {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
 
-        ctx.bus.send(BusEvent::outbound_message(
-            ctx.persona_name.clone(),
-            content.to_string(),
-            ctx.request_id.clone(),
-            target,
-        ));
+        ctx.bus.send(
+            BusEvent::outbound_message(
+                ctx.persona_name.clone(),
+                content.to_string(),
+                ctx.request_id.clone(),
+                target,
+            )
+            .with_session(ctx.session_id.clone()),
+        );
         Ok("已发送".to_string())
     }
 }

@@ -53,6 +53,16 @@ impl Outbound {
         if !self.cfg.friend_ids.contains(&user_id) {
             anyhow::bail!("target user {user_id} is not in the friend allowlist");
         }
+        self.send_private_approved(user_id, text)
+    }
+
+    /// Send without the allowlist check — only used after the user approved
+    /// an outbound message to a non-allowlisted target.
+    pub(crate) fn send_private_approved(
+        &self,
+        user_id: i64,
+        text: &str,
+    ) -> anyhow::Result<()> {
         for chunk in chunk_text(text, MAX_MESSAGE_CHARS) {
             self.action_tx
                 .send(ActionRequest::send_private_msg(user_id, &chunk))?;
@@ -64,6 +74,16 @@ impl Outbound {
         if !self.cfg.group_ids.contains(&group_id) {
             anyhow::bail!("target group {group_id} is not in the group allowlist");
         }
+        self.send_group_approved(group_id, text)
+    }
+
+    /// Send without the allowlist check — only used after the user approved
+    /// an outbound message to a non-allowlisted target.
+    pub(crate) fn send_group_approved(
+        &self,
+        group_id: i64,
+        text: &str,
+    ) -> anyhow::Result<()> {
         for chunk in chunk_text(text, MAX_MESSAGE_CHARS) {
             self.action_tx
                 .send(ActionRequest::send_group_msg(group_id, &chunk))?;
@@ -168,6 +188,22 @@ impl OneBotBridge {
             return;
         }
 
+        // Approve / deny commands for pending outbound messages are handled
+        // here and never reach the persona.
+        let raw_text = msg
+            .message
+            .as_ref()
+            .map(|m| m.to_text())
+            .unwrap_or_default();
+        if let Some((approved, permission_id)) = parse_approval(&raw_text) {
+            log::info!(
+                "OneBot permission {} (approved={approved})",
+                permission_id
+            );
+            self.permissions.resolve(&permission_id, approved).await;
+            return;
+        }
+
         let Some(content) = msg.message else { return };
         let mut text = content.to_text();
         if text.trim().is_empty() {
@@ -268,9 +304,9 @@ impl OneBotBridge {
             EventKind::OutboundMessage => {
                 // The persona asked to send a message explicitly. `context`
                 // carries the adapter-independent target
-                // (`private:<QQ>` / `group:<QQ>`); only allowlisted targets
-                // are delivered, and the real message is recorded in the
-                // target session's shallow layer.
+                // (`private:<QQ>` / `group:<QQ>`); allowlisted targets are
+                // delivered immediately, everything else goes through an
+                // approval round-trip with the user.
                 let Some(route) = target_to_route(&event.context) else {
                     log::warn!(
                         "OneBot outbound event has no usable target: '{}'",
@@ -279,14 +315,109 @@ impl OneBotBridge {
                     return;
                 };
                 let outbound = self.outbound_for(action_tx);
-                if let Err(e) = send_via(&outbound, &route, &event.content) {
-                    log::warn!("OneBot outbound send failed: {e:#}");
+                if self.route_allowed(&route) {
+                    match send_via(&outbound, &route, &event.content) {
+                        Ok(()) => {
+                            self.record_shallow(
+                                &route_to_session_id(&route),
+                                &event.content,
+                            )
+                            .await;
+                        }
+                        Err(e) => log::warn!("OneBot outbound send failed: {e:#}"),
+                    }
                     return;
                 }
-                self.record_shallow(&route_to_session_id(&route), &event.content)
+                self.request_outbound_approval(action_tx, &event, &route)
                     .await;
             }
         }
+    }
+
+    /// Whether the route is inside the configured allowlist.
+    fn route_allowed(&self, route: &ReplyRoute) -> bool {
+        match route {
+            ReplyRoute::Private { user_id } => self.cfg.friend_ids.contains(user_id),
+            ReplyRoute::Group { group_id } => self.cfg.group_ids.contains(group_id),
+        }
+    }
+
+    /// Ask the user to approve an outbound message to a non-allowlisted
+    /// target. The notice goes back to the session that started the turn;
+    /// the message is sent only after approval.
+    async fn request_outbound_approval(
+        &self,
+        action_tx: &UnboundedSender<ActionRequest>,
+        event: &BusEvent,
+        route: &ReplyRoute,
+    ) {
+        let (permission_id, decision) = self.permissions.register().await;
+        let notice = format!(
+            "persona 想向{}发送消息：{}\n回复「批准{}」同意，或「拒绝{}」拒绝",
+            describe_target(route),
+            event.content,
+            permission_id,
+            permission_id
+        );
+
+        // Notify the session that started this turn (QQ via a reply, other
+        // channels via a bus message event carrying the source session).
+        match event.session_id.as_deref().and_then(session_to_route) {
+            Some(source_route) => {
+                self.send_reply(action_tx, &source_route, &notice);
+            }
+            None => {
+                self.bus.send(
+                    BusEvent::message("system".to_string(), notice, None)
+                        .with_session(event.session_id.clone()),
+                );
+            }
+        }
+
+        // Wait for the decision; approved sends bypass the allowlist (the
+        // user's explicit approval is the gate).
+        let action_tx = action_tx.clone();
+        let cfg = self.cfg.clone();
+        let sessions = self.sessions.clone();
+        let persona = self.persona.clone();
+        let route = route.clone();
+        let content = event.content.clone();
+        tokio::spawn(async move {
+            if !decision.await.unwrap_or(false) {
+                log::info!(
+                    "OneBot outbound message denied by user: {}",
+                    route_to_session_id(&route)
+                );
+                return;
+            }
+            let outbound = Outbound { action_tx, cfg };
+            let result = match route {
+                ReplyRoute::Private { user_id } => {
+                    outbound.send_private_approved(user_id, &content)
+                }
+                ReplyRoute::Group { group_id } => {
+                    outbound.send_group_approved(group_id, &content)
+                }
+            };
+            if let Err(e) = result {
+                log::warn!("OneBot outbound send failed after approval: {e:#}");
+                return;
+            }
+            if let Err(e) = sessions
+                .append_shallow(
+                    &Session::new(persona.clone(), route_to_session_id(&route)),
+                    &[ChatLogEntry {
+                        sender: persona,
+                        content,
+                        timestamp: chrono::Utc::now().timestamp(),
+                        context: String::new(),
+                    }],
+                )
+                .await
+            {
+                log::warn!("failed to record shallow message: {e:#}");
+            }
+        });
     }
 
     /// Record an actually-delivered message in the session's shallow layer
@@ -359,6 +490,28 @@ fn target_to_route(target: &str) -> Option<ReplyRoute> {
         "group" => Some(ReplyRoute::Group { group_id: id }),
         _ => None,
     }
+}
+
+/// Human-readable description of an outbound target, e.g. `群 551947633`.
+fn describe_target(route: &ReplyRoute) -> String {
+    match route {
+        ReplyRoute::Private { user_id } => format!("好友 {user_id}"),
+        ReplyRoute::Group { group_id } => format!("群 {group_id}"),
+    }
+}
+
+/// Parse an approve/deny command from a chat message:
+/// `批准<permission-id>` / `同意<permission-id>` / `拒绝<permission-id>`.
+fn parse_approval(text: &str) -> Option<(bool, String)> {
+    for (prefix, approved) in [("批准", true), ("同意", true), ("拒绝", false)] {
+        if let Some(rest) = text.trim().strip_prefix(prefix) {
+            let id = rest.trim();
+            if !id.is_empty() {
+                return Some((approved, id.to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// The OneBot session id for a reply route.
@@ -738,5 +891,130 @@ mod tests {
         let shallow = store.shallow.lock().unwrap();
         assert_eq!(shallow.len(), 1);
         assert_eq!(shallow[0].content, "hi");
+    }
+
+    fn extract_permission_id(notice: &str) -> String {
+        let start = notice.find("批准").unwrap() + "批准".len();
+        notice[start..start + 36].to_string()
+    }
+
+    #[tokio::test]
+    async fn outbound_to_non_allowlisted_requires_approval() {
+        let (mut bridge, store) = test_bridge_with_store();
+        bridge.cfg.friend_ids = vec![42];
+        bridge.cfg.group_ids = vec![30003];
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let event = BusEvent::outbound_message(
+            "bob".to_string(),
+            "hi".to_string(),
+            None,
+            "group:99999".to_string(),
+        )
+        .with_session(Some("onebot_private_42".to_string()));
+
+        bridge.handle_bus_event(event, &action_tx).await;
+
+        // No direct send; a notice asking for approval goes to the source
+        // session instead.
+        let notice_action = action_rx.recv().await.unwrap();
+        assert_eq!(notice_action.action, "send_private_msg");
+        let ActionParams::Private { message, .. } = notice_action.params else {
+            panic!("expected private action");
+        };
+        let notice = &message[0].data.text;
+        assert!(notice.contains("群 99999"));
+        assert!(notice.contains("批准"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), action_rx.recv())
+                .await
+                .is_err(),
+            "nothing is sent before approval"
+        );
+
+        // Approve -> the message is sent (bypassing the allowlist) and
+        // recorded in the target session's shallow layer.
+        let id = extract_permission_id(notice);
+        bridge.permissions.resolve(&id, true).await;
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            action_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(sent.action, "send_group_msg");
+        let ActionParams::Group { group_id, message } = sent.params else {
+            panic!("expected group action");
+        };
+        assert_eq!(group_id, 99999);
+        assert_eq!(message[0].data.text, "hi");
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let shallow = store.shallow.lock().unwrap();
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].content, "hi");
+    }
+
+    #[tokio::test]
+    async fn denied_outbound_not_sent() {
+        let mut bridge = test_bridge();
+        bridge.cfg.friend_ids = vec![42];
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let event = BusEvent::outbound_message(
+            "bob".to_string(),
+            "hi".to_string(),
+            None,
+            "group:99999".to_string(),
+        )
+        .with_session(Some("onebot_private_42".to_string()));
+
+        bridge.handle_bus_event(event, &action_tx).await;
+
+        let notice_action = action_rx.recv().await.unwrap();
+        let ActionParams::Private { message, .. } = notice_action.params else {
+            panic!("expected private action");
+        };
+        let id = extract_permission_id(&message[0].data.text);
+        bridge.permissions.resolve(&id, false).await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), action_rx.recv())
+                .await
+                .is_err(),
+            "denied outbound message must not be sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_command_resolves_and_is_not_forwarded() {
+        let mut bridge = test_bridge();
+        bridge.cfg.friend_ids = vec![42];
+        let mut bus_rx = bridge.bus.subscribe();
+        let (permission_id, decision) = bridge.permissions.register().await;
+
+        bridge
+            .handle_onebot_event(private_event(42, &format!("批准{permission_id}")))
+            .await;
+
+        assert!(decision.await.unwrap());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), bus_rx.recv())
+                .await
+                .is_err(),
+            "approval commands are consumed by the bridge, never the persona"
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_command_resolves_false() {
+        let mut bridge = test_bridge();
+        bridge.cfg.friend_ids = vec![42];
+        let (permission_id, decision) = bridge.permissions.register().await;
+
+        bridge
+            .handle_onebot_event(private_event(42, &format!("拒绝{permission_id}")))
+            .await;
+
+        assert!(!decision.await.unwrap());
     }
 }

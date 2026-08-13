@@ -381,3 +381,16 @@ cloned as a git submodule.
   live in shallow.
 - Future `dream` runs will learn from the shallow layer (what the persona
   really said) to self-optimize the persona; not implemented yet.
+
+### Outbound approval for non-allowlisted targets (2026-08-13)
+- `send_message` to a target inside the allowlist is delivered immediately.
+  To a non-allowlisted target, the OneBot bridge registers a permission
+  oneshot, notifies the originating session
+  (`persona 想向群/好友 … 发送消息：…` + `批准<id>` / `拒绝<id>`), and only
+  sends after approval (bypassing the allowlist via `Outbound::*_approved`).
+- Approval commands (`批准<id>` / `同意<id>` / `拒绝<id>`) are intercepted by
+  the bridge before the persona and resolved via `PermissionRegistry`; web
+  clients use the existing `{type:"permission", …}` command.
+- The notice reaches OneBot sessions as a reply and other sessions (e.g.
+  web) as a `system` bus message event; the web forwarder now also relays
+  request-id-less system notices.
