@@ -27,7 +27,8 @@ use nota_core::session::SessionManager;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
-    TokioScheduler, http_serve, register_builtin_tools, register_chat_tools,
+    SqliteHistoryStore, TokioScheduler, http_serve, register_builtin_tools,
+    register_chat_tools,
 };
 
 mod config_wizard;
@@ -121,10 +122,9 @@ async fn run_server(
     let path_policy = Arc::new(PathPolicy::new());
 
     let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
-    let manager = Arc::new(SessionManager::new(
-        persona_store.clone(),
-        path_policy.clone(),
-    ));
+    let history: Arc<dyn nota_core::history::HistoryStore> =
+        Arc::new(SqliteHistoryStore::new(base)?);
+    let manager = Arc::new(SessionManager::new(history.clone(), path_policy.clone()));
     let scheduler: Arc<dyn Scheduler> = Arc::new(TokioScheduler::new(manager.clone()));
     let llm: Arc<dyn nota_core::llm::LlmClient> = Arc::new(OpenAiLlm::new(
         &config.api_url,
@@ -151,6 +151,7 @@ async fn run_server(
         let runtime = Arc::new(PersonaRuntime::new(
             persona,
             persona_store.clone(),
+            history.clone(),
             llm.clone(),
             tool_registry.clone(),
             permissions.clone(),
@@ -182,6 +183,7 @@ async fn run_server(
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
         persona_store,
+        history,
         config: config_arc,
         config_path,
     });

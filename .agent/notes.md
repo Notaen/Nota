@@ -435,3 +435,13 @@ cloned as a git submodule.
   persona. Inbound messages carry the identity header separately
   (`InboundMessage.prefix`, e.g. `[好友 昵称(QQ)] `) from the user's real
   content, so commands reach the session manager verbatim.
+
+### SQLite history with kind field + clear boundaries (2026-08-13)
+- Conversation history moved from `chatlog.jsonl` to SQLite
+  (`~/.nota/history.db`, `rusqlite` bundled). Rows are stored verbatim with a
+  `kind` column instead of the ambiguous `sender`:
+  - `0` clear boundary (`//clear` appends one; nothing is ever deleted)
+  - `1` user message, `2` assistant message, `3` tool call/result
+- The LLM context query returns only rows after the last clear boundary
+  (`id > MAX(id WHERE kind = 0)`); raw history (boundaries included) is
+  exposed via `GET /api/personas/{name}/chatlog/{session_id}`.

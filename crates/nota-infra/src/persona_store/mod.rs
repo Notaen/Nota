@@ -5,15 +5,12 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use nota_core::persona::{ChatLogEntry, PersonaStore};
-use nota_core::session::Session;
+use nota_core::persona::PersonaStore;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 const SOLO_FILENAME: &str = "solo.md";
 const MEMORY_FILENAME: &str = "memory.md";
-const HISTORY_FILENAME: &str = "chatlog.jsonl";
 
 type FileCache = HashMap<PathBuf, (String, SystemTime)>;
 
@@ -51,96 +48,21 @@ async fn invalidate_cache(path: &Path) {
     }
 }
 
-/// Parse a session history file. New files are JSONL (one entry per line);
-/// legacy JSON arrays are still accepted and migrated to JSONL on append.
-fn parse_entries(content: &str) -> Vec<ChatLogEntry> {
-    if content.trim_start().starts_with('[') {
-        serde_json::from_str(content).unwrap_or_default()
-    } else {
-        content
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if line.is_empty() {
-                    None
-                } else {
-                    serde_json::from_str(line).ok()
-                }
-            })
-            .collect()
-    }
-}
-
-/// Serialize entries as JSONL and append them to `path` (creating it if
-/// needed). A legacy JSON-array file is rewritten to JSONL first.
-async fn append_jsonl(
-    path: &Path,
-    entries: &[ChatLogEntry],
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    if let Some(content) = read_cached(path).await?
-        && content.trim_start().starts_with('[')
-    {
-        // Migrate the legacy JSON array to JSONL, then append.
-        let mut existing = parse_entries(&content);
-        existing.extend(entries.iter().cloned());
-        let jsonl = existing
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<std::result::Result<Vec<String>, _>>()?
-            .join("\n");
-        fs::write(path, format!("{jsonl}\n")).await?;
-        invalidate_cache(path).await;
-        return Ok(());
-    }
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    for entry in entries {
-        file.write_all(serde_json::to_string(entry)?.as_bytes())
-            .await?;
-        file.write_all(b"\n").await?;
-    }
-    invalidate_cache(path).await;
-    Ok(())
-}
-
-async fn read_entries(path: &Path) -> Result<Vec<ChatLogEntry>> {
-    match read_cached(path).await? {
-        Some(content) => Ok(parse_entries(&content)),
-        None => Ok(Vec::new()),
-    }
-}
-
-/// Persona files plus per-session conversation history (fed to the LLM).
-/// Sessions live independently under `~/.nota/sessions/<id>/`.
+/// Persona files (`solo.md`, `memory.md`). Conversation history lives in the
+/// SQLite `HistoryStore`, not here.
 pub struct FilePersonaStore {
     personas_dir: PathBuf,
-    sessions_dir: PathBuf,
 }
 
 impl FilePersonaStore {
     pub fn new(base_dir: &Path) -> Self {
         Self {
             personas_dir: base_dir.join("personas"),
-            sessions_dir: base_dir.join("sessions"),
         }
     }
 
     fn workspace(&self, name: &str) -> PathBuf {
         self.personas_dir.join(name)
-    }
-
-    fn history_path(&self, session: &Session) -> PathBuf {
-        self.sessions_dir
-            .join(&session.session_id)
-            .join(HISTORY_FILENAME)
     }
 }
 
@@ -206,35 +128,5 @@ impl PersonaStore for FilePersonaStore {
             }
         }
         Ok(names)
-    }
-
-    async fn append_history(
-        &self,
-        session: &Session,
-        entries: &[ChatLogEntry],
-    ) -> Result<()> {
-        append_jsonl(&self.history_path(session), entries).await
-    }
-
-    async fn read_history(
-        &self,
-        session: &Session,
-        since: Option<i64>,
-    ) -> Result<Vec<ChatLogEntry>> {
-        let entries = read_entries(&self.history_path(session)).await?;
-        if let Some(ts) = since {
-            Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
-        } else {
-            Ok(entries)
-        }
-    }
-
-    async fn clear_history(&self, session: &Session) -> Result<()> {
-        let path = self.history_path(session);
-        if fs::try_exists(&path).await.unwrap_or(false) {
-            fs::remove_file(&path).await?;
-        }
-        invalidate_cache(&path).await;
-        Ok(())
     }
 }

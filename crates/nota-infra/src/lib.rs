@@ -5,6 +5,7 @@
 //! injects them into the core.
 
 pub mod config;
+pub mod history;
 pub mod http;
 pub mod llm;
 pub mod persona_store;
@@ -15,6 +16,7 @@ pub use config::{
     Config, ConfigStore, OnebotConfig,
     provider_default_model, provider_ids, provider_name, provider_url,
 };
+pub use history::SqliteHistoryStore;
 pub use http::{api::ApiState, serve as http_serve, AppContext};
 pub use llm::OpenAiLlm;
 pub use persona_store::FilePersonaStore;

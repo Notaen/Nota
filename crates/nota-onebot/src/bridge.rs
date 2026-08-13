@@ -539,53 +539,53 @@ mod tests {
     use crate::types::{
         ActionParams, MessageContent, MessageEvent, Sender,
     };
-    use nota_core::persona::ChatLogEntry;
-    use nota_core::persona::PersonaStore;
+    use nota_core::history::{HistoryEntry, HistoryStore};
     use nota_core::permissions::PathPolicy;
     use nota_core::session::OutboundEvent;
 
-    /// In-memory persona store for tests.
-    struct MemPersonaStore;
+    /// In-memory history store for tests.
+    #[derive(Default)]
+    struct MemHistoryStore {
+        entries: Mutex<Vec<(i64, HistoryEntry)>>,
+    }
 
     #[async_trait]
-    impl PersonaStore for MemPersonaStore {
-        async fn read_persona_file(&self, _n: &str, _f: &str) -> Result<String> {
-            Ok(String::new())
-        }
-        async fn write_persona_file(&self, _n: &str, _f: &str, _c: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn create_persona(&self, _n: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn delete_persona(&self, _n: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn list_personas(&self) -> Result<Vec<String>> {
-            Ok(vec![])
-        }
-        async fn append_history(
+    impl HistoryStore for MemHistoryStore {
+        async fn append(
             &self,
             _s: &Session,
-            _e: &[ChatLogEntry],
+            entries: &[HistoryEntry],
         ) -> Result<()> {
+            let mut all = self.entries.lock().unwrap();
+            for e in entries {
+                let next = all.len() as i64 + 1;
+                all.push((next, e.clone()));
+            }
             Ok(())
         }
-        async fn read_history(
+        async fn read_context(&self, _s: &Session) -> Result<Vec<HistoryEntry>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, e)| e.clone())
+                .collect())
+        }
+        async fn read_raw(
             &self,
             _s: &Session,
-            _since: Option<i64>,
-        ) -> Result<Vec<ChatLogEntry>> {
-            Ok(vec![])
+        ) -> Result<Vec<(i64, HistoryEntry)>> {
+            Ok(self.entries.lock().unwrap().clone())
         }
-        async fn clear_history(&self, _s: &Session) -> Result<()> {
+        async fn add_clear_boundary(&self, _s: &Session) -> Result<()> {
             Ok(())
         }
     }
 
     fn test_bridge() -> (OneBotBridge, Arc<SessionManager>) {
         let manager = Arc::new(SessionManager::new(
-            Arc::new(MemPersonaStore),
+            Arc::new(MemHistoryStore::default()),
             Arc::new(PathPolicy::default()),
         ));
         let bridge = OneBotBridge::new(

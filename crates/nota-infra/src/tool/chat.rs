@@ -117,7 +117,7 @@ pub fn register_chat_tools(registry: &dyn ToolRegistry) {
 mod tests {
     use super::*;
     use nota_core::permissions::PermissionRegistry;
-    use nota_core::persona::{ChatLogEntry, PersonaStore};
+    use nota_core::history::{HistoryEntry, HistoryStore};
     use nota_core::permissions::PathPolicy;
     use nota_core::session::{AdapterEvent, Session, SessionManager};
     use anyhow::Result;
@@ -125,47 +125,49 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    struct MemPersonaStore;
+    #[derive(Default)]
+    struct MemHistoryStore {
+        entries: std::sync::Mutex<Vec<HistoryEntry>>,
+    }
 
     #[async_trait]
-    impl PersonaStore for MemPersonaStore {
-        async fn read_persona_file(&self, _n: &str, _f: &str) -> Result<String> {
-            Ok(String::new())
-        }
-        async fn write_persona_file(&self, _n: &str, _f: &str, _c: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn create_persona(&self, _n: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn delete_persona(&self, _n: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn list_personas(&self) -> Result<Vec<String>> {
-            Ok(vec![])
-        }
-        async fn append_history(
+    impl HistoryStore for MemHistoryStore {
+        async fn append(
             &self,
             _s: &Session,
-            _e: &[ChatLogEntry],
+            entries: &[HistoryEntry],
         ) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .extend(entries.iter().cloned());
             Ok(())
         }
-        async fn read_history(
+        async fn read_context(&self, _s: &Session) -> Result<Vec<HistoryEntry>> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+        async fn read_raw(
             &self,
             _s: &Session,
-            _since: Option<i64>,
-        ) -> Result<Vec<ChatLogEntry>> {
-            Ok(vec![])
+        ) -> Result<Vec<(i64, HistoryEntry)>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, e)| (i as i64 + 1, e))
+                .collect())
         }
-        async fn clear_history(&self, _s: &Session) -> Result<()> {
+        async fn add_clear_boundary(&self, _s: &Session) -> Result<()> {
             Ok(())
         }
     }
 
     fn tool_ctx() -> ToolContext {
         let manager = Arc::new(SessionManager::new(
-            Arc::new(MemPersonaStore),
+            Arc::new(MemHistoryStore::default()),
             Arc::new(PathPolicy::default()),
         ));
         ToolContext {

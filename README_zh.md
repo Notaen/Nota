@@ -165,9 +165,7 @@ nota/
 │       ├── solo.md        # 系统提示词
 │       ├── memory.md      # 长期记忆
 ├── .logs/                 # 日志（30 天轮转）
-├── sessions/
-│   └── <session_id>/      # 按会话隔离的历史（独立于 personas）
-│       └── chatlog.jsonl  # 会话历史（JSONL，追加写入）
+├── history.db             # 会话历史（SQLite，追加写入）
 └── config.toml            # api_url、api_key、model
 ```
 

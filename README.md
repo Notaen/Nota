@@ -179,9 +179,7 @@ Runtime data under the user's home directory:
 │       ├── solo.md        # system prompt
 │       ├── memory.md      # long-term memory
 ├── .logs/                 # rotating logs (30-day)
-├── sessions/
-│   └── <session_id>/      # per-conversation history (independent of personas)
-│       └── chatlog.jsonl  # conversation history (JSONL, append-only)
+├── history.db             # conversation history (SQLite, append-only)
 └── config.toml            # api_url, api_key, model
 ```
 

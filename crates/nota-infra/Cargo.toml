@@ -14,6 +14,7 @@ axum = { workspace = true, features = ["ws"] }
 chrono.workspace = true
 log.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "fs", "sync", "net"] }

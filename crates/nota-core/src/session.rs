@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use crate::history::HistoryStore;
 use crate::permissions::PathPolicy;
-use crate::persona::PersonaStore;
 
 /// Identifies one conversation: a persona plus an adapter-assigned session id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,16 +86,16 @@ pub enum AdapterEvent {
 pub struct SessionManager {
     persona_inboxes: Mutex<HashMap<String, UnboundedSender<InboundMessage>>>,
     adapter_outboxes: Mutex<HashMap<String, Vec<UnboundedSender<AdapterEvent>>>>,
-    personas: Arc<dyn PersonaStore>,
+    history: Arc<dyn HistoryStore>,
     policy: Arc<PathPolicy>,
 }
 
 impl SessionManager {
-    pub fn new(personas: Arc<dyn PersonaStore>, policy: Arc<PathPolicy>) -> Self {
+    pub fn new(history: Arc<dyn HistoryStore>, policy: Arc<PathPolicy>) -> Self {
         Self {
             persona_inboxes: Mutex::new(HashMap::new()),
             adapter_outboxes: Mutex::new(HashMap::new()),
-            personas,
+            history,
             policy,
         }
     }
@@ -225,8 +225,8 @@ impl SessionManager {
     async fn run_command(&self, session: &Session, cmd: SlashCommand) {
         match cmd {
             SlashCommand::Clear => {
-                if let Err(e) = self.personas.clear_history(session).await {
-                    log::warn!("//clear history failed: {e:#}");
+                if let Err(e) = self.history.add_clear_boundary(session).await {
+                    log::warn!("//clear boundary failed: {e:#}");
                 }
                 self.route_outbound(
                     Some(&session.session_id),

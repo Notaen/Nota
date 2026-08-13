@@ -6,7 +6,8 @@ use axum::{
     http::StatusCode,
     routing::{delete, get},
 };
-use nota_core::persona::{ChatLogEntry, PersonaStore};
+use nota_core::history::HistoryStore;
+use nota_core::persona::PersonaStore;
 use nota_core::session::Session;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -15,6 +16,7 @@ use crate::config::{Config, ConfigStore};
 
 pub struct ApiState {
     pub persona_store: Arc<dyn PersonaStore>,
+    pub history: Arc<dyn HistoryStore>,
     pub config: Arc<RwLock<Config>>,
     pub config_path: std::path::PathBuf,
 }
@@ -131,10 +133,10 @@ async fn write_file(
 async fn read_history(
     State(state): State<Arc<ApiState>>,
     Path((name, session_id)): Path<(String, String)>,
-) -> Result<Json<Vec<ChatLogEntry>>, (StatusCode, Json<ErrorBody>)> {
+) -> Result<Json<Vec<(i64, nota_core::history::HistoryEntry)>>, (StatusCode, Json<ErrorBody>)> {
     let entries = state
-        .persona_store
-        .read_history(&Session::new(name, session_id), None)
+        .history
+        .read_raw(&Session::new(name, session_id))
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(entries))
