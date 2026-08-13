@@ -9,8 +9,8 @@ use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams};
 
 use crate::api::OneBotApi;
 use crate::types::{
-    ActionRequest, GetMsgData, GroupMsgHistoryData, LoginInfoData, format_history,
-    identity,
+    ActionRequest, FetchPttTextData, GetMsgData, GroupMsgHistoryData, LoginInfoData,
+    format_history, identity,
 };
 
 /// Actively read recent messages of any QQ group via NapCat's
@@ -206,7 +206,7 @@ impl Tool for GetMsgTool {
         let text = data
             .message
             .as_ref()
-            .map(|m| m.to_text())
+            .map(|m| m.to_text_with_id(&data.message_id))
             .unwrap_or_default();
         let ts = chrono::Local
             .timestamp_opt(data.time, 0)
@@ -221,13 +221,151 @@ impl Tool for GetMsgTool {
     }
 }
 
+/// Transcribe a QQ voice message (语音) into text via NapCat's
+/// `fetch_ptt_text`, so the persona can read the content of a
+/// `[语音 消息ID:…]` segment from an incoming or historical message.
+pub struct GetVoiceTextTool {
+    api: OneBotApi,
+}
+
+impl GetVoiceTextTool {
+    pub fn new(api: OneBotApi) -> Self {
+        Self { api }
+    }
+}
+
+#[async_trait]
+impl Tool for GetVoiceTextTool {
+    fn name(&self) -> &str {
+        "get_voice_text"
+    }
+
+    fn description(&self) -> &str {
+        "Transcribe a QQ voice message (语音) into text via the OneBot connection (NapCat fetch_ptt_text). Pass the message id from a [语音 消息ID:...] segment."
+    }
+
+    fn parameters(&self) -> ToolParams {
+        let mut props = HashMap::new();
+        props.insert(
+            "message_id".to_string(),
+            PropertyDef {
+                prop_type: "string".to_string(),
+                description: "Message id from a [语音 消息ID:...] segment in an incoming or historical message".to_string(),
+                r#enum: vec![],
+            },
+        );
+        ToolParams::object(props, vec!["message_id".to_string()])
+    }
+
+    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
+        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        let message_id = args["message_id"]
+            .as_str()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .or_else(|| args["message_id"].as_i64())
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid 'message_id'"))?;
+
+        let resp = self
+            .api
+            .call(ActionRequest::fetch_ptt_text(message_id))
+            .await?;
+        if resp.retcode != Some(0) {
+            anyhow::bail!(
+                "fetch_ptt_text failed: status={:?} retcode={:?}",
+                resp.status,
+                resp.retcode
+            );
+        }
+        let data: FetchPttTextData = match resp.data {
+            Some(v) => serde_json::from_value(v)?,
+            None => anyhow::bail!("fetch_ptt_text returned no data"),
+        };
+        let text = data.text.trim();
+        if text.is_empty() {
+            Ok(format!("语音 {message_id} 没有可转写的文字内容"))
+        } else {
+            Ok(format!("语音 {message_id} 转文字: {text}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bridge::Outbound;
+    use crate::client::PendingResponses;
     use crate::config::OnebotConfig;
-    use crate::types::ActionParams;
+    use crate::types::{ActionParams, ActionResponse};
+    use nota_core::history::{HistoryEntry, HistoryStore};
+    use nota_core::permissions::{PathPolicy, PermissionRegistry};
+    use nota_core::session::{Session, SessionManager};
+    use nota_core::tool::ToolContext;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
     use tokio::sync::mpsc;
+
+    #[derive(Default)]
+    struct MemHistoryStore {
+        entries: std::sync::Mutex<Vec<HistoryEntry>>,
+    }
+
+    #[async_trait]
+    impl HistoryStore for MemHistoryStore {
+        async fn append(
+            &self,
+            _s: &Session,
+            entries: &[HistoryEntry],
+        ) -> Result<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .extend(entries.iter().cloned());
+            Ok(())
+        }
+        async fn read_context(&self, _s: &Session) -> Result<Vec<HistoryEntry>> {
+            Ok(self.entries.lock().unwrap().clone())
+        }
+        async fn read_raw(
+            &self,
+            _s: &Session,
+        ) -> Result<Vec<(i64, HistoryEntry)>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, e)| (i as i64 + 1, e))
+                .collect())
+        }
+        async fn add_clear_boundary(&self, _s: &Session) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn tool_ctx() -> ToolContext {
+        let manager = Arc::new(SessionManager::new(
+            Arc::new(MemHistoryStore::default()),
+            Arc::new(PathPolicy::default()),
+        ));
+        ToolContext {
+            persona_name: "bob".to_string(),
+            manager,
+            request_id: None,
+            permissions: Arc::new(PermissionRegistry::new()),
+            session_id: None,
+            suppress_reply: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// OneBotApi wired to an action channel; returns the receiver and the
+    /// pending map so tests can answer actions like the WS loop would.
+    fn test_api() -> (OneBotApi, mpsc::UnboundedReceiver<ActionRequest>, PendingResponses) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let pending: PendingResponses = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        (OneBotApi::new(tx, pending.clone()), rx, pending)
+    }
 
     fn outbound(
         friend_ids: Vec<i64>,
@@ -283,5 +421,71 @@ mod tests {
         assert_eq!(message[0].data.text.len(), 4000);
         assert_eq!(m2[0].data.text.len(), 4000);
         assert_eq!(m3[0].data.text.len(), 1000);
+    }
+
+    #[tokio::test]
+    async fn get_voice_text_returns_transcription() {
+        let (api, mut action_rx, pending) = test_api();
+        let tool = GetVoiceTextTool::new(api);
+
+        tokio::spawn(async move {
+            let action = action_rx.recv().await.unwrap();
+            assert_eq!(action.action, "fetch_ptt_text");
+            let tx = pending
+                .lock()
+                .unwrap()
+                .remove(&action.echo)
+                .expect("pending response registered");
+            tx.send(ActionResponse {
+                status: Some("ok".to_string()),
+                retcode: Some(0),
+                echo: Some(action.echo),
+                data: Some(serde_json::json!({"text": "今天的天气真好"})),
+            })
+            .unwrap();
+        });
+
+        let out = tool
+            .run(r#"{"message_id":"99"}"#, tool_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out, "语音 99 转文字: 今天的天气真好");
+    }
+
+    #[tokio::test]
+    async fn get_voice_text_bails_on_failure() {
+        let (api, mut action_rx, pending) = test_api();
+        let tool = GetVoiceTextTool::new(api);
+
+        tokio::spawn(async move {
+            let action = action_rx.recv().await.unwrap();
+            let tx = pending
+                .lock()
+                .unwrap()
+                .remove(&action.echo)
+                .expect("pending response registered");
+            tx.send(ActionResponse {
+                status: Some("failed".to_string()),
+                retcode: Some(100),
+                echo: Some(action.echo),
+                data: None,
+            })
+            .unwrap();
+        });
+
+        let err = tool
+            .run(r#"{"message_id":"99"}"#, tool_ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fetch_ptt_text failed"));
+    }
+
+    #[tokio::test]
+    async fn get_voice_text_rejects_missing_id() {
+        let (api, _, _) = test_api();
+        let tool = GetVoiceTextTool::new(api);
+
+        let err = tool.run("{}", tool_ctx()).await.unwrap_err();
+        assert!(err.to_string().contains("message_id"));
     }
 }

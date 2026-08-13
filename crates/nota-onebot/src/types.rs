@@ -104,6 +104,20 @@ impl MessageContent {
             }
         }
     }
+
+    /// Flatten to plain text like [`to_text`], but render `record` segments
+    /// with the containing message id (`[语音 消息ID:<id>]`) so the persona
+    /// can transcribe them via the `get_voice_text` tool.
+    pub fn to_text_with_id(&self, message_id: &str) -> String {
+        match self {
+            MessageContent::Text(s) => s.clone(),
+            MessageContent::Segments(segs) => {
+                segs.iter()
+                    .map(|seg| segment_to_text_with_id(seg, message_id))
+                    .collect()
+            }
+        }
+    }
 }
 
 fn segment_to_text(seg: &MessageSegment) -> String {
@@ -146,6 +160,15 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// Render a segment for [`MessageContent::to_text_with_id`]; `record`
+/// (voice) segments carry the message id so the persona can transcribe them.
+fn segment_to_text_with_id(seg: &MessageSegment, message_id: &str) -> String {
+    if seg.segment_type == "record" {
+        return format!("[语音 消息ID:{message_id}]");
+    }
+    segment_to_text(seg)
+}
+
 /// Deserialize a message id that implementations may send as either a
 /// JSON number or a string.
 fn de_id_as_string<'de, D>(d: D) -> Result<String, D::Error>
@@ -185,6 +208,9 @@ pub enum ActionParams {
     LoginInfo {},
     GetMsg {
         message_id: i64,
+    },
+    FetchPttText {
+        message_id: String,
     },
 }
 
@@ -252,6 +278,18 @@ impl ActionRequest {
         Self {
             action: "get_msg".to_string(),
             params: ActionParams::GetMsg { message_id },
+            echo: Uuid::new_v4().to_string(),
+        }
+    }
+
+    /// NapCat extended API: transcribe the voice message of `message_id`
+    /// (`fetch_ptt_text`, requires NapCat >= 4.18.2).
+    pub fn fetch_ptt_text(message_id: i64) -> Self {
+        Self {
+            action: "fetch_ptt_text".to_string(),
+            params: ActionParams::FetchPttText {
+                message_id: message_id.to_string(),
+            },
             echo: Uuid::new_v4().to_string(),
         }
     }
@@ -330,12 +368,22 @@ pub struct LoginInfoData {
     pub nickname: String,
 }
 
+/// `data` payload of `fetch_ptt_text` (NapCat voice-to-text).
+#[derive(Debug, Clone, Deserialize)]
+pub struct FetchPttTextData {
+    pub text: String,
+}
+
 /// Render history messages as readable text for the LLM, one per line:
 /// `[HH:MM] nickname(QQ) 消息ID:{id}: text`.
 pub fn format_history(messages: &[HistoryMessage]) -> String {
     let mut out = Vec::new();
     for msg in messages {
-        let text = msg.message.as_ref().map(MessageContent::to_text).unwrap_or_default();
+        let text = msg
+            .message
+            .as_ref()
+            .map(|m| m.to_text_with_id(&msg.message_id))
+            .unwrap_or_default();
         if text.trim().is_empty() {
             continue;
         }
@@ -536,6 +584,28 @@ mod tests {
     }
 
     #[test]
+    fn renders_record_segment_with_message_id() {
+        let voice = MessageContent::Segments(vec![MessageSegment {
+            segment_type: "record".to_string(),
+            data: HashMap::from([("file".to_string(), serde_json::json!("voice.amr"))]),
+        }]);
+        assert_eq!(voice.to_text(), "[语音]");
+        assert_eq!(voice.to_text_with_id("99"), "[语音 消息ID:99]");
+
+        let mixed = MessageContent::Segments(vec![
+            MessageSegment {
+                segment_type: "text".to_string(),
+                data: HashMap::from([("text".to_string(), serde_json::json!("收到 "))]),
+            },
+            MessageSegment {
+                segment_type: "record".to_string(),
+                data: HashMap::new(),
+            },
+        ]);
+        assert_eq!(mixed.to_text_with_id("42"), "收到 [语音 消息ID:42]");
+    }
+
+    #[test]
     fn serializes_login_info_action() {
         let action = ActionRequest::get_login_info();
         let value = serde_json::to_value(&action).unwrap();
@@ -551,6 +621,15 @@ mod tests {
         let value = serde_json::to_value(&action).unwrap();
         assert_eq!(value["action"], "get_msg");
         assert_eq!(value["params"]["message_id"], 1234567890);
+        assert!(value["echo"].is_string());
+    }
+
+    #[test]
+    fn serializes_fetch_ptt_text_action() {
+        let action = ActionRequest::fetch_ptt_text(99);
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["action"], "fetch_ptt_text");
+        assert_eq!(value["params"]["message_id"], "99");
         assert!(value["echo"].is_string());
     }
 
@@ -573,6 +652,18 @@ mod tests {
         assert_eq!(data.message_id, "1234567890");
         assert_eq!(data.message_type.as_deref(), Some("group"));
         assert_eq!(data.message.unwrap().to_text(), "具体回复了这句");
+    }
+
+    #[test]
+    fn parses_fetch_ptt_text_response() {
+        let json = r#"{
+            "status": "ok",
+            "retcode": 0,
+            "data": {"text": "语音转写结果"}
+        }"#;
+        let resp: ActionResponse = serde_json::from_str(json).unwrap();
+        let data: FetchPttTextData = serde_json::from_value(resp.data.unwrap()).unwrap();
+        assert_eq!(data.text, "语音转写结果");
     }
 
     #[test]

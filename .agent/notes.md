@@ -329,6 +329,20 @@ cloned as a git submodule.
   numeric `message_id` + `message_seq`).
 - `get_login_info` tool exposes the bot's own QQ number/nickname.
 
+### Voice messages: persona-driven transcription (2026-08-13)
+- Voice (`record`) segments are rendered with the containing message id —
+  `[语音 消息ID:<id>]` — in inbound events, `get_msg`, and
+  `format_history`, so the persona can see there is a voice message and
+  knows which one it is.
+- Transcription is **not** automatic in the bridge: the persona calls the
+  `get_voice_text` tool with `message_id` when it wants to read the voice
+  content. The tool invokes NapCat's extended `fetch_ptt_text` action
+  (param `message_id`, number or string; requires NapCat >= 4.18.2) and
+  returns the transcript text.
+- `MessageContent::to_text_with_id` / `segment_to_text_with_id`, the
+  `fetch_ptt_text` action serialization + response parsing, and the
+  `get_voice_text` tool's success/failure paths are covered by unit tests.
+
 ### Send/receive separation (2026-08-13)
 - The bridge no longer auto-routes persona replies. Inbound OneBot events
   only reach the persona; the encoded reply target travels in

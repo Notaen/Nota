@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::api::OneBotApi;
 use crate::client::{self, PendingResponses};
 use crate::config::OnebotConfig;
-use crate::tools::{GetLoginInfoTool, GetMsgTool, ReadGroupChatTool};
+use crate::tools::{GetLoginInfoTool, GetMsgTool, GetVoiceTextTool, ReadGroupChatTool};
 use crate::types::{
     ActionRequest, MessageEvent, PostEvent, ReplyRoute, chunk_text, identity,
 };
@@ -122,6 +122,7 @@ impl OneBotBridge {
         registry.register(Arc::new(ReadGroupChatTool::new(self.api())));
         registry.register(Arc::new(GetLoginInfoTool::new(self.api())));
         registry.register(Arc::new(GetMsgTool::new(self.api())));
+        registry.register(Arc::new(GetVoiceTextTool::new(self.api())));
     }
 
     /// Run the bridge forever: deliver inbound events to the persona inbox
@@ -196,7 +197,9 @@ impl OneBotBridge {
         }
 
         let Some(content) = msg.message else { return };
-        let mut text = content.to_text();
+        // 语音段渲染为 [语音 消息ID:<id>]，persona 需要时自己调用
+        // get_voice_text 工具转写，不在桥接层自动处理。
+        let mut text = content.to_text_with_id(&msg.message_id.to_string());
         if text.trim().is_empty() {
             return;
         }
@@ -537,7 +540,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use crate::types::{
-        ActionParams, MessageContent, MessageEvent, Sender,
+        ActionParams, MessageContent, MessageEvent, MessageSegment, Sender,
     };
     use nota_core::history::{HistoryEntry, HistoryStore};
     use nota_core::permissions::PathPolicy;
@@ -624,6 +627,27 @@ mod tests {
         })
     }
 
+    fn voice_event(user_id: i64) -> PostEvent {
+        PostEvent::Message(MessageEvent {
+            self_id: 7,
+            time: 1700000000,
+            message_id: 99,
+            message_type: "private".to_string(),
+            sub_type: Some("friend".to_string()),
+            user_id,
+            message: Some(MessageContent::Segments(vec![MessageSegment {
+                segment_type: "record".to_string(),
+                data: HashMap::from([("file".to_string(), serde_json::json!("voice.amr"))]),
+            }])),
+            group_id: None,
+            sender: Some(Sender {
+                user_id,
+                nickname: "Alice".to_string(),
+                card: None,
+            }),
+        })
+    }
+
     fn outbound(
         session_id: Option<&str>,
         target: Option<&str>,
@@ -680,6 +704,19 @@ mod tests {
         assert_eq!(msg.prefix, "[群 30003 Alice(42)] ");
         assert_eq!(msg.content, "hi");
         assert_eq!(msg.session.session_id, "onebot_group_30003");
+    }
+
+    #[tokio::test]
+    async fn delivers_voice_message_with_message_id() {
+        let (mut bridge, manager) = test_bridge();
+        bridge.cfg.friend_ids = vec![42];
+        let mut inbox = manager.subscribe_persona("bob");
+
+        bridge.handle_onebot_event(voice_event(42)).await;
+
+        let msg = inbox.recv().await.unwrap();
+        assert_eq!(msg.content, "[语音 消息ID:99]");
+        assert_eq!(msg.session.session_id, "onebot_private_42");
     }
 
     #[tokio::test]
