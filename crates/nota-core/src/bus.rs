@@ -4,8 +4,13 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventKind {
+    /// An inbound chat message for a persona to answer.
     Message,
+    /// A permission decision is required for a tool call.
     PermissionRequest,
+    /// A persona explicitly asks to send a message outbound (channel target
+    /// encoded in `context`). Channels subscribe and forward it.
+    OutboundMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -15,12 +20,21 @@ pub struct BusEvent {
     pub content: String,
     pub timestamp: i64,
     pub context: String,
+    /// The conversation session this event belongs to (adapter-assigned,
+    /// e.g. `onebot_private_2961354039`); `None` for channel-agnostic events.
+    pub session_id: Option<String>,
     pub request_id: Option<String>,
     pub parent_request_id: Option<String>,
     pub target: Option<String>,
 }
 
 impl BusEvent {
+    /// Attach the conversation session this event belongs to.
+    pub fn with_session(mut self, session_id: Option<String>) -> Self {
+        self.session_id = session_id;
+        self
+    }
+
     pub fn message(
         sender: String,
         content: String,
@@ -44,6 +58,7 @@ impl BusEvent {
             content,
             timestamp: chrono::Utc::now().timestamp(),
             context,
+            session_id: None,
             request_id,
             parent_request_id: None,
             target: None,
@@ -62,6 +77,7 @@ impl BusEvent {
             content,
             timestamp: chrono::Utc::now().timestamp(),
             context: String::new(),
+            session_id: None,
             request_id,
             parent_request_id: None,
             target: Some(target),
@@ -84,6 +100,7 @@ impl BusEvent {
             content,
             timestamp: chrono::Utc::now().timestamp(),
             context,
+            session_id: None,
             request_id,
             parent_request_id: None,
             target: Some(target),
@@ -102,8 +119,31 @@ impl BusEvent {
             content: prompt,
             timestamp: chrono::Utc::now().timestamp(),
             context: String::new(),
+            session_id: None,
             request_id: Some(permission_id),
             parent_request_id,
+            target: None,
+        }
+    }
+
+    /// A persona-initiated outbound message. `context` carries the channel
+    /// target (e.g. `"private:2961354039"`), so the sending persona does not
+    /// touch the transport directly.
+    pub fn outbound_message(
+        sender: String,
+        content: String,
+        request_id: Option<String>,
+        context: String,
+    ) -> Self {
+        Self {
+            kind: EventKind::OutboundMessage,
+            sender,
+            content,
+            timestamp: chrono::Utc::now().timestamp(),
+            context,
+            session_id: None,
+            request_id,
+            parent_request_id: None,
             target: None,
         }
     }

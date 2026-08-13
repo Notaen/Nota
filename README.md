@@ -47,12 +47,13 @@ Notes:
 - A `reply` quote segment carries its message id as `[回复消息ID:…]`; the
   `get_msg` tool fetches the quoted message by that id, and group history
   lines include `消息ID:…` so the persona can correlate quotes to messages.
-- **Send/receive are separated**: inbound messages only reach the persona;
-  nothing is auto-sent back. The persona sends replies explicitly via the
-  `reply` tool (target chat is injected, no QQ number guessing), so it can
-  choose not to reply ("不要回答" is honored), send several messages in a
-  row, or proactively message someone with `send_private_msg` /
-  `send_group_msg` (targets must be allowlisted).
+- **Sessions & send/receive**: each chat endpoint (a QQ friend, a group, a
+  web client) is its own conversation **session** with an isolated chatlog
+  (`~/.nota/personas/<name>/sessions/<id>/chatlog.json`). The persona's
+  final answer is auto-routed back to the originating session; `skip_reply`
+  suppresses it ("不要回答" is honored), `reply` adds more messages in a
+  row, and `send_private_msg` / `send_group_msg` enable proactive messages
+  (targets must be allowlisted).
 - **Allowlist**: the persona only responds to `friend_ids` / `group_ids`.
   Messages from anyone else are dropped before the LLM is ever called.
   Empty list means nobody in that category is allowed.
@@ -175,7 +176,8 @@ Runtime data under the user's home directory:
 │   └── <name>/
 │       ├── solo.md        # system prompt
 │       ├── memory.md      # long-term memory
-│       └── chatlog.json   # recent conversation (rewritten on dream)
+│       └── sessions/      # per-conversation chatlogs
+│           └── <session_id>/chatlog.json
 ├── .logs/                 # rotating logs (30-day)
 └── config.toml            # api_url, api_key, model
 ```

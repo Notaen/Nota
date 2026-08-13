@@ -34,7 +34,8 @@ crates/nota-core/src/
 ├── bus.rs                  # EventBus (mpsc broadcast to all subscribers) + BusEvent + EventKind
 ├── permissions.rs          # PermissionRegistry (pending permission oneshots keyed by id)
 ├── llm.rs                  # LlmClient trait + ToolDef/ToolCall/LlmResponse/ChatMessage
-├── tool.rs                 # Tool / ToolRegistry traits + ToolContext (bus + permissions + request_id)
+├── session.rs              # Session + SessionStore (per-conversation chatlog)
+├── tool.rs                 # Tool / ToolRegistry traits + ToolContext (bus + permissions + session)
 ├── agent/mod.rs            # AgentRunner: LLM ↔ tool loop, returns ChatMessage list
 └── persona/mod.rs          # Persona + PersonaStore trait + PersonaRuntime (event loop)
 

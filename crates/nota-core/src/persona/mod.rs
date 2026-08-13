@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -5,9 +6,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentRunner;
-use crate::bus::{BusEvent, EventBus};
+use crate::bus::{BusEvent, EventBus, EventKind};
 use crate::llm::{ChatMessage, LlmClient};
 use crate::permissions::PermissionRegistry;
+use crate::session::{Session, SessionStore};
 use crate::tool::{ToolContext, ToolRegistry};
 
 const SOLO_FILENAME: &str = "solo.md";
@@ -38,16 +40,13 @@ pub trait PersonaStore: Send + Sync {
 
     async fn delete_persona(&self, name: &str) -> Result<()>;
 
-    async fn append_chatlog(&self, name: &str, entries: &[ChatLogEntry]) -> Result<()>;
-
-    async fn read_chatlog(&self, name: &str, since: Option<i64>) -> Result<Vec<ChatLogEntry>>;
-
     async fn list_personas(&self) -> Result<Vec<String>>;
 }
 
 pub struct PersonaRuntime {
     persona: Persona,
     store: Arc<dyn PersonaStore>,
+    sessions: Arc<dyn SessionStore>,
     llm: Arc<dyn LlmClient>,
     registry: Arc<dyn ToolRegistry>,
     permissions: Arc<PermissionRegistry>,
@@ -57,6 +56,7 @@ impl PersonaRuntime {
     pub fn new(
         persona: Persona,
         store: Arc<dyn PersonaStore>,
+        sessions: Arc<dyn SessionStore>,
         llm: Arc<dyn LlmClient>,
         registry: Arc<dyn ToolRegistry>,
         permissions: Arc<PermissionRegistry>,
@@ -64,6 +64,7 @@ impl PersonaRuntime {
         Self {
             persona,
             store,
+            sessions,
             llm,
             registry,
             permissions,
@@ -88,16 +89,27 @@ impl PersonaRuntime {
             if event.sender == name {
                 continue;
             }
+            // Only chat messages drive the persona; outbound instructions and
+            // permission events are handled by their own subscribers.
+            if event.kind != EventKind::Message {
+                continue;
+            }
             if let Some(ref t) = event.target
                 && t != &name
             {
                 continue;
             }
 
+            let session_id = event
+                .session_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            let session = Session::new(name.clone(), session_id);
+
             let system = self.build_system_prompt().await;
 
             let history = self
-                .load_chatlog_context()
+                .load_chatlog_context(&session)
                 .await
                 .unwrap_or_default();
 
@@ -109,19 +121,20 @@ impl PersonaRuntime {
                 tool_call_id: None,
             });
 
+            let suppress_reply = Arc::new(AtomicBool::new(false));
             let tool_ctx = ToolContext {
                 persona_name: name.clone(),
                 bus: bus.clone(),
                 request_id: event.request_id.clone(),
                 permissions: self.permissions.clone(),
-                reply_target: (!event.context.is_empty())
-                    .then(|| event.context.clone()),
+                session_id: event.session_id.clone(),
+                suppress_reply: suppress_reply.clone(),
             };
 
             let _ = self
-                .store
+                .sessions
                 .append_chatlog(
-                    &name,
+                    &session,
                     &[ChatLogEntry {
                         sender: event.sender.clone(),
                         content: event.content.clone(),
@@ -151,20 +164,25 @@ impl PersonaRuntime {
                     }
 
                     let _ = self
-                        .store
-                        .append_chatlog(&name, &chatlog_entries)
+                        .sessions
+                        .append_chatlog(&session, &chatlog_entries)
                         .await;
 
-                    if let Some(last) = new_msgs.last()
+                    if !suppress_reply.load(Ordering::SeqCst)
+                        && let Some(last) = new_msgs.last()
                         && let Some(content) = &last.content
                         && last.role == "assistant"
+                        && !content.trim().is_empty()
                     {
-                        bus.send(BusEvent::message_with_context(
-                            name.clone(),
-                            content.clone(),
-                            event.request_id.clone(),
-                            event.context.clone(),
-                        ));
+                        bus.send(
+                            BusEvent::message_with_context(
+                                name.clone(),
+                                content.clone(),
+                                event.request_id.clone(),
+                                event.context.clone(),
+                            )
+                            .with_session(event.session_id.clone()),
+                        );
                     }
                 }
                 Err(e) => {
@@ -188,11 +206,8 @@ impl PersonaRuntime {
         parts.join("\n\n")
     }
 
-    async fn load_chatlog_context(&self) -> Result<Vec<ChatMessage>> {
-        let entries = self
-            .store
-            .read_chatlog(&self.persona.name, None)
-            .await?;
+    async fn load_chatlog_context(&self, session: &Session) -> Result<Vec<ChatMessage>> {
+        let entries = self.sessions.read_chatlog(session, None).await?;
 
         let mut messages = Vec::new();
         for entry in entries {

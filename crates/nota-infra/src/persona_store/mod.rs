@@ -6,6 +6,7 @@ use std::time::SystemTime;
 use anyhow::Result;
 use async_trait::async_trait;
 use nota_core::persona::{ChatLogEntry, PersonaStore};
+use nota_core::session::{Session, SessionStore};
 use tokio::fs;
 use tokio::sync::RwLock;
 
@@ -34,6 +35,13 @@ impl FilePersonaStore {
 
     fn workspace(&self, name: &str) -> PathBuf {
         self.personas_dir.join(name)
+    }
+
+    fn session_chatlog(&self, session: &Session) -> PathBuf {
+        self.workspace(&session.persona)
+            .join("sessions")
+            .join(&session.session_id)
+            .join(CHATLOG_FILENAME)
     }
 
     async fn read_cached(&self, path: &Path) -> Result<Option<String>> {
@@ -112,38 +120,6 @@ impl PersonaStore for FilePersonaStore {
         Ok(())
     }
 
-    async fn append_chatlog(&self, name: &str, entries: &[ChatLogEntry]) -> Result<()> {
-        let path = self.workspace(name).join(CHATLOG_FILENAME);
-        let mut existing: Vec<ChatLogEntry> = match self.read_cached(&path).await? {
-            Some(content) => serde_json::from_str(&content).unwrap_or_default(),
-            None => Vec::new(),
-        };
-        existing.extend(entries.iter().cloned());
-        let json = serde_json::to_string(&existing)?;
-        fs::write(&path, &json).await?;
-        self.invalidate_cache(&path).await;
-        Ok(())
-    }
-
-    async fn read_chatlog(
-        &self,
-        name: &str,
-        since: Option<i64>,
-    ) -> Result<Vec<ChatLogEntry>> {
-        let path = self.workspace(name).join(CHATLOG_FILENAME);
-        let content = match self.read_cached(&path).await? {
-            Some(c) => c,
-            None => return Ok(Vec::new()),
-        };
-        let entries: Vec<ChatLogEntry> =
-            serde_json::from_str(&content).unwrap_or_default();
-        if let Some(ts) = since {
-            Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
-        } else {
-            Ok(entries)
-        }
-    }
-
     async fn list_personas(&self) -> Result<Vec<String>> {
         let mut names = Vec::new();
         let mut entries = fs::read_dir(&self.personas_dir).await?;
@@ -158,5 +134,47 @@ impl PersonaStore for FilePersonaStore {
             }
         }
         Ok(names)
+    }
+}
+
+#[async_trait]
+impl SessionStore for FilePersonaStore {
+    async fn append_chatlog(
+        &self,
+        session: &Session,
+        entries: &[ChatLogEntry],
+    ) -> Result<()> {
+        let path = self.session_chatlog(session);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let mut existing: Vec<ChatLogEntry> = match self.read_cached(&path).await? {
+            Some(content) => serde_json::from_str(&content).unwrap_or_default(),
+            None => Vec::new(),
+        };
+        existing.extend(entries.iter().cloned());
+        let json = serde_json::to_string(&existing)?;
+        fs::write(&path, &json).await?;
+        self.invalidate_cache(&path).await;
+        Ok(())
+    }
+
+    async fn read_chatlog(
+        &self,
+        session: &Session,
+        since: Option<i64>,
+    ) -> Result<Vec<ChatLogEntry>> {
+        let path = self.session_chatlog(session);
+        let content = match self.read_cached(&path).await? {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+        let entries: Vec<ChatLogEntry> =
+            serde_json::from_str(&content).unwrap_or_default();
+        if let Some(ts) = since {
+            Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
+        } else {
+            Ok(entries)
+        }
     }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -14,10 +15,11 @@ pub struct ToolContext {
     pub bus: Arc<EventBus>,
     pub request_id: Option<String>,
     pub permissions: Arc<PermissionRegistry>,
-    /// Outbound chat target for replying to the current message, encoded by
-    /// the channel (e.g. `"private:2961354039"` / `"group:30003"`). `None`
-    /// when the turn was not driven by a chat message.
-    pub reply_target: Option<String>,
+    /// The conversation session this turn belongs to (adapter-assigned).
+    pub session_id: Option<String>,
+    /// Set by the persona (e.g. via the `skip_reply` tool) to suppress the
+    /// automatic reply at the end of this turn.
+    pub suppress_reply: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -25,7 +27,7 @@ impl std::fmt::Debug for ToolContext {
         f.debug_struct("ToolContext")
             .field("persona_name", &self.persona_name)
             .field("request_id", &self.request_id)
-            .field("reply_target", &self.reply_target)
+            .field("session_id", &self.session_id)
             .finish()
     }
 }
@@ -35,12 +37,15 @@ impl ToolContext {
     /// Returns `true` if approved, `false` if denied or on timeout.
     pub async fn request_permission(&self, prompt: String) -> bool {
         let (id, rx) = self.permissions.register().await;
-        self.bus.send(BusEvent::permission_request(
-            self.persona_name.clone(),
-            prompt,
-            id,
-            self.request_id.clone(),
-        ));
+        self.bus.send(
+            BusEvent::permission_request(
+                self.persona_name.clone(),
+                prompt,
+                id,
+                self.request_id.clone(),
+            )
+            .with_session(self.session_id.clone()),
+        );
         rx.await.unwrap_or(false)
     }
 }

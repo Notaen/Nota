@@ -333,3 +333,22 @@ cloned as a git submodule.
   `send_reply` remains only for the auto-denied permission notices.
 - OneBot tools are registered via `OneBotBridge::register_tools`; the CLI
   no longer names individual OneBot tool types.
+
+### Sessions replace the broadcast-only bus (2026-08-13)
+- The event bus is kept as the message backbone, but every chat endpoint is
+  now a **session** (`SessionStore` + `Session { persona, session_id }`).
+  Chatlogs moved from `personas/<name>/chatlog.json` to
+  `personas/<name>/sessions/<session_id>/chatlog.json` (file-based, same
+  store; the historical SQLite session stack was intentionally not revived).
+- Adapter-assigned session ids: `onebot_private_<qq>` /
+  `onebot_group_<qq>` for OneBot, `web_<uuid>` per WebSocket connection.
+  `BusEvent` and `ToolContext` carry `session_id`; each adapter only routes
+  events for its own session prefix, so one persona can serve many channels
+  without history bleeding between them.
+- Persona replies are auto-routed back to the originating session (final
+  assistant text → bus event with `session_id`); `skip_reply` tool sets a
+  per-turn `suppress_reply` flag to honor "不要回答"; empty final text is
+  also suppressed. `reply`/`send_*` tools emit `OutboundMessage` events that
+  the bridge forwards after the allowlist check.
+- `GET /api/personas/{name}/chatlog/{session_id}` replaced the global
+  chatlog endpoint.

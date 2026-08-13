@@ -23,6 +23,7 @@ use tracing_subscriber::{
 use nota_core::bus::EventBus;
 use nota_core::permissions::PermissionRegistry;
 use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
+use nota_core::session::SessionStore;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
@@ -119,7 +120,9 @@ async fn run_server(
     let bus = Arc::new(EventBus::new());
     let permissions = Arc::new(PermissionRegistry::new());
 
-    let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
+    let persona_store = Arc::new(FilePersonaStore::new(base));
+    let session_store: Arc<dyn SessionStore> = persona_store.clone();
+    let persona_store: Arc<dyn PersonaStore> = persona_store;
     let llm: Arc<dyn nota_core::llm::LlmClient> = Arc::new(OpenAiLlm::new(
         &config.api_url,
         &config.api_key,
@@ -139,6 +142,7 @@ async fn run_server(
         let runtime = Arc::new(PersonaRuntime::new(
             persona,
             persona_store.clone(),
+            session_store.clone(),
             llm.clone(),
             tool_registry.clone(),
             permissions.clone(),
@@ -170,6 +174,7 @@ async fn run_server(
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
         persona_store,
+        session_store,
         config: config_arc,
         config_path,
     });

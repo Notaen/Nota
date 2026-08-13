@@ -1,17 +1,18 @@
 //! OneBot tools exposed to the persona (read group chat history, etc.).
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::TimeZone;
+use nota_core::bus::BusEvent;
 use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams};
 
 use crate::api::OneBotApi;
-use crate::bridge::Outbound;
 use crate::types::{
     ActionRequest, GetMsgData, GroupMsgHistoryData, LoginInfoData, format_history,
-    identity, ReplyRoute,
+    identity,
 };
 
 /// Actively read recent messages of any QQ group via NapCat's
@@ -222,17 +223,12 @@ impl Tool for GetMsgTool {
     }
 }
 
-/// Reply to the message that triggered this turn. The target chat comes from
-/// the turn context, so the persona never has to guess the QQ number.
-pub struct ReplyTool {
-    outbound: Outbound,
-}
-
-impl ReplyTool {
-    pub fn new(outbound: Outbound) -> Self {
-        Self { outbound }
-    }
-}
+/// Reply to the message that triggered this turn. The target comes from the
+/// turn session, so the persona never has to guess the QQ number. The send
+/// goes through the bus (`OutboundMessage`); the OneBot bridge forwards it
+/// after the allowlist check.
+#[derive(Default)]
+pub struct ReplyTool;
 
 #[async_trait]
 impl Tool for ReplyTool {
@@ -263,34 +259,26 @@ impl Tool for ReplyTool {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
-        let target = ctx
-            .reply_target
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("no reply target for this turn"))?;
-        let route = ReplyRoute::from_context(target)
-            .ok_or_else(|| anyhow::anyhow!("invalid reply target {target}"))?;
-        match route {
-            ReplyRoute::Private { user_id } => {
-                self.outbound.send_private(user_id, content)?;
-            }
-            ReplyRoute::Group { group_id } => {
-                self.outbound.send_group(group_id, content)?;
-            }
-        }
+        let session_id = ctx
+            .session_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no session for this turn"))?;
+        ctx.bus.send(
+            BusEvent::outbound_message(
+                ctx.persona_name.clone(),
+                content.to_string(),
+                ctx.request_id.clone(),
+                String::new(),
+            )
+            .with_session(Some(session_id)),
+        );
         Ok("已发送回复".to_string())
     }
 }
 
 /// Proactively send a private message to a friend (must be allowlisted).
-pub struct SendPrivateMsgTool {
-    outbound: Outbound,
-}
-
-impl SendPrivateMsgTool {
-    pub fn new(outbound: Outbound) -> Self {
-        Self { outbound }
-    }
-}
+#[derive(Default)]
+pub struct SendPrivateMsgTool;
 
 #[async_trait]
 impl Tool for SendPrivateMsgTool {
@@ -323,7 +311,7 @@ impl Tool for SendPrivateMsgTool {
         ToolParams::object(props, vec!["user_id".to_string(), "content".to_string()])
     }
 
-    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
+    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
         let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
         let user_id = args["user_id"]
             .as_i64()
@@ -332,21 +320,22 @@ impl Tool for SendPrivateMsgTool {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
-        self.outbound.send_private(user_id, content)?;
+        ctx.bus.send(
+            BusEvent::outbound_message(
+                ctx.persona_name.clone(),
+                content.to_string(),
+                ctx.request_id.clone(),
+                String::new(),
+            )
+            .with_session(Some(format!("onebot_private_{user_id}"))),
+        );
         Ok("已发送".to_string())
     }
 }
 
 /// Proactively send a message to a group (must be allowlisted).
-pub struct SendGroupMsgTool {
-    outbound: Outbound,
-}
-
-impl SendGroupMsgTool {
-    pub fn new(outbound: Outbound) -> Self {
-        Self { outbound }
-    }
-}
+#[derive(Default)]
+pub struct SendGroupMsgTool;
 
 #[async_trait]
 impl Tool for SendGroupMsgTool {
@@ -379,7 +368,7 @@ impl Tool for SendGroupMsgTool {
         ToolParams::object(props, vec!["group_id".to_string(), "content".to_string()])
     }
 
-    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
+    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
         let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
         let group_id = args["group_id"]
             .as_i64()
@@ -388,28 +377,64 @@ impl Tool for SendGroupMsgTool {
             .as_str()
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
-        self.outbound.send_group(group_id, content)?;
+        ctx.bus.send(
+            BusEvent::outbound_message(
+                ctx.persona_name.clone(),
+                content.to_string(),
+                ctx.request_id.clone(),
+                String::new(),
+            )
+            .with_session(Some(format!("onebot_group_{group_id}"))),
+        );
         Ok("已发送".to_string())
+    }
+}
+
+/// Explicitly suppress the automatic reply for the current turn (e.g. when
+/// the user asked the persona not to answer).
+#[derive(Default)]
+pub struct SkipReplyTool;
+
+#[async_trait]
+impl Tool for SkipReplyTool {
+    fn name(&self) -> &str {
+        "skip_reply"
+    }
+
+    fn description(&self) -> &str {
+        "Do not send an automatic reply for the current message. Call this when the user asked you not to reply."
+    }
+
+    fn parameters(&self) -> ToolParams {
+        ToolParams::object(HashMap::new(), Vec::new())
+    }
+
+    async fn run(&self, _args: &str, ctx: ToolContext) -> Result<String> {
+        ctx.suppress_reply.store(true, Ordering::SeqCst);
+        Ok("已跳过回复".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::Outbound;
     use crate::config::OnebotConfig;
     use crate::types::ActionParams;
-    use nota_core::bus::EventBus;
+    use nota_core::bus::{EventBus, EventKind};
     use nota_core::permissions::PermissionRegistry;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn tool_context(reply_target: Option<String>) -> ToolContext {
+    fn tool_context(session_id: Option<String>) -> ToolContext {
         ToolContext {
             persona_name: "bob".to_string(),
             bus: Arc::new(EventBus::new()),
             request_id: None,
             permissions: Arc::new(PermissionRegistry::new()),
-            reply_target,
+            session_id,
+            suppress_reply: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -435,58 +460,77 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reply_tool_sends_to_context_target() {
-        let (out, mut rx) = outbound(vec![42], vec![]);
-        let tool = ReplyTool::new(out);
-        let ctx = tool_context(Some("private:42".to_string()));
+    async fn reply_tool_emits_outbound_bus_event() {
+        let tool = ReplyTool;
+        let ctx = tool_context(Some("onebot_private_42".to_string()));
+        let mut bus_rx = ctx.bus.subscribe();
 
         tool.run(r#"{"content":"hello"}"#, ctx).await.unwrap();
 
-        let action = rx.recv().await.unwrap();
-        assert_eq!(action.action, "send_private_msg");
-        let ActionParams::Private { user_id, message } = action.params else {
-            panic!("expected private action");
-        };
-        assert_eq!(user_id, 42);
-        assert_eq!(message[0].data.text, "hello");
+        let event = bus_rx.recv().await.unwrap();
+        assert_eq!(event.kind, EventKind::OutboundMessage);
+        assert_eq!(event.sender, "bob");
+        assert_eq!(event.session_id.as_deref(), Some("onebot_private_42"));
+        assert_eq!(event.content, "hello");
     }
 
     #[tokio::test]
-    async fn reply_tool_without_target_fails() {
-        let (out, _rx) = outbound(vec![42], vec![]);
-        let tool = ReplyTool::new(out);
+    async fn reply_tool_without_session_fails() {
+        let tool = ReplyTool;
         let ctx = tool_context(None);
 
         let err = tool.run(r#"{"content":"hi"}"#, ctx).await.unwrap_err();
-        assert!(err.to_string().contains("reply target"));
+        assert!(err.to_string().contains("session"));
     }
 
     #[tokio::test]
-    async fn proactive_send_respects_allowlist() {
-        let (out, mut rx) = outbound(vec![42], vec![30003]);
-        let tool = SendPrivateMsgTool::new(out.clone());
-
-        // Allowlisted target sends.
-        tool.run(r#"{"user_id":42,"content":"hi"}"#, tool_context(None))
+    async fn proactive_send_emits_bus_event() {
+        let ctx = tool_context(None);
+        let mut bus_rx = ctx.bus.subscribe();
+        let tool = SendPrivateMsgTool;
+        tool.run(r#"{"user_id":42,"content":"hi"}"#, ctx)
             .await
             .unwrap();
-        let action = rx.recv().await.unwrap();
-        assert_eq!(action.action, "send_private_msg");
+        let event = bus_rx.recv().await.unwrap();
+        assert_eq!(event.kind, EventKind::OutboundMessage);
+        assert_eq!(event.session_id.as_deref(), Some("onebot_private_42"));
+        assert_eq!(event.content, "hi");
 
-        // Non-allowlisted target is rejected.
-        let err = tool
-            .run(r#"{"user_id":99,"content":"hi"}"#, tool_context(None))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("allowlist"));
-
-        let group_tool = SendGroupMsgTool::new(out);
+        let ctx2 = tool_context(None);
+        let mut bus_rx2 = ctx2.bus.subscribe();
+        let group_tool = SendGroupMsgTool;
         group_tool
-            .run(r#"{"group_id":30003,"content":"yo"}"#, tool_context(None))
+            .run(r#"{"group_id":30003,"content":"yo"}"#, ctx2)
             .await
             .unwrap();
-        let action = rx.recv().await.unwrap();
-        assert_eq!(action.action, "send_group_msg");
+        let event2 = bus_rx2.recv().await.unwrap();
+        assert_eq!(event2.session_id.as_deref(), Some("onebot_group_30003"));
+        assert_eq!(event2.content, "yo");
+    }
+
+    #[tokio::test]
+    async fn skip_reply_sets_suppress_flag() {
+        let tool = SkipReplyTool;
+        let ctx = tool_context(Some("onebot_private_42".to_string()));
+        let suppress = ctx.suppress_reply.clone();
+
+        tool.run("{}", ctx).await.unwrap();
+
+        assert!(suppress.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn outbound_rejects_non_allowlisted_targets() {
+        let (out, mut rx) = outbound(vec![42], vec![]);
+        let err = out.send_private(99, "hi").unwrap_err();
+        assert!(err.to_string().contains("allowlist"));
+        let err = out.send_group(99999, "hi").unwrap_err();
+        assert!(err.to_string().contains("allowlist"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

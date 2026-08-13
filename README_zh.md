@@ -44,10 +44,12 @@ group_ids = []                     # 群白名单：只回复这些群
 - 引用（回复）消息段会带上消息 id：`[回复消息ID:…]`；`get_msg` 工具可按
   该 id 取回被引用的那条消息，群历史每行也带 `消息ID:…`，persona 能把
   引用和历史对应起来。
-- **收发分离**：入站消息只送达 persona，不会再被自动回复。persona 通过
-  `reply` 工具显式回复（目标已注入，不用猜 QQ 号），因此可以决定不回复
-  （"不要回答"会真的不回）、连续发多条，或用 `send_private_msg` /
-  `send_group_msg` 主动发消息（目标必须在白名单内）。
+- **会话与收发**：每个聊天端点（QQ 好友、群、Web 客户端）都是独立的
+  对话 **session**，有各自的聊天记录
+  （`~/.nota/personas/<name>/sessions/<id>/chatlog.json`）。persona 的
+  最终回答自动路由回原会话；`skip_reply` 可抑制回复（"不要回答"会真的
+  不回），`reply` 可连续追加消息，`send_private_msg` / `send_group_msg`
+  可主动发消息（目标必须在白名单内）。
 - **白名单机制**：persona 只对 `friend_ids` / `group_ids` 里指定的人/群回复；
   其他人发来的消息会在调用 LLM 之前直接被丢弃。列表为空 = 该类别谁也不回复。
 - `read_group_chat` 工具：persona 可以主动拉取**任意群**的最近消息（通过
@@ -161,7 +163,8 @@ nota/
 │   └── <name>/
 │       ├── solo.md        # 系统提示词
 │       ├── memory.md      # 长期记忆
-│       └── chatlog.json   # 最近对话（dream 时回看、改写）
+│       └── sessions/      # 按会话隔离的聊天记录
+│           └── <session_id>/chatlog.json
 ├── .logs/                 # 日志（30 天轮转）
 └── config.toml            # api_url、api_key、model
 ```
