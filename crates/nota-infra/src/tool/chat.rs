@@ -82,8 +82,9 @@ fn is_valid_target(target: &str) -> bool {
     }
 }
 
-/// Explicitly suppress the automatic reply for the current turn (e.g. when
-/// the user asked the persona not to answer).
+/// Explicitly suppress the automatic reply for the current turn. This is the
+/// only way for the persona to stay silent — the final assistant text is
+/// always delivered as a reply unless this flag is set.
 #[derive(Default)]
 pub struct SkipReplyTool;
 
@@ -94,7 +95,13 @@ impl Tool for SkipReplyTool {
     }
 
     fn description(&self) -> &str {
-        "Do not send an automatic reply for the current message. Call this when the user asked you not to reply."
+        "Suppress the automatic reply for this turn — the ONLY way to stay silent.\n\
+         IMPORTANT: unless you call skip_reply, your final text WILL be sent to the chat as your reply.\n\
+         Call it (no arguments) when: the user explicitly asked you not to reply (e.g. 「不要回复」); \
+         the message needs no answer (addressed to someone else, just an acknowledgment, casual chatter, \
+         or you are thinking out loud); or you have nothing meaningful to say.\n\
+         Silence is normal and human — don't reply just for the sake of replying. After calling it, your \
+         turn ends and nothing is sent."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -220,5 +227,14 @@ mod tests {
         tool.run("{}", context).await.unwrap();
 
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn skip_reply_description_explains_silence_contract() {
+        let desc = SkipReplyTool.description();
+        assert!(desc.contains("ONLY way to stay silent"));
+        assert!(desc.contains("final text WILL be sent"));
+        assert!(desc.contains("nothing meaningful to say"));
+        assert!(desc.contains("Silence is normal and human"));
     }
 }

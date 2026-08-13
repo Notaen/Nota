@@ -403,6 +403,9 @@ cloned as a git submodule.
   still go through `send_private_msg` / `send_group_msg`.
 - This keeps exactly one reply path, eliminating double replies caused by
   the LLM both calling `reply` and emitting final text.
+- `skip_reply`'s tool description now spells out the silence contract
+  explicitly ("unless you call skip_reply, your final text WILL be sent"),
+  because the persona kept replying eagerly when nothing needed saying.
 
 ### Two-layer sessions + session-level send_message (2026-08-13)
 - The shallow/deep split was dropped: a session has one history file,
