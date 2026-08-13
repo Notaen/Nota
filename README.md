@@ -179,7 +179,8 @@ Runtime data under the user's home directory:
 │       ├── solo.md        # system prompt
 │       ├── memory.md      # long-term memory
 ├── .logs/                 # rotating logs (30-day)
-├── history.db             # conversation history (SQLite, append-only)
+├── sessions/
+│   └── <session_id>/history.db  # conversation history (SQLite, per session)
 └── config.toml            # api_url, api_key, model
 ```
 

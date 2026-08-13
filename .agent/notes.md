@@ -438,8 +438,9 @@ cloned as a git submodule.
 
 ### SQLite history with kind field + clear boundaries (2026-08-13)
 - Conversation history moved from `chatlog.jsonl` to SQLite
-  (`~/.nota/history.db`, `rusqlite` bundled). Rows are stored verbatim with a
-  `kind` column instead of the ambiguous `sender`:
+  (`~/.nota/sessions/<session_id>/history.db`, one database per session,
+  `rusqlite` bundled). Rows are stored verbatim with a `kind` column instead
+  of the ambiguous `sender`:
   - `0` clear boundary (`//clear` appends one; nothing is ever deleted)
   - `1` user message, `2` assistant message, `3` tool call/result
 - The LLM context query returns only rows after the last clear boundary
