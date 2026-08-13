@@ -20,13 +20,14 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use nota_core::permissions::PermissionRegistry;
+use nota_core::permissions::{PathPolicy, PermissionRegistry};
 use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
+use nota_core::scheduler::Scheduler;
 use nota_core::session::SessionManager;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
-    http_serve, register_builtin_tools, register_chat_tools,
+    TokioScheduler, http_serve, register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -117,9 +118,14 @@ async fn run_server(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let permissions = Arc::new(PermissionRegistry::new());
+    let path_policy = Arc::new(PathPolicy::new());
 
     let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
-    let manager = Arc::new(SessionManager::new(persona_store.clone()));
+    let manager = Arc::new(SessionManager::new(
+        persona_store.clone(),
+        path_policy.clone(),
+    ));
+    let scheduler: Arc<dyn Scheduler> = Arc::new(TokioScheduler::new(manager.clone()));
     let llm: Arc<dyn nota_core::llm::LlmClient> = Arc::new(OpenAiLlm::new(
         &config.api_url,
         &config.api_key,
@@ -127,7 +133,12 @@ async fn run_server(
     ));
 
     let tool_registry: Arc<ToolRegistryImpl> = Arc::new(ToolRegistryImpl::new());
-    register_builtin_tools(&tool_registry, base.join("personas"));
+    register_builtin_tools(
+        &tool_registry,
+        base.join("personas"),
+        scheduler.clone(),
+        path_policy,
+    );
     register_chat_tools(tool_registry.as_ref());
 
     let persona_names = persona_store.list_personas().await?;

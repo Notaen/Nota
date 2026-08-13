@@ -4,17 +4,22 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::DateTime;
+use nota_core::permissions::PathPolicy;
+use nota_core::scheduler::Scheduler;
+use nota_core::session::Session;
 use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
 
 use super::ToolRegistryImpl;
 
 pub struct FileReadTool {
     personas_dir: PathBuf,
+    policy: Arc<PathPolicy>,
 }
 
 impl FileReadTool {
-    pub fn new(personas_dir: PathBuf) -> Self {
-        Self { personas_dir }
+    pub fn new(personas_dir: PathBuf, policy: Arc<PathPolicy>) -> Self {
+        Self { personas_dir, policy }
     }
 
     fn workspace(&self, name: &str) -> PathBuf {
@@ -59,21 +64,27 @@ impl Tool for FileReadTool {
             Ok(c) => c,
             Err(_) => {
                 if !resolved.starts_with(&workspace_canonical) {
-                    let prompt = format!(
-                        "{} wants to read outside its workspace: {}",
-                        ctx.persona_name,
-                        resolved.display()
-                    );
-                    let approved = ctx.request_permission(prompt).await;
-                    if !approved {
-                        anyhow::bail!("permission denied");
+                    // User-guided allowlist lets the persona read outside the
+                    // workspace without per-call approval.
+                    if !self.policy.is_read_allowed(&resolved).await {
+                        let prompt = format!(
+                            "{} wants to read outside its workspace: {}",
+                            ctx.persona_name,
+                            resolved.display()
+                        );
+                        let approved = ctx.request_permission(prompt).await;
+                        if !approved {
+                            anyhow::bail!("permission denied");
+                        }
                     }
                 }
                 tokio::fs::canonicalize(&resolved).await?
             }
         };
 
-        if !canonical.starts_with(&workspace_canonical) {
+        if !canonical.starts_with(&workspace_canonical)
+            && !self.policy.is_read_allowed(&canonical).await
+        {
             let prompt = format!(
                 "{} wants to read outside its workspace: {}",
                 ctx.persona_name,
@@ -178,7 +189,15 @@ impl Tool for FileWriteTool {
     }
 }
 
-pub struct ScheduleTool;
+pub struct ScheduleTool {
+    scheduler: Arc<dyn Scheduler>,
+}
+
+impl ScheduleTool {
+    pub fn new(scheduler: Arc<dyn Scheduler>) -> Self {
+        Self { scheduler }
+    }
+}
 
 #[async_trait]
 impl Tool for ScheduleTool {
@@ -187,7 +206,7 @@ impl Tool for ScheduleTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule a message to be sent in this session at a future time"
+        "Schedule a reminder to be delivered in this session at a future time (ISO 8601 trigger_at)."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -214,9 +233,27 @@ impl Tool for ScheduleTool {
         )
     }
 
-    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
-        let _args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        Ok("schedule accepted (scheduler not yet implemented)".to_string())
+    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
+        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        let message = args["message"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing or empty 'message'"))?;
+        let trigger_at = args["trigger_at"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing 'trigger_at'"))?;
+        let parsed = DateTime::parse_from_rfc3339(trigger_at)
+            .map_err(|e| anyhow::anyhow!("invalid trigger_at (expected ISO 8601): {e}"))?;
+        let session_id = ctx
+            .session_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no session available for scheduling"))?;
+        let session = Session::new(ctx.persona_name.clone(), session_id);
+        self.scheduler
+            .schedule_reminder(parsed.timestamp(), session, message.to_string())
+            .await?;
+        Ok(format!("已安排于 {trigger_at} 提醒"))
     }
 }
 
@@ -241,9 +278,17 @@ impl Tool for GetVersionTool {
     }
 }
 
-pub fn register_builtin_tools(registry: &ToolRegistryImpl, personas_dir: PathBuf) {
-    registry.register(Arc::new(FileReadTool::new(personas_dir.clone())));
+pub fn register_builtin_tools(
+    registry: &ToolRegistryImpl,
+    personas_dir: PathBuf,
+    scheduler: Arc<dyn Scheduler>,
+    policy: Arc<PathPolicy>,
+) {
+    registry.register(Arc::new(FileReadTool::new(
+        personas_dir.clone(),
+        policy.clone(),
+    )));
     registry.register(Arc::new(FileWriteTool::new(personas_dir)));
-    registry.register(Arc::new(ScheduleTool));
+    registry.register(Arc::new(ScheduleTool::new(scheduler)));
     registry.register(Arc::new(GetVersionTool));
 }

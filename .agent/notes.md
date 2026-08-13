@@ -423,3 +423,15 @@ cloned as a git submodule.
 - Inbound message headers no longer include the bot's own identity:
   `[好友 昵称(QQ)]` for private messages, `[群 群号 昵称(QQ)]` for groups.
   The persona learns its own QQ/nickname via the `get_login_info` tool.
+
+### Scheduler, read allowlist, command interception (2026-08-13)
+- `Scheduler` port (core) + `TokioScheduler` (infra): `schedule` tool
+  registers an ISO-8601 reminder; when due, the message is delivered into the
+  target session with `sender = "scheduler"` so the persona can react.
+- `PathPolicy` (core) + `//allow_read <path>`: user-guided allowlist lets
+  `file_read` read outside the workspace without per-call approval; unlisted
+  paths still go through the 同意/拒绝 permission round-trip.
+- Slash commands are intercepted in `SessionManager::deliver` before the
+  persona. Inbound messages carry the identity header separately
+  (`InboundMessage.prefix`, e.g. `[好友 昵称(QQ)] `) from the user's real
+  content, so commands reach the session manager verbatim.

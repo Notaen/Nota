@@ -8,6 +8,7 @@ pub mod config;
 pub mod http;
 pub mod llm;
 pub mod persona_store;
+pub mod scheduler;
 pub mod tool;
 
 pub use config::{
@@ -17,6 +18,7 @@ pub use config::{
 pub use http::{api::ApiState, serve as http_serve, AppContext};
 pub use llm::OpenAiLlm;
 pub use persona_store::FilePersonaStore;
+pub use scheduler::TokioScheduler;
 pub use tool::{
     ToolRegistryImpl, builtin::register_builtin_tools, chat::register_chat_tools,
 };

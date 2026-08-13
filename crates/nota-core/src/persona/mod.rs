@@ -108,9 +108,10 @@ impl PersonaRuntime {
                 .unwrap_or_default();
 
             let mut messages = history;
+            let display = format!("{}{}", msg.prefix, msg.content);
             messages.push(ChatMessage {
                 role: "user".to_string(),
-                content: Some(msg.content.clone()),
+                content: Some(display.clone()),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -131,7 +132,7 @@ impl PersonaRuntime {
                     &session,
                     &[ChatLogEntry {
                         sender: msg.sender.clone(),
-                        content: msg.content.clone(),
+                        content: display,
                         timestamp: msg.timestamp,
                     }],
                 )

@@ -208,21 +208,24 @@ impl OneBotBridge {
             text = text[self.cfg.prefix.len()..].trim_start().to_string();
         }
 
-        let session_id = match msg.message_type.as_str() {
+        // The identity header is carried separately as `prefix`; `text` stays
+        // the user's real content (so slash commands reach the session
+        // manager verbatim).
+        let (session_id, prefix) = match msg.message_type.as_str() {
             "private" => {
-                text = format!(
-                    "[好友 {}] {text}",
-                    identity(msg.sender.as_ref(), msg.user_id),
+                let prefix = format!(
+                    "[好友 {}] ",
+                    identity(msg.sender.as_ref(), msg.user_id)
                 );
-                format!("onebot_private_{}", msg.user_id)
+                (format!("onebot_private_{}", msg.user_id), prefix)
             }
             "group" => {
                 let Some(group_id) = msg.group_id else { return };
-                text = format!(
-                    "[群 {group_id} {}] {text}",
-                    identity(msg.sender.as_ref(), msg.user_id),
+                let prefix = format!(
+                    "[群 {group_id} {}] ",
+                    identity(msg.sender.as_ref(), msg.user_id)
                 );
-                format!("onebot_group_{group_id}")
+                (format!("onebot_group_{group_id}"), prefix)
             }
             _ => return,
         };
@@ -233,6 +236,7 @@ impl OneBotBridge {
             .deliver(
                 &Session::new(self.persona.clone(), session_id),
                 "user",
+                &prefix,
                 &text,
                 Some(request_id),
             )
@@ -537,6 +541,7 @@ mod tests {
     };
     use nota_core::persona::ChatLogEntry;
     use nota_core::persona::PersonaStore;
+    use nota_core::permissions::PathPolicy;
     use nota_core::session::OutboundEvent;
 
     /// In-memory persona store for tests.
@@ -579,7 +584,10 @@ mod tests {
     }
 
     fn test_bridge() -> (OneBotBridge, Arc<SessionManager>) {
-        let manager = Arc::new(SessionManager::new(Arc::new(MemPersonaStore)));
+        let manager = Arc::new(SessionManager::new(
+            Arc::new(MemPersonaStore),
+            Arc::new(PathPolicy::default()),
+        ));
         let bridge = OneBotBridge::new(
             manager.clone(),
             Arc::new(PermissionRegistry::new()),
@@ -639,7 +647,8 @@ mod tests {
 
         let msg = inbox.recv().await.unwrap();
         assert_eq!(msg.sender, "user");
-        assert_eq!(msg.content, "[好友 Alice(42)] hello");
+        assert_eq!(msg.prefix, "[好友 Alice(42)] ");
+        assert_eq!(msg.content, "hello");
         assert_eq!(msg.session.persona, "bob");
         assert_eq!(msg.session.session_id, "onebot_private_42");
     }
@@ -668,7 +677,8 @@ mod tests {
         bridge.handle_onebot_event(event).await;
 
         let msg = inbox.recv().await.unwrap();
-        assert_eq!(msg.content, "[群 30003 Alice(42)] hi");
+        assert_eq!(msg.prefix, "[群 30003 Alice(42)] ");
+        assert_eq!(msg.content, "hi");
         assert_eq!(msg.session.session_id, "onebot_group_30003");
     }
 

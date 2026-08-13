@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use tokio::sync::{RwLock, oneshot};
 
@@ -31,6 +32,38 @@ impl PermissionRegistry {
 }
 
 impl Default for PermissionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// User-guided read allowlist: paths the user explicitly told the persona it
+/// may read outside its workspace (`//allow_read <path>`). Reads under these
+/// prefixes skip the per-call approval round-trip.
+pub struct PathPolicy {
+    allowed_read: RwLock<HashSet<PathBuf>>,
+}
+
+impl PathPolicy {
+    pub fn new() -> Self {
+        Self {
+            allowed_read: RwLock::new(HashSet::new()),
+        }
+    }
+
+    /// Record a user-approved path prefix for reading outside the workspace.
+    pub async fn allow_read(&self, path: PathBuf) {
+        self.allowed_read.write().await.insert(path);
+    }
+
+    /// Whether `path` is inside a user-allowed read prefix.
+    pub async fn is_read_allowed(&self, path: &Path) -> bool {
+        let allowed = self.allowed_read.read().await;
+        allowed.iter().any(|prefix| path.starts_with(prefix))
+    }
+}
+
+impl Default for PathPolicy {
     fn default() -> Self {
         Self::new()
     }

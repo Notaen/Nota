@@ -100,6 +100,7 @@ async fn handle_command(
                 .deliver(
                     &Session::new(persona, session_id),
                     "user",
+                    "",
                     &content,
                     Some(request_id),
                 )

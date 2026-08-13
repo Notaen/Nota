@@ -11,11 +11,13 @@
 //!   reaches the persona.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
+use crate::permissions::PathPolicy;
 use crate::persona::PersonaStore;
 
 /// Identifies one conversation: a persona plus an adapter-assigned session id.
@@ -44,6 +46,9 @@ pub fn adapter_prefix(session_id: &str) -> &str {
 pub struct InboundMessage {
     pub session: Session,
     pub sender: String,
+    /// Identity header shown before the content (e.g. `[好友 昵称(QQ)] `).
+    pub prefix: String,
+    /// The user's real message text, without any header.
     pub content: String,
     pub timestamp: i64,
     pub request_id: Option<String>,
@@ -82,14 +87,16 @@ pub struct SessionManager {
     persona_inboxes: Mutex<HashMap<String, UnboundedSender<InboundMessage>>>,
     adapter_outboxes: Mutex<HashMap<String, Vec<UnboundedSender<AdapterEvent>>>>,
     personas: Arc<dyn PersonaStore>,
+    policy: Arc<PathPolicy>,
 }
 
 impl SessionManager {
-    pub fn new(personas: Arc<dyn PersonaStore>) -> Self {
+    pub fn new(personas: Arc<dyn PersonaStore>, policy: Arc<PathPolicy>) -> Self {
         Self {
             persona_inboxes: Mutex::new(HashMap::new()),
             adapter_outboxes: Mutex::new(HashMap::new()),
             personas,
+            policy,
         }
     }
 
@@ -124,6 +131,7 @@ impl SessionManager {
         &self,
         session: &Session,
         sender: &str,
+        prefix: &str,
         content: &str,
         request_id: Option<String>,
     ) {
@@ -135,6 +143,7 @@ impl SessionManager {
         let msg = InboundMessage {
             session: session.clone(),
             sender: sender.to_string(),
+            prefix: prefix.to_string(),
             content: content.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
             request_id,
@@ -227,19 +236,36 @@ impl SessionManager {
                 )
                 .await;
             }
+            SlashCommand::AllowRead(path) => {
+                self.policy.allow_read(path.clone()).await;
+                self.route_outbound(
+                    Some(&session.session_id),
+                    None,
+                    &format!("已允许读取：{}", path.display()),
+                    None,
+                )
+                .await;
+            }
         }
     }
 }
 
 enum SlashCommand {
     Clear,
+    AllowRead(PathBuf),
 }
 
 fn parse_command(content: &str) -> Option<SlashCommand> {
     let trimmed = content.trim();
     let cmd = trimmed.strip_prefix("//")?.trim();
-    match cmd {
-        "clear" => Some(SlashCommand::Clear),
-        _ => None,
+    if cmd == "clear" {
+        return Some(SlashCommand::Clear);
     }
+    if let Some(rest) = cmd.strip_prefix("allow_read") {
+        let path = rest.trim();
+        if !path.is_empty() {
+            return Some(SlashCommand::AllowRead(PathBuf::from(path)));
+        }
+    }
+    None
 }

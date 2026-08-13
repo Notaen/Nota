@@ -118,6 +118,7 @@ mod tests {
     use super::*;
     use nota_core::permissions::PermissionRegistry;
     use nota_core::persona::{ChatLogEntry, PersonaStore};
+    use nota_core::permissions::PathPolicy;
     use nota_core::session::{AdapterEvent, Session, SessionManager};
     use anyhow::Result;
     use async_trait::async_trait;
@@ -163,7 +164,10 @@ mod tests {
     }
 
     fn tool_ctx() -> ToolContext {
-        let manager = Arc::new(SessionManager::new(Arc::new(MemPersonaStore)));
+        let manager = Arc::new(SessionManager::new(
+            Arc::new(MemPersonaStore),
+            Arc::new(PathPolicy::default()),
+        ));
         ToolContext {
             persona_name: "bob".to_string(),
             manager,
