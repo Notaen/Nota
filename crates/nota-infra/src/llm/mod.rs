@@ -123,15 +123,19 @@ enum ResponsesContentPart {
     OutputText { text: String },
 }
 
-/// Function tools in the Responses API are flat (`type`, `name`,
-/// `description`, `parameters`) instead of nested under `function`.
+/// Tools in the Responses API. Function tools are flat (`type`, `name`,
+/// `description`, `parameters`) instead of nested under `function`; the
+/// built-in `web_search` tool has no extra fields (DeepSeek executes it
+/// server-side).
 #[derive(Serialize)]
-struct ResponsesTool {
-    #[serde(rename = "type")]
-    tool_type: String,
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesTool {
+    Function {
+        name: String,
+        description: String,
+        parameters: serde_json::Value,
+    },
+    WebSearch,
 }
 
 #[derive(Deserialize)]
@@ -179,11 +183,19 @@ pub struct OpenAiLlm {
     model: String,
     /// "responses" (default) or "chat".
     api_mode: String,
+    /// Attach the built-in `web_search` tool in responses mode.
+    web_search: bool,
     client: reqwest::Client,
 }
 
 impl OpenAiLlm {
-    pub fn new(api_url: &str, api_key: &str, model: &str, api_mode: &str) -> Self {
+    pub fn new(
+        api_url: &str,
+        api_key: &str,
+        model: &str,
+        api_mode: &str,
+        web_search: bool,
+    ) -> Self {
         Self {
             api_url: api_url.to_string(),
             api_key: api_key.to_string(),
@@ -193,6 +205,7 @@ impl OpenAiLlm {
             } else {
                 api_mode.to_string()
             },
+            web_search,
             client: reqwest::Client::new(),
         }
     }
@@ -206,16 +219,7 @@ impl OpenAiLlm {
         let instructions = (!system.is_empty()).then(|| system.to_string());
         let input = to_responses_input(messages);
 
-        let api_tools: Vec<ResponsesTool> = tools
-            .iter()
-            .map(|t| ResponsesTool {
-                tool_type: "function".to_string(),
-                name: t.name.clone(),
-                description: t.description.clone(),
-                parameters: serde_json::to_value(&t.parameters)
-                    .unwrap_or(serde_json::Value::Null),
-            })
-            .collect();
+        let api_tools = build_responses_tools(tools, self.web_search);
 
         let req = ResponsesRequest {
             model: self.model.clone(),
@@ -369,6 +373,21 @@ fn to_responses_input(messages: &[ChatMessage]) -> Vec<ResponsesInputItem> {
     }
 
     items
+}
+
+fn build_responses_tools(tools: &[ToolDef], web_search: bool) -> Vec<ResponsesTool> {
+    let mut api_tools: Vec<ResponsesTool> = tools
+        .iter()
+        .map(|t| ResponsesTool::Function {
+            name: t.name.clone(),
+            description: t.description.clone(),
+            parameters: serde_json::to_value(&t.parameters).unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
+    if web_search {
+        api_tools.push(ResponsesTool::WebSearch);
+    }
+    api_tools
 }
 
 fn to_wire_message(msg: &ChatMessage) -> WireMessage {
@@ -574,6 +593,38 @@ mod tests {
                 }
             ])
         );
+    }
+
+    #[test]
+    fn responses_tools_include_web_search_by_default() {
+        let tools = vec![ToolDef {
+            name: "get_weather".to_string(),
+            description: "Get the weather".to_string(),
+            parameters: nota_core::tool::ToolParams::object(
+                std::collections::HashMap::new(),
+                Vec::new(),
+            ),
+        }];
+
+        let value = serde_json::to_value(build_responses_tools(&tools, true)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": { "type": "object", "properties": {}, "required": [] },
+                },
+                { "type": "web_search" },
+            ])
+        );
+    }
+
+    #[test]
+    fn responses_tools_omit_web_search_when_disabled() {
+        let value = serde_json::to_value(build_responses_tools(&[], false)).unwrap();
+        assert_eq!(value, serde_json::json!([]));
     }
 
     #[test]

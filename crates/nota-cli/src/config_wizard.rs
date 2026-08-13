@@ -86,6 +86,11 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
         .interact()?;
     let api_mode = if mode_selection == 0 { "responses" } else { "chat" }.to_string();
 
+    let web_search = Confirm::new()
+        .with_prompt("Enable the built-in web_search tool (Responses API)?")
+        .default(existing.map(|cfg| cfg.web_search).unwrap_or(true))
+        .interact()?;
+
     let onebot = prompt_onebot(existing)?;
 
     let cfg = Config {
@@ -93,6 +98,7 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
         api_key,
         model,
         api_mode,
+        web_search,
         onebot,
     };
 
@@ -105,6 +111,7 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
     println!("  API Key : {}", mask_key(&cfg.api_key));
     println!("  Model   : {}", cfg.model);
     println!("  API Mode: {}", cfg.api_mode);
+    println!("  WebSearch: {}", if cfg.web_search { "enabled" } else { "disabled" });
     match &cfg.onebot {
         Some(ob) if ob.enabled => {
             println!("  OneBot  : enabled ({} -> {})", ob.mode, ob.ws_url);

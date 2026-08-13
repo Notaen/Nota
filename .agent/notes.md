@@ -473,3 +473,18 @@ cloned as a git submodule.
   function-call round trips both return `status: completed` at
   `https://api.deepseek.com/v1/responses`, and an end-to-end WS chat
   through persona Nota produced a reply.
+
+### Built-in web_search tool in Responses API mode (2026-08-13)
+- `Config.web_search` (default `true`) attaches DeepSeek's server-side
+  built-in `web_search` tool to every Responses API request:
+  `tools` gains `{"type":"web_search"}` after the function tools. Set it to
+  `false` in `config.toml` to disable; the onboard wizard asks for it.
+- DeepSeek executes the search server-side and injects the results into the
+  model context; the response surfaces `web_search_call` output items
+  (ignored by the parser, like `reasoning`) plus the final answer message.
+  `search_context_size` / `user_location` are ignored by DeepSeek, so the
+  tool is sent with no extra fields.
+- Verified live: a query about 2026-08-13 tech news returned
+  `status: completed` with multiple `web_search_call` items and a final
+  answer containing real-time news; the same flow works end-to-end through
+  persona Nota over the local WS channel.

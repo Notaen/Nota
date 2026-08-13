@@ -58,6 +58,10 @@ pub struct Config {
     /// "chat" (legacy Chat Completions).
     #[serde(default = "default_api_mode")]
     pub api_mode: String,
+    /// Attach the provider's built-in `web_search` tool to Responses API
+    /// requests by default (DeepSeek executes it server-side).
+    #[serde(default = "default_web_search")]
+    pub web_search: bool,
     /// Optional OneBot 11 adapter configuration (`[onebot]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub onebot: Option<OnebotConfig>,
@@ -65,6 +69,10 @@ pub struct Config {
 
 fn default_api_mode() -> String {
     "responses".to_string()
+}
+
+fn default_web_search() -> bool {
+    true
 }
 
 /// Owns the loaded [`Config`] and the path it is read from / written to.
