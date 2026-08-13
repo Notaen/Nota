@@ -48,12 +48,14 @@ Notes:
   `get_msg` tool fetches the quoted message by that id, and group history
   lines include `消息ID:…` so the persona can correlate quotes to messages.
 - **Sessions & send/receive**: each chat endpoint (a QQ friend, a group, a
-  web client) is its own conversation **session** with an isolated chatlog
-  (`~/.nota/personas/<name>/sessions/<id>/chatlog.json`). The persona's
-  final answer is auto-routed back to the originating session; `skip_reply`
-  suppresses it ("不要回答" is honored), `reply` adds more messages in a
-  row, and `send_private_msg` / `send_group_msg` enable proactive messages
-  (targets must be allowlisted).
+  web client) is its own conversation **session** with two history layers:
+  `deep.json` (full LLM context) and `shallow.json` (only messages actually
+  delivered to the user). The persona's final answer is auto-routed back to
+  the originating session; `skip_reply` / empty output suppress it
+  ("不要回答" is honored). `send_message(target: "private:<QQ>" |
+  "group:<QQ>", content)` lets the persona proactively message any
+  allowlisted session (e.g. from a private chat into a group), and every
+  delivered message lands in that session's shallow layer.
 - **Allowlist**: the persona only responds to `friend_ids` / `group_ids`.
   Messages from anyone else are dropped before the LLM is ever called.
   Empty list means nobody in that category is allowed.
@@ -176,8 +178,10 @@ Runtime data under the user's home directory:
 │   └── <name>/
 │       ├── solo.md        # system prompt
 │       ├── memory.md      # long-term memory
-│       └── sessions/      # per-conversation chatlogs
-│           └── <session_id>/chatlog.json
+│       └── sessions/      # per-conversation history
+│           └── <session_id>/
+│               ├── deep.json      # LLM context (full history + tool calls)
+│               └── shallow.json   # messages actually delivered to the user
 ├── .logs/                 # rotating logs (30-day)
 └── config.toml            # api_url, api_key, model
 ```

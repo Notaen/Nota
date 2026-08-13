@@ -17,4 +17,6 @@ pub use config::{
 pub use http::{api::ApiState, serve as http_serve, AppContext};
 pub use llm::OpenAiLlm;
 pub use persona_store::FilePersonaStore;
-pub use tool::{ToolRegistryImpl, builtin::register_builtin_tools};
+pub use tool::{
+    ToolRegistryImpl, builtin::register_builtin_tools, chat::register_chat_tools,
+};

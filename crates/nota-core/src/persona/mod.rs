@@ -133,7 +133,7 @@ impl PersonaRuntime {
 
             let _ = self
                 .sessions
-                .append_chatlog(
+                .append_deep(
                     &session,
                     &[ChatLogEntry {
                         sender: event.sender.clone(),
@@ -165,7 +165,7 @@ impl PersonaRuntime {
 
                     let _ = self
                         .sessions
-                        .append_chatlog(&session, &chatlog_entries)
+                        .append_deep(&session, &chatlog_entries)
                         .await;
 
                     if !suppress_reply.load(Ordering::SeqCst)
@@ -207,7 +207,7 @@ impl PersonaRuntime {
     }
 
     async fn load_chatlog_context(&self, session: &Session) -> Result<Vec<ChatMessage>> {
-        let entries = self.sessions.read_chatlog(session, None).await?;
+        let entries = self.sessions.read_deep(session, None).await?;
 
         let mut messages = Vec::new();
         for entry in entries {

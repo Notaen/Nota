@@ -27,7 +27,7 @@ use nota_core::session::SessionStore;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
-    http_serve, register_builtin_tools,
+    http_serve, register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -131,6 +131,7 @@ async fn run_server(
 
     let tool_registry: Arc<ToolRegistryImpl> = Arc::new(ToolRegistryImpl::new());
     register_builtin_tools(&tool_registry, base.join("personas"));
+    register_chat_tools(tool_registry.as_ref());
 
     let persona_names = persona_store.list_personas().await?;
     if persona_names.is_empty() {
@@ -166,6 +167,7 @@ async fn run_server(
             persona_store.clone(),
             tool_registry.clone(),
             onebot,
+            session_store.clone(),
         )
         .await?;
     }
@@ -202,6 +204,7 @@ async fn start_onebot(
     persona_store: Arc<dyn PersonaStore>,
     tool_registry: Arc<ToolRegistryImpl>,
     cfg: &OnebotConfig,
+    session_store: Arc<dyn SessionStore>,
 ) -> Result<()> {
     if cfg.mode != "ws" {
         anyhow::bail!(
@@ -227,7 +230,13 @@ async fn start_onebot(
         cfg.persona.clone()
     };
 
-    let bridge = OneBotBridge::new(bus, permissions, persona.clone(), cfg.clone());
+    let bridge = OneBotBridge::new(
+        bus,
+        permissions,
+        persona.clone(),
+        cfg.clone(),
+        session_store,
+    );
     bridge.register_tools(tool_registry.as_ref());
     tokio::spawn(async move { bridge.run().await });
     info!(

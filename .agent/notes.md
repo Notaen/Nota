@@ -364,3 +364,20 @@ cloned as a git submodule.
   still go through `send_private_msg` / `send_group_msg`.
 - This keeps exactly one reply path, eliminating double replies caused by
   the LLM both calling `reply` and emitting final text.
+
+### Two-layer sessions + session-level send_message (2026-08-13)
+- Each session now has two layers: `deep.json` (full LLM context: inbound,
+  assistant turns, tool calls) and `shallow.json` (only messages actually
+  delivered to the user). Legacy `chatlog.json` is read as a fallback and
+  migrated to `deep.json` on first write.
+- The adapter-specific `send_private_msg` / `send_group_msg` tools were
+  replaced by one channel-agnostic `send_message(target, content)` in
+  `nota-infra` (`tool/chat.rs`, with `skip_reply`). Target format is
+  `private:<QQ>` / `group:<QQ>`; the OneBot bridge maps it to its session
+  and enforces the allowlist.
+- The bridge holds `SessionStore`: after a message is actually sent (auto
+  reply or explicit send), it records the delivered content in the target
+  session's shallow layer — persona intent lives in deep, delivered messages
+  live in shallow.
+- Future `dream` runs will learn from the shallow layer (what the persona
+  really said) to self-optimize the persona; not implemented yet.

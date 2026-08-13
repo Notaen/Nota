@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use nota_core::bus::{BusEvent, EventBus, EventKind};
 use nota_core::permissions::PermissionRegistry;
+use nota_core::persona::ChatLogEntry;
+use nota_core::session::{Session, SessionStore};
 use nota_core::tool::ToolRegistry;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use uuid::Uuid;
@@ -20,10 +22,7 @@ use uuid::Uuid;
 use crate::config::OnebotConfig;
 use crate::api::OneBotApi;
 use crate::client::{self, PendingResponses};
-use crate::tools::{
-    GetLoginInfoTool, GetMsgTool, ReadGroupChatTool, SendGroupMsgTool,
-    SendPrivateMsgTool, SkipReplyTool,
-};
+use crate::tools::{GetLoginInfoTool, GetMsgTool, ReadGroupChatTool};
 use crate::types::{
     ActionRequest, MessageEvent, PostEvent, ReplyRoute, chunk_text, identity,
 };
@@ -37,6 +36,7 @@ pub struct OneBotBridge {
     persona: String,
     cfg: OnebotConfig,
     api: OneBotApi,
+    sessions: Arc<dyn SessionStore>,
     action_rx: Option<mpsc::UnboundedReceiver<ActionRequest>>,
 }
 
@@ -78,6 +78,7 @@ impl OneBotBridge {
         permissions: Arc<PermissionRegistry>,
         persona: String,
         cfg: OnebotConfig,
+        sessions: Arc<dyn SessionStore>,
     ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let pending: PendingResponses = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -88,6 +89,7 @@ impl OneBotBridge {
             persona,
             cfg,
             api,
+            sessions,
             action_rx: Some(action_rx),
         }
     }
@@ -112,9 +114,6 @@ impl OneBotBridge {
         registry.register(Arc::new(ReadGroupChatTool::new(self.api())));
         registry.register(Arc::new(GetLoginInfoTool::new(self.api())));
         registry.register(Arc::new(GetMsgTool::new(self.api())));
-        registry.register(Arc::new(SendPrivateMsgTool));
-        registry.register(Arc::new(SendGroupMsgTool));
-        registry.register(Arc::new(SkipReplyTool));
     }
 
     /// Run the bridge forever: forward OneBot events to the bus and route
@@ -238,22 +237,22 @@ impl OneBotBridge {
             return;
         }
 
-        // Only events addressed to a OneBot session are handled here; other
-        // channels (web, future adapters) route their own sessions.
-        let Some(session_id) = event.session_id.as_deref() else { return };
-        let Some(route) = session_to_route(session_id) else { return };
-
         match event.kind {
             EventKind::Message => {
                 // Automatic reply: the persona's final text is delivered back
                 // to the originating session. The allowlist is enforced in
                 // `Outbound`.
+                let Some(session_id) = event.session_id.as_deref() else { return };
+                let Some(route) = session_to_route(session_id) else { return };
                 let outbound = self.outbound_for(action_tx);
-                if let Err(e) = send_via(&outbound, &route, &event.content) {
-                    log::warn!("OneBot reply suppressed: {e:#}");
+                match send_via(&outbound, &route, &event.content) {
+                    Ok(()) => self.record_shallow(session_id, &event.content).await,
+                    Err(e) => log::warn!("OneBot reply suppressed: {e:#}"),
                 }
             }
             EventKind::PermissionRequest => {
+                let Some(session_id) = event.session_id.as_deref() else { return };
+                let Some(route) = session_to_route(session_id) else { return };
                 let Some(_parent) = event.parent_request_id else { return };
                 // OneBot has no interactive approval channel yet: deny so the
                 // tool call fails fast instead of hanging the persona loop.
@@ -267,14 +266,44 @@ impl OneBotBridge {
                 self.send_reply(action_tx, &route, &notice);
             }
             EventKind::OutboundMessage => {
-                // The persona asked to send a message explicitly; the target
-                // rides in the session id and the allowlist is enforced in
-                // `Outbound`.
+                // The persona asked to send a message explicitly. `context`
+                // carries the adapter-independent target
+                // (`private:<QQ>` / `group:<QQ>`); only allowlisted targets
+                // are delivered, and the real message is recorded in the
+                // target session's shallow layer.
+                let Some(route) = target_to_route(&event.context) else {
+                    log::warn!(
+                        "OneBot outbound event has no usable target: '{}'",
+                        event.context
+                    );
+                    return;
+                };
                 let outbound = self.outbound_for(action_tx);
                 if let Err(e) = send_via(&outbound, &route, &event.content) {
                     log::warn!("OneBot outbound send failed: {e:#}");
+                    return;
                 }
+                self.record_shallow(&route_to_session_id(&route), &event.content)
+                    .await;
             }
+        }
+    }
+
+    /// Record an actually-delivered message in the session's shallow layer
+    /// (what the user saw).
+    async fn record_shallow(&self, session_id: &str, content: &str) {
+        let entry = ChatLogEntry {
+            sender: self.persona.clone(),
+            content: content.to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            context: String::new(),
+        };
+        if let Err(e) = self
+            .sessions
+            .append_shallow(&Session::new(self.persona.clone(), session_id), &[entry])
+            .await
+        {
+            log::warn!("failed to record shallow message: {e:#}");
         }
     }
 
@@ -320,6 +349,26 @@ fn session_to_route(session_id: &str) -> Option<ReplyRoute> {
     }
 }
 
+/// Map an adapter-independent target (`private:<QQ>` / `group:<QQ>`) to a
+/// OneBot reply route.
+fn target_to_route(target: &str) -> Option<ReplyRoute> {
+    let (kind, id) = target.split_once(':')?;
+    let id: i64 = id.parse().ok()?;
+    match kind {
+        "private" => Some(ReplyRoute::Private { user_id: id }),
+        "group" => Some(ReplyRoute::Group { group_id: id }),
+        _ => None,
+    }
+}
+
+/// The OneBot session id for a reply route.
+fn route_to_session_id(route: &ReplyRoute) -> String {
+    match route {
+        ReplyRoute::Private { user_id } => format!("onebot_private_{user_id}"),
+        ReplyRoute::Group { group_id } => format!("onebot_group_{group_id}"),
+    }
+}
+
 /// Send `text` to `route` through `outbound` (allowlist + chunking applied
 /// inside `Outbound`).
 fn send_via(
@@ -336,13 +385,63 @@ fn send_via(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
     use crate::types::{
         ActionParams, MessageContent, MessageEvent, Sender,
     };
     use nota_core::bus::EventBus;
+    use nota_core::persona::ChatLogEntry;
+    use nota_core::session::{Session, SessionStore};
+    use std::sync::Mutex;
 
-    fn test_bridge() -> OneBotBridge {
-        OneBotBridge::new(
+    /// In-memory session store for tests.
+    #[derive(Default)]
+    struct MemSessionStore {
+        deep: Mutex<Vec<ChatLogEntry>>,
+        shallow: Mutex<Vec<ChatLogEntry>>,
+    }
+
+    #[async_trait]
+    impl SessionStore for MemSessionStore {
+        async fn append_deep(
+            &self,
+            _session: &Session,
+            entries: &[ChatLogEntry],
+        ) -> Result<()> {
+            self.deep.lock().unwrap().extend(entries.iter().cloned());
+            Ok(())
+        }
+
+        async fn read_deep(
+            &self,
+            _session: &Session,
+            _since: Option<i64>,
+        ) -> Result<Vec<ChatLogEntry>> {
+            Ok(self.deep.lock().unwrap().clone())
+        }
+
+        async fn append_shallow(
+            &self,
+            _session: &Session,
+            entries: &[ChatLogEntry],
+        ) -> Result<()> {
+            self.shallow.lock().unwrap().extend(entries.iter().cloned());
+            Ok(())
+        }
+
+        async fn read_shallow(
+            &self,
+            _session: &Session,
+            _since: Option<i64>,
+        ) -> Result<Vec<ChatLogEntry>> {
+            Ok(self.shallow.lock().unwrap().clone())
+        }
+    }
+
+    fn test_bridge_with_store() -> (OneBotBridge, Arc<MemSessionStore>) {
+        let store = Arc::new(MemSessionStore::default());
+        let bridge = OneBotBridge::new(
             Arc::new(EventBus::new()),
             Arc::new(PermissionRegistry::new()),
             "bob".to_string(),
@@ -356,7 +455,13 @@ mod tests {
                 friend_ids: Vec::new(),
                 group_ids: Vec::new(),
             },
-        )
+            store.clone(),
+        );
+        (bridge, store)
+    }
+
+    fn test_bridge() -> OneBotBridge {
+        test_bridge_with_store().0
     }
 
     fn private_event(user_id: i64, text: &str) -> PostEvent {
@@ -492,7 +597,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_routes_persona_reply_by_session() {
-        let mut bridge = test_bridge();
+        let (mut bridge, store) = test_bridge_with_store();
         bridge.cfg.friend_ids = vec![42];
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
         let event = BusEvent::message(
@@ -511,6 +616,12 @@ mod tests {
         };
         assert_eq!(user_id, 42);
         assert_eq!(message[0].data.text, "hi");
+
+        // The delivered reply is recorded in the session's shallow layer.
+        let shallow = store.shallow.lock().unwrap();
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].sender, "bob");
+        assert_eq!(shallow[0].content, "hi");
     }
 
     #[tokio::test]
@@ -607,20 +718,25 @@ mod tests {
 
     #[tokio::test]
     async fn forwards_outbound_message_by_session() {
-        let mut bridge = test_bridge();
-        bridge.cfg.friend_ids = vec![42];
+        let (mut bridge, store) = test_bridge_with_store();
+        bridge.cfg.group_ids = vec![30003];
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
         let event = BusEvent::outbound_message(
             "bob".to_string(),
             "hi".to_string(),
             None,
-            String::new(),
-        )
-        .with_session(Some("onebot_private_42".to_string()));
+            "group:30003".to_string(),
+        );
 
         bridge.handle_bus_event(event, &action_tx).await;
 
         let action = action_rx.recv().await.unwrap();
-        assert_eq!(action.action, "send_private_msg");
+        assert_eq!(action.action, "send_group_msg");
+
+        // The actual outbound message lands in the target session's shallow
+        // layer even though this turn originated elsewhere.
+        let shallow = store.shallow.lock().unwrap();
+        assert_eq!(shallow.len(), 1);
+        assert_eq!(shallow[0].content, "hi");
     }
 }

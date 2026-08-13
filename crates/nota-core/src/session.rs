@@ -1,5 +1,14 @@
 //! Chat sessions: an isolated conversation between a persona and one channel
 //! endpoint (e.g. a QQ friend, a QQ group, a web client).
+//!
+//! Each session has **two layers** of history:
+//! - **deep**: the full conversation history fed to the LLM (inbound
+//!   messages, assistant turns, tool calls/results — everything the persona
+//!   "thought").
+//! - **shallow**: only the messages actually delivered to the user (real
+//!   outbound content: text / images / stickers). Future `dream` runs will
+//!   learn from this layer — what the persona actually said — rather than
+//!   its internal reasoning.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -29,13 +38,29 @@ impl Session {
 /// its own LLM history.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
-    async fn append_chatlog(
+    /// Append to the deep layer (LLM context).
+    async fn append_deep(
         &self,
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()>;
 
-    async fn read_chatlog(
+    /// Read the deep layer (LLM context).
+    async fn read_deep(
+        &self,
+        session: &Session,
+        since: Option<i64>,
+    ) -> Result<Vec<ChatLogEntry>>;
+
+    /// Append to the shallow layer (what was actually delivered to the user).
+    async fn append_shallow(
+        &self,
+        session: &Session,
+        entries: &[ChatLogEntry],
+    ) -> Result<()>;
+
+    /// Read the shallow layer (actual outbound messages).
+    async fn read_shallow(
         &self,
         session: &Session,
         since: Option<i64>,

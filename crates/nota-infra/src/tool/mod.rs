@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use nota_core::tool::{Tool, ToolRegistry};
 
 pub mod builtin;
+pub mod chat;
 
 pub struct ToolRegistryImpl {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
