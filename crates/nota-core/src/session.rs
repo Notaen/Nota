@@ -1,23 +1,24 @@
-//! Chat sessions: an isolated conversation between a persona and one channel
-//! endpoint (e.g. a QQ friend, a QQ group, a web client).
+//! Chat sessions and the session-scoped message routing layer.
 //!
-//! Each session has **two layers** of history:
-//! - **deep**: the full conversation history fed to the LLM (inbound
-//!   messages, assistant turns, tool calls/results — everything the persona
-//!   "thought").
-//! - **shallow**: only the messages actually delivered to the user (real
-//!   outbound content: text / images / stickers). Future `dream` runs will
-//!   learn from this layer — what the persona actually said — rather than
-//!   its internal reasoning.
+//! There is no global broadcast bus: every message is routed by session.
+//! - **Inbound**: an adapter delivers a chat message to the *target persona's
+//!   inbox* (carrying the `Session`), so the persona always receives it.
+//! - **Outbound**: the persona replies to a session (routed to that session's
+//!   adapter) or sends to a channel-agnostic target (broadcast to adapters,
+//!   each adapter claims what it understands).
+//! - **Permissions** are routed to the session's adapter for user approval.
+//! - **Slash commands** (`//clear` etc.) are handled here, before anything
+//!   reaches the persona.
 
-use anyhow::Result;
-use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::Arc;
 
-use crate::persona::ChatLogEntry;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+
+use crate::persona::PersonaStore;
 
 /// Identifies one conversation: a persona plus an adapter-assigned session id.
-/// The session id is opaque and must be safe to use as a filesystem path
-/// segment (e.g. `onebot_private_2961354039`, `web_<uuid>`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Session {
     pub persona: String,
@@ -33,23 +34,212 @@ impl Session {
     }
 }
 
-/// Per-session **shallow** storage: only the messages actually delivered to
-/// the user (text / images / stickers) live here. The deep layer (LLM
-/// context) is managed by the persona module; sessions keep what was really
-/// said so future `dream` runs can learn from real interactions.
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    /// Append to the shallow layer (what was actually delivered to the user).
-    async fn append_shallow(
-        &self,
-        session: &Session,
-        entries: &[ChatLogEntry],
-    ) -> Result<()>;
+/// Adapter prefix of a session id (up to the first `_`): `onebot`, `web`, …
+pub fn adapter_prefix(session_id: &str) -> &str {
+    session_id.split('_').next().unwrap_or(session_id)
+}
 
-    /// Read the shallow layer (actual outbound messages).
-    async fn read_shallow(
+/// An inbound chat message delivered to a persona's inbox.
+#[derive(Debug, Clone)]
+pub struct InboundMessage {
+    pub session: Session,
+    pub sender: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub request_id: Option<String>,
+}
+
+/// An outbound event routed to adapters. Either `session_id` (replies and
+/// session-targeted sends) or `target` (channel-agnostic, e.g.
+/// `group:551947633`) is set.
+#[derive(Debug, Clone)]
+pub struct OutboundEvent {
+    pub session_id: Option<String>,
+    pub target: Option<String>,
+    pub content: String,
+    pub request_id: Option<String>,
+}
+
+/// A permission request routed to the session's adapter for user approval.
+#[derive(Debug, Clone)]
+pub struct PermissionEvent {
+    pub session_id: String,
+    pub permission_id: String,
+    pub prompt: String,
+    pub parent_request_id: Option<String>,
+}
+
+/// Everything an adapter can receive from its sessions.
+#[derive(Debug, Clone)]
+pub enum AdapterEvent {
+    Outbound(OutboundEvent),
+    Permission(PermissionEvent),
+}
+
+/// Routes messages by session: persona inboxes for inbound, adapter outboxes
+/// for outbound and permissions. Owns slash-command handling (`//clear`).
+pub struct SessionManager {
+    persona_inboxes: Mutex<HashMap<String, UnboundedSender<InboundMessage>>>,
+    adapter_outboxes: Mutex<HashMap<String, Vec<UnboundedSender<AdapterEvent>>>>,
+    personas: Arc<dyn PersonaStore>,
+}
+
+impl SessionManager {
+    pub fn new(personas: Arc<dyn PersonaStore>) -> Self {
+        Self {
+            persona_inboxes: Mutex::new(HashMap::new()),
+            adapter_outboxes: Mutex::new(HashMap::new()),
+            personas,
+        }
+    }
+
+    /// Register a persona's inbox; the persona loop consumes from it.
+    pub fn subscribe_persona(&self, persona: &str) -> UnboundedReceiver<InboundMessage> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.persona_inboxes
+            .lock()
+            .unwrap()
+            .insert(persona.to_string(), tx);
+        rx
+    }
+
+    /// Register an adapter outbox (keyed by adapter prefix, e.g. `onebot`).
+    pub fn subscribe_adapter(
+        &self,
+        prefix: &str,
+    ) -> UnboundedReceiver<AdapterEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.adapter_outboxes
+            .lock()
+            .unwrap()
+            .entry(prefix.to_string())
+            .or_default()
+            .push(tx);
+        rx
+    }
+
+    /// Deliver an inbound chat message to the target persona. Slash commands
+    /// (`//…`) are handled here and never reach the persona.
+    pub async fn deliver(
         &self,
         session: &Session,
-        since: Option<i64>,
-    ) -> Result<Vec<ChatLogEntry>>;
+        sender: &str,
+        content: &str,
+        request_id: Option<String>,
+    ) {
+        if let Some(cmd) = parse_command(content) {
+            self.run_command(session, cmd).await;
+            return;
+        }
+
+        let msg = InboundMessage {
+            session: session.clone(),
+            sender: sender.to_string(),
+            content: content.to_string(),
+            timestamp: chrono::Utc::now().timestamp(),
+            request_id,
+        };
+        let inbox = self
+            .persona_inboxes
+            .lock()
+            .unwrap()
+            .get(&session.persona)
+            .cloned();
+        if let Some(tx) = inbox {
+            let _ = tx.send(msg);
+        } else {
+            log::warn!(
+                "no inbox for persona '{}'; message dropped",
+                session.persona
+            );
+        }
+    }
+
+    /// Persona replies / sends: route to the session's adapter, or broadcast
+    /// to every adapter when only a channel-agnostic target is known.
+    pub async fn route_outbound(
+        &self,
+        session_id: Option<&str>,
+        target: Option<&str>,
+        content: &str,
+        request_id: Option<String>,
+    ) {
+        let event = AdapterEvent::Outbound(OutboundEvent {
+            session_id: session_id.map(str::to_string),
+            target: target.map(str::to_string),
+            content: content.to_string(),
+            request_id,
+        });
+        let outboxes = self.adapter_outboxes.lock().unwrap();
+        match session_id {
+            Some(sid) => {
+                if let Some(channels) = outboxes.get(adapter_prefix(sid)) {
+                    for tx in channels {
+                        let _ = tx.send(event.clone());
+                    }
+                }
+            }
+            None => {
+                for channels in outboxes.values() {
+                    for tx in channels {
+                        let _ = tx.send(event.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    /// Route a permission request to the session's adapter.
+    pub async fn send_permission(
+        &self,
+        session_id: &str,
+        permission_id: &str,
+        prompt: &str,
+        parent_request_id: Option<String>,
+    ) {
+        let event = AdapterEvent::Permission(PermissionEvent {
+            session_id: session_id.to_string(),
+            permission_id: permission_id.to_string(),
+            prompt: prompt.to_string(),
+            parent_request_id,
+        });
+        let outboxes = self.adapter_outboxes.lock().unwrap();
+        if let Some(channels) = outboxes.get(adapter_prefix(session_id)) {
+            for tx in channels {
+                let _ = tx.send(event.clone());
+            }
+        }
+    }
+
+    /// Execute a slash command against the session and ack through the
+    /// adapter.
+    async fn run_command(&self, session: &Session, cmd: SlashCommand) {
+        match cmd {
+            SlashCommand::Clear => {
+                if let Err(e) = self.personas.clear_history(session).await {
+                    log::warn!("//clear history failed: {e:#}");
+                }
+                self.route_outbound(
+                    Some(&session.session_id),
+                    None,
+                    "已清除当前会话的历史记录",
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+}
+
+enum SlashCommand {
+    Clear,
+}
+
+fn parse_command(content: &str) -> Option<SlashCommand> {
+    let trimmed = content.trim();
+    let cmd = trimmed.strip_prefix("//")?.trim();
+    match cmd {
+        "clear" => Some(SlashCommand::Clear),
+        _ => None,
+    }
 }

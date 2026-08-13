@@ -6,10 +6,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentRunner;
-use crate::bus::{BusEvent, EventBus, EventKind};
 use crate::llm::{ChatMessage, LlmClient};
 use crate::permissions::PermissionRegistry;
-use crate::session::Session;
+use crate::session::{InboundMessage, Session, SessionManager};
 use crate::tool::{ToolContext, ToolRegistry};
 
 const SOLO_FILENAME: &str = "solo.md";
@@ -41,21 +40,23 @@ pub trait PersonaStore: Send + Sync {
 
     async fn list_personas(&self) -> Result<Vec<String>>;
 
-    /// Append to a session's **deep** layer (the full history fed to the
-    /// LLM). Deep context is managed by the persona module; storage lives
-    /// under `sessions/<session_id>/`.
-    async fn append_deep(
+    /// Append to a session's history (the full conversation fed to the LLM).
+    /// Storage lives under `sessions/<session_id>/`.
+    async fn append_history(
         &self,
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()>;
 
-    /// Read a session's **deep** layer (LLM context).
-    async fn read_deep(
+    /// Read a session's history (LLM context).
+    async fn read_history(
         &self,
         session: &Session,
         since: Option<i64>,
     ) -> Result<Vec<ChatLogEntry>>;
+
+    /// Drop the session's history.
+    async fn clear_history(&self, session: &Session) -> Result<()>;
 }
 
 pub struct PersonaRuntime {
@@ -87,36 +88,17 @@ impl PersonaRuntime {
         &self.persona.name
     }
 
-    pub async fn run(self: Arc<Self>, bus: Arc<EventBus>) {
-        let mut rx = bus.subscribe();
+    pub async fn run(self: Arc<Self>, manager: Arc<SessionManager>) {
+        let mut rx = manager.subscribe_persona(&self.persona.name);
         let agent = AgentRunner::new(self.llm.clone(), self.registry.clone());
         let name = self.persona.name.clone();
 
         loop {
-            let event = match rx.recv().await {
+            let msg: InboundMessage = match rx.recv().await {
                 Some(e) => e,
                 None => break,
             };
-
-            if event.sender == name {
-                continue;
-            }
-            // Only chat messages drive the persona; outbound instructions and
-            // permission events are handled by their own subscribers.
-            if event.kind != EventKind::Message {
-                continue;
-            }
-            if let Some(ref t) = event.target
-                && t != &name
-            {
-                continue;
-            }
-
-            let session_id = event
-                .session_id
-                .clone()
-                .unwrap_or_else(|| "default".to_string());
-            let session = Session::new(name.clone(), session_id);
+            let session = msg.session;
 
             let system = self.build_system_prompt().await;
 
@@ -128,7 +110,7 @@ impl PersonaRuntime {
             let mut messages = history;
             messages.push(ChatMessage {
                 role: "user".to_string(),
-                content: Some(event.content.clone()),
+                content: Some(msg.content.clone()),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -136,21 +118,21 @@ impl PersonaRuntime {
             let suppress_reply = Arc::new(AtomicBool::new(false));
             let tool_ctx = ToolContext {
                 persona_name: name.clone(),
-                bus: bus.clone(),
-                request_id: event.request_id.clone(),
+                manager: manager.clone(),
+                request_id: msg.request_id.clone(),
                 permissions: self.permissions.clone(),
-                session_id: event.session_id.clone(),
+                session_id: Some(session.session_id.clone()),
                 suppress_reply: suppress_reply.clone(),
             };
 
             let _ = self
                 .store
-                .append_deep(
+                .append_history(
                     &session,
                     &[ChatLogEntry {
-                        sender: event.sender.clone(),
-                        content: event.content.clone(),
-                        timestamp: event.timestamp,
+                        sender: msg.sender.clone(),
+                        content: msg.content.clone(),
+                        timestamp: msg.timestamp,
                     }],
                 )
                 .await;
@@ -162,12 +144,31 @@ impl PersonaRuntime {
 
                     for msg in &new_msgs {
                         let role_str = &msg.role;
-                        let entry_content = msg
-                            .content
-                            .clone()
-                            .unwrap_or_else(|| format!("[{role_str}]"));
+                        let entry_content = match &msg.content {
+                            Some(c) => c.clone(),
+                            // Tool calls are stored with their raw payload,
+                            // rendered by the llm module.
+                            None if msg
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|t| !t.is_empty()) =>
+                            {
+                                msg.raw_json()
+                            }
+                            None => format!("[{role_str}]"),
+                        };
+                        let sender = if msg.role == "tool"
+                            || msg
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|t| !t.is_empty())
+                        {
+                            "tool".to_string()
+                        } else {
+                            name.clone()
+                        };
                         chatlog_entries.push(ChatLogEntry {
-                            sender: name.clone(),
+                            sender,
                             content: entry_content.clone(),
                             timestamp: now,
                         });
@@ -175,7 +176,7 @@ impl PersonaRuntime {
 
                     let _ = self
                         .store
-                        .append_deep(&session, &chatlog_entries)
+                        .append_history(&session, &chatlog_entries)
                         .await;
 
                     if !suppress_reply.load(Ordering::SeqCst)
@@ -184,15 +185,14 @@ impl PersonaRuntime {
                         && last.role == "assistant"
                         && !content.trim().is_empty()
                     {
-                        bus.send(
-                            BusEvent::message_with_context(
-                                name.clone(),
-                                content.clone(),
-                                event.request_id.clone(),
-                                event.context.clone(),
+                        manager
+                            .route_outbound(
+                                Some(&session.session_id),
+                                None,
+                                content,
+                                msg.request_id.clone(),
                             )
-                            .with_session(event.session_id.clone()),
-                        );
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -217,11 +217,16 @@ impl PersonaRuntime {
     }
 
     async fn load_chatlog_context(&self, session: &Session) -> Result<Vec<ChatMessage>> {
-        let entries = self.store.read_deep(session, None).await?;
+        let entries = self.store.read_history(session, None).await?;
 
         let mut messages = Vec::new();
         for entry in entries {
-            let role = if entry.sender == self.persona.name {
+            // Tool results are replayed as assistant context (they carry no
+            // `tool_call_id` in history, which OpenAI-compatible APIs require
+            // for a real `tool` role message).
+            let role = if entry.sender == self.persona.name
+                || entry.sender == "tool"
+            {
                 "assistant"
             } else {
                 "user"

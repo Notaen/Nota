@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use nota_core::bus::BusEvent;
 use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
 
 /// Send a message to any conversation session. The target is an
@@ -63,15 +62,14 @@ impl Tool for SendMessageTool {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
 
-        ctx.bus.send(
-            BusEvent::outbound_message(
-                ctx.persona_name.clone(),
-                content.to_string(),
+        ctx.manager
+            .route_outbound(
+                ctx.session_id.as_deref(),
+                Some(&target),
+                content,
                 ctx.request_id.clone(),
-                target,
             )
-            .with_session(ctx.session_id.clone()),
-        );
+            .await;
         Ok("已发送".to_string())
     }
 }
@@ -118,15 +116,57 @@ pub fn register_chat_tools(registry: &dyn ToolRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nota_core::bus::{EventBus, EventKind};
     use nota_core::permissions::PermissionRegistry;
+    use nota_core::persona::{ChatLogEntry, PersonaStore};
+    use nota_core::session::{AdapterEvent, Session, SessionManager};
+    use anyhow::Result;
+    use async_trait::async_trait;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    struct MemPersonaStore;
+
+    #[async_trait]
+    impl PersonaStore for MemPersonaStore {
+        async fn read_persona_file(&self, _n: &str, _f: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn write_persona_file(&self, _n: &str, _f: &str, _c: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn create_persona(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn delete_persona(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn list_personas(&self) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn append_history(
+            &self,
+            _s: &Session,
+            _e: &[ChatLogEntry],
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn read_history(
+            &self,
+            _s: &Session,
+            _since: Option<i64>,
+        ) -> Result<Vec<ChatLogEntry>> {
+            Ok(vec![])
+        }
+        async fn clear_history(&self, _s: &Session) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn tool_ctx() -> ToolContext {
+        let manager = Arc::new(SessionManager::new(Arc::new(MemPersonaStore)));
         ToolContext {
             persona_name: "bob".to_string(),
-            bus: Arc::new(EventBus::new()),
+            manager,
             request_id: None,
             permissions: Arc::new(PermissionRegistry::new()),
             session_id: Some("onebot_private_42".to_string()),
@@ -138,17 +178,21 @@ mod tests {
     async fn send_message_emits_outbound_event_with_target() {
         let tool = SendMessageTool;
         let context = tool_ctx();
-        let mut rx = context.bus.subscribe();
+        let mut rx = context
+            .manager
+            .subscribe_adapter("onebot");
 
         tool.run(r#"{"target":"group:30003","content":"yo"}"#, context)
             .await
             .unwrap();
 
         let event = rx.recv().await.unwrap();
-        assert_eq!(event.kind, EventKind::OutboundMessage);
-        assert_eq!(event.sender, "bob");
-        assert_eq!(event.context, "group:30003");
-        assert_eq!(event.content, "yo");
+        let AdapterEvent::Outbound(e) = event else {
+            panic!("expected outbound event");
+        };
+        assert_eq!(e.session_id.as_deref(), Some("onebot_private_42"));
+        assert_eq!(e.target.as_deref(), Some("group:30003"));
+        assert_eq!(e.content, "yo");
     }
 
     #[tokio::test]

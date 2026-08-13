@@ -344,6 +344,19 @@ cloned as a git submodule.
   Sessions are independent of personas: storage lives under
   `~/.nota/sessions/<session_id>/` (the historical SQLite session stack was
   intentionally not revived).
+
+### Global EventBus removed; session-scoped routing (2026-08-13)
+- The global `EventBus` is gone. `SessionManager` routes messages by session:
+  - **Inbound**: adapters deliver straight to the target persona's inbox
+    (`subscribe_persona`), so the persona always receives its session's
+    messages — no broadcast, no filtering.
+  - **Outbound**: persona replies route to the session's adapter
+    (`route_outbound` with the session id); `send_message` broadcasts an
+    adapter-agnostic target and each adapter claims what it understands.
+  - **Permissions** route to the session's adapter (`AdapterEvent::Permission`)
+    for the user's 同意/拒绝 approval.
+  - **Slash commands** are intercepted in `SessionManager::deliver` before
+    reaching the persona: `//clear` drops the session history and acks.
 - Adapter-assigned session ids: `onebot_private_<qq>` /
   `onebot_group_<qq>` for OneBot, `web_<uuid>` per WebSocket connection.
   `BusEvent` and `ToolContext` carry `session_id`; each adapter only routes
@@ -366,15 +379,12 @@ cloned as a git submodule.
   the LLM both calling `reply` and emitting final text.
 
 ### Two-layer sessions + session-level send_message (2026-08-13)
-- Each session now has two layers: `deep.json` (full LLM context: inbound,
-  assistant turns, tool calls) and `shallow.json` (only messages actually
-  delivered to the user). **Deep is owned by the persona module**
-  (`PersonaStore::append_deep/read_deep`), **shallow is owned by the session
-  module** (`SessionStore::append_shallow/read_shallow`); both live under
-  `~/.nota/sessions/<session_id>/`.
-- Session files are **JSONL** (`deep.jsonl` / `shallow.jsonl`, one entry per
-  line) and appended incrementally; legacy JSON arrays are parsed as a
-  fallback and migrated to JSONL on the next append.
+- The shallow/deep split was dropped: a session has one history file,
+  `~/.nota/sessions/<session_id>/chatlog.jsonl` (JSONL, append-only), owned
+  by the persona module (`PersonaStore::append_history/read_history/clear_history`).
+  Tool calls are stored with their raw payload (rendered by the llm module,
+  no `serde_json` in core) with `sender = "tool"`; user/persona messages use
+  their real senders.
 - The adapter-specific `send_private_msg` / `send_group_msg` tools were
   replaced by one channel-agnostic `send_message(target, content)` in
   `nota-infra` (`tool/chat.rs`, with `skip_reply`). Target format is
@@ -405,3 +415,11 @@ cloned as a git submodule.
   are matched by the bridge's per-session queue. Non-OneBot sources are
   dropped (other channels implement their own approval); there is no generic
   "system notification" event on the bus.
+
+### Persona naming & chat headers (2026-08-13)
+- The `solo.md` template uses a `{name}` placeholder; `create_persona`
+  substitutes the name given at creation time. Persona folders are named
+  after the persona (`~/.nota/personas/<name>/`).
+- Inbound message headers no longer include the bot's own identity:
+  `[好友 昵称(QQ)]` for private messages, `[群 群号 昵称(QQ)]` for groups.
+  The persona learns its own QQ/nickname via the `get_login_info` tool.

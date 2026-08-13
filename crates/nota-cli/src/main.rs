@@ -20,14 +20,13 @@ use tracing_subscriber::{
     prelude::*,
 };
 
-use nota_core::bus::EventBus;
 use nota_core::permissions::PermissionRegistry;
 use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
-use nota_core::session::SessionStore;
+use nota_core::session::SessionManager;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
-    ApiState, AppContext, ConfigStore, FilePersonaStore, FileSessionStore, OpenAiLlm,
-    ToolRegistryImpl, http_serve, register_builtin_tools, register_chat_tools,
+    ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
+    http_serve, register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -117,11 +116,10 @@ async fn run_server(
     config: nota_infra::Config,
     cancel_token: CancellationToken,
 ) -> Result<()> {
-    let bus = Arc::new(EventBus::new());
     let permissions = Arc::new(PermissionRegistry::new());
 
     let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
-    let session_store: Arc<dyn SessionStore> = Arc::new(FileSessionStore::new(base));
+    let manager = Arc::new(SessionManager::new(persona_store.clone()));
     let llm: Arc<dyn nota_core::llm::LlmClient> = Arc::new(OpenAiLlm::new(
         &config.api_url,
         &config.api_key,
@@ -147,10 +145,10 @@ async fn run_server(
             permissions.clone(),
         ));
 
-        let persona_loop_bus = bus.clone();
         let persona_loop_runtime = runtime.clone();
+        let manager_for_task = manager.clone();
         tokio::spawn(async move {
-            persona_loop_runtime.run(persona_loop_bus).await;
+            persona_loop_runtime.run(manager_for_task).await;
         });
 
         info!("Persona '{}' started", name);
@@ -160,12 +158,11 @@ async fn run_server(
         && onebot.enabled
     {
         start_onebot(
-            bus.clone(),
+            manager.clone(),
             permissions.clone(),
             persona_store.clone(),
             tool_registry.clone(),
             onebot,
-            session_store.clone(),
         )
         .await?;
     }
@@ -174,13 +171,12 @@ async fn run_server(
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
         persona_store,
-        session_store,
         config: config_arc,
         config_path,
     });
 
     let ctx = Arc::new(AppContext {
-        bus: bus.clone(),
+        manager: manager.clone(),
         permissions: permissions.clone(),
         api_state,
     });
@@ -197,12 +193,11 @@ async fn run_server(
 
 /// Wire the OneBot 11 adapter: resolve the target persona and start the bridge.
 async fn start_onebot(
-    bus: Arc<EventBus>,
+    manager: Arc<SessionManager>,
     permissions: Arc<PermissionRegistry>,
     persona_store: Arc<dyn PersonaStore>,
     tool_registry: Arc<ToolRegistryImpl>,
     cfg: &OnebotConfig,
-    session_store: Arc<dyn SessionStore>,
 ) -> Result<()> {
     if cfg.mode != "ws" {
         anyhow::bail!(
@@ -228,13 +223,7 @@ async fn start_onebot(
         cfg.persona.clone()
     };
 
-    let bridge = OneBotBridge::new(
-        bus,
-        permissions,
-        persona.clone(),
-        cfg.clone(),
-        session_store,
-    );
+    let bridge = OneBotBridge::new(manager, permissions, persona.clone(), cfg.clone());
     bridge.register_tools(tool_registry.as_ref());
     tokio::spawn(async move { bridge.run().await });
     info!(

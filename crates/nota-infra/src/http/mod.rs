@@ -8,8 +8,8 @@ use axum::{
     response::Response,
     routing::get,
 };
-use nota_core::bus::EventBus;
 use nota_core::permissions::PermissionRegistry;
+use nota_core::session::SessionManager;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,7 @@ async fn health() -> (StatusCode, Json<Health<'static>>) {
 }
 
 pub struct AppContext {
-    pub bus: Arc<EventBus>,
+    pub manager: Arc<SessionManager>,
     pub permissions: Arc<PermissionRegistry>,
     pub api_state: Arc<ApiState>,
 }
@@ -55,7 +55,7 @@ pub fn router(ctx: Arc<AppContext>, cancel_token: CancellationToken) -> Router {
         .layer(middleware::from_fn(log_request));
 
     let ws_state = Arc::new(WsState {
-        bus: ctx.bus.clone(),
+        manager: ctx.manager.clone(),
         permissions: ctx.permissions.clone(),
     });
 

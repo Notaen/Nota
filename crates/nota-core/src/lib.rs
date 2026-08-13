@@ -1,5 +1,4 @@
 pub mod agent;
-pub mod bus;
 pub mod llm;
 pub mod permissions;
 pub mod persona;

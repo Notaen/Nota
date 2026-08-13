@@ -6,13 +6,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::bus::{BusEvent, EventBus, EventKind};
 use crate::permissions::PermissionRegistry;
+use crate::session::SessionManager;
 
 #[derive(Clone)]
 pub struct ToolContext {
     pub persona_name: String,
-    pub bus: Arc<EventBus>,
+    /// Session-scoped router: replies and permission requests go through it.
+    pub manager: Arc<SessionManager>,
     pub request_id: Option<String>,
     pub permissions: Arc<PermissionRegistry>,
     /// The conversation session this turn belongs to (adapter-assigned).
@@ -37,15 +38,16 @@ impl ToolContext {
     /// Returns `true` if approved, `false` if denied or on timeout.
     pub async fn request_permission(&self, prompt: String) -> bool {
         let (id, rx) = self.permissions.register().await;
-        self.bus.send(
-            BusEvent::permission_request(
-                self.persona_name.clone(),
-                prompt,
-                id,
-                self.request_id.clone(),
-            )
-            .with_session(self.session_id.clone()),
-        );
+        if let Some(session_id) = &self.session_id {
+            self.manager
+                .send_permission(
+                    session_id,
+                    &id,
+                    &prompt,
+                    self.request_id.clone(),
+                )
+                .await;
+        }
         rx.await.unwrap_or(false)
     }
 }
@@ -95,7 +97,3 @@ pub trait ToolRegistry: Send + Sync {
     fn get(&self, name: &str) -> Option<Arc<dyn Tool>>;
     fn list(&self) -> Vec<Arc<dyn Tool>>;
 }
-
-// Keep EventKind import to suppress unused warning on rebuilds
-#[allow(dead_code)]
-fn _ensure_event_kind_used(_: EventKind) {}

@@ -167,8 +167,7 @@ nota/
 ├── .logs/                 # 日志（30 天轮转）
 ├── sessions/
 │   └── <session_id>/      # 按会话隔离的历史（独立于 personas）
-│       ├── deep.jsonl     # LLM 上下文（JSONL）——由 persona 模块管理
-│       └── shallow.jsonl  # 真正发送给用户的消息（JSONL）——由 session 模块管理
+│       └── chatlog.jsonl  # 会话历史（JSONL，追加写入）
 └── config.toml            # api_url、api_key、model
 ```
 

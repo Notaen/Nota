@@ -5,10 +5,9 @@ use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::Response,
 };
-use nota_core::bus::{BusEvent, EventBus, EventKind};
 use nota_core::permissions::PermissionRegistry;
+use nota_core::session::{AdapterEvent, Session, SessionManager};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -50,17 +49,15 @@ pub async fn ws_chat_handler(
 }
 
 pub struct WsState {
-    pub bus: Arc<EventBus>,
+    pub manager: Arc<SessionManager>,
     pub permissions: Arc<PermissionRegistry>,
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    state.bus.subscribe_with_sender(tx);
-
     // Each web connection is its own conversation session, so multiple
     // clients (or tabs) never see each other's messages or history.
     let session_id = format!("web_{}", Uuid::new_v4());
+    let mut rx = state.manager.subscribe_adapter("web");
 
     loop {
         tokio::select! {
@@ -98,15 +95,15 @@ async fn handle_command(
     let cmd: ClientCommand = serde_json::from_str(text)?;
     match cmd {
         ClientCommand::Send { persona, content, request_id } => {
-            state.bus.send(
-                BusEvent::targeted_message(
-                    "user".to_string(),
-                    content,
+            state
+                .manager
+                .deliver(
+                    &Session::new(persona, session_id),
+                    "user",
+                    &content,
                     Some(request_id),
-                    persona,
                 )
-                .with_session(Some(session_id.to_string())),
-            );
+                .await;
         }
         ClientCommand::Permission { permission_id, approved } => {
             state.permissions.resolve(&permission_id, approved).await;
@@ -116,38 +113,28 @@ async fn handle_command(
 }
 
 async fn forward_event(
-    event: BusEvent,
+    event: AdapterEvent,
     socket: &mut WebSocket,
     session_id: &str,
 ) {
-    // Only events for this connection's session may be forwarded.
-    if event.session_id.as_deref() != Some(session_id) {
-        return;
-    }
-    match event.kind {
-        EventKind::Message => {
-            if let Some(ref rid) = event.request_id {
-                let payload = serde_json::to_string(&ServerEvent::Message {
-                    content: event.content,
-                    request_id: rid.clone(),
-                })
-                .unwrap();
-                let _ = socket.send(Message::Text(payload.into())).await;
-            }
+    match event {
+        AdapterEvent::Outbound(e) if e.session_id.as_deref() == Some(session_id) => {
+            let payload = serde_json::to_string(&ServerEvent::Message {
+                content: e.content,
+                request_id: e.request_id.unwrap_or_default(),
+            })
+            .unwrap();
+            let _ = socket.send(Message::Text(payload.into())).await;
         }
-        EventKind::PermissionRequest => {
-            if let Some(ref parent) = event.parent_request_id {
-                let payload = serde_json::to_string(&ServerEvent::PermissionNeeded {
-                    permission_id: event.request_id.unwrap_or_default(),
-                    prompt: event.content,
-                    request_id: parent.clone(),
-                })
-                .unwrap();
-                let _ = socket.send(Message::Text(payload.into())).await;
-            }
+        AdapterEvent::Permission(p) if p.session_id == session_id => {
+            let payload = serde_json::to_string(&ServerEvent::PermissionNeeded {
+                permission_id: p.permission_id,
+                prompt: p.prompt,
+                request_id: p.parent_request_id.unwrap_or_default(),
+            })
+            .unwrap();
+            let _ = socket.send(Message::Text(payload.into())).await;
         }
-        // Persona-initiated outbound messages are forwarded by the channel
-        // (e.g. OneBot), not by the web client.
-        EventKind::OutboundMessage => {}
+        _ => {}
     }
 }

@@ -7,7 +7,7 @@ use axum::{
     routing::{delete, get},
 };
 use nota_core::persona::{ChatLogEntry, PersonaStore};
-use nota_core::session::{Session, SessionStore};
+use nota_core::session::Session;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -15,7 +15,6 @@ use crate::config::{Config, ConfigStore};
 
 pub struct ApiState {
     pub persona_store: Arc<dyn PersonaStore>,
-    pub session_store: Arc<dyn SessionStore>,
     pub config: Arc<RwLock<Config>>,
     pub config_path: std::path::PathBuf,
 }
@@ -129,25 +128,13 @@ async fn write_file(
     Ok(StatusCode::OK)
 }
 
-async fn read_deep(
+async fn read_history(
     State(state): State<Arc<ApiState>>,
     Path((name, session_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<ChatLogEntry>>, (StatusCode, Json<ErrorBody>)> {
     let entries = state
         .persona_store
-        .read_deep(&Session::new(name, session_id), None)
-        .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(entries))
-}
-
-async fn read_shallow(
-    State(state): State<Arc<ApiState>>,
-    Path((name, session_id)): Path<(String, String)>,
-) -> Result<Json<Vec<ChatLogEntry>>, (StatusCode, Json<ErrorBody>)> {
-    let entries = state
-        .session_store
-        .read_shallow(&Session::new(name, session_id), None)
+        .read_history(&Session::new(name, session_id), None)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(entries))
@@ -184,11 +171,7 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/personas/{name}/files/{filename}", get(read_file).put(write_file))
         .route(
             "/personas/{name}/chatlog/{session_id}",
-            get(read_deep),
-        )
-        .route(
-            "/personas/{name}/shallow/{session_id}",
-            get(read_shallow),
+            get(read_history),
         )
         .route("/settings", get(get_settings).put(put_settings))
 }

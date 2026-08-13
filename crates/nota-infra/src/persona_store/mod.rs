@@ -6,15 +6,14 @@ use std::time::SystemTime;
 use anyhow::Result;
 use async_trait::async_trait;
 use nota_core::persona::{ChatLogEntry, PersonaStore};
-use nota_core::session::{Session, SessionStore};
+use nota_core::session::Session;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
 const SOLO_FILENAME: &str = "solo.md";
 const MEMORY_FILENAME: &str = "memory.md";
-const DEEP_FILENAME: &str = "deep.jsonl";
-const SHALLOW_FILENAME: &str = "shallow.jsonl";
+const HISTORY_FILENAME: &str = "chatlog.jsonl";
 
 type FileCache = HashMap<PathBuf, (String, SystemTime)>;
 
@@ -119,8 +118,8 @@ async fn read_entries(path: &Path) -> Result<Vec<ChatLogEntry>> {
     }
 }
 
-/// Persona files plus the per-session **deep** layer (the full history fed to
-/// the LLM). Sessions live independently under `~/.nota/sessions/<id>/`.
+/// Persona files plus per-session conversation history (fed to the LLM).
+/// Sessions live independently under `~/.nota/sessions/<id>/`.
 pub struct FilePersonaStore {
     personas_dir: PathBuf,
     sessions_dir: PathBuf,
@@ -138,10 +137,10 @@ impl FilePersonaStore {
         self.personas_dir.join(name)
     }
 
-    fn deep_path(&self, session: &Session) -> PathBuf {
+    fn history_path(&self, session: &Session) -> PathBuf {
         self.sessions_dir
             .join(&session.session_id)
-            .join(DEEP_FILENAME)
+            .join(HISTORY_FILENAME)
     }
 }
 
@@ -173,7 +172,8 @@ impl PersonaStore for FilePersonaStore {
 
         let solo_path = workspace.join(SOLO_FILENAME);
         if !fs::try_exists(&solo_path).await.unwrap_or(false) {
-            fs::write(&solo_path, include_str!("../../assets/solo.md")).await?;
+            let solo = include_str!("../../assets/solo.md").replace("{name}", name);
+            fs::write(&solo_path, solo).await?;
         }
 
         let memory_path = workspace.join(MEMORY_FILENAME);
@@ -208,68 +208,33 @@ impl PersonaStore for FilePersonaStore {
         Ok(names)
     }
 
-    async fn append_deep(
+    async fn append_history(
         &self,
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()> {
-        append_jsonl(&self.deep_path(session), entries).await
+        append_jsonl(&self.history_path(session), entries).await
     }
 
-    async fn read_deep(
+    async fn read_history(
         &self,
         session: &Session,
         since: Option<i64>,
     ) -> Result<Vec<ChatLogEntry>> {
-        let entries = read_entries(&self.deep_path(session)).await?;
+        let entries = read_entries(&self.history_path(session)).await?;
         if let Some(ts) = since {
             Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
         } else {
             Ok(entries)
         }
     }
-}
 
-/// Session **shallow** storage: only the messages actually delivered to the
-/// user. Sessions live independently under `~/.nota/sessions/<id>/`.
-pub struct FileSessionStore {
-    sessions_dir: PathBuf,
-}
-
-impl FileSessionStore {
-    pub fn new(base_dir: &Path) -> Self {
-        Self {
-            sessions_dir: base_dir.join("sessions"),
+    async fn clear_history(&self, session: &Session) -> Result<()> {
+        let path = self.history_path(session);
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            fs::remove_file(&path).await?;
         }
-    }
-
-    fn shallow_path(&self, session: &Session) -> PathBuf {
-        self.sessions_dir
-            .join(&session.session_id)
-            .join(SHALLOW_FILENAME)
-    }
-}
-
-#[async_trait]
-impl SessionStore for FileSessionStore {
-    async fn append_shallow(
-        &self,
-        session: &Session,
-        entries: &[ChatLogEntry],
-    ) -> Result<()> {
-        append_jsonl(&self.shallow_path(session), entries).await
-    }
-
-    async fn read_shallow(
-        &self,
-        session: &Session,
-        since: Option<i64>,
-    ) -> Result<Vec<ChatLogEntry>> {
-        let entries = read_entries(&self.shallow_path(session)).await?;
-        if let Some(ts) = since {
-            Ok(entries.into_iter().filter(|e| e.timestamp >= ts).collect())
-        } else {
-            Ok(entries)
-        }
+        invalidate_cache(&path).await;
+        Ok(())
     }
 }
