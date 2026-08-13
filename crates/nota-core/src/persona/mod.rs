@@ -89,6 +89,11 @@ impl PersonaRuntime {
             if event.sender == name {
                 continue;
             }
+            // System notices (e.g. outbound approval requests) are routed to
+            // the channel, never fed back into the persona loop.
+            if event.sender == "system" {
+                continue;
+            }
             // Only chat messages drive the persona; outbound instructions and
             // permission events are handled by their own subscribers.
             if event.kind != EventKind::Message {

@@ -9,6 +9,7 @@
 //! hanging.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::Arc;
 
 use nota_core::bus::{BusEvent, EventBus, EventKind};
@@ -37,6 +38,8 @@ pub struct OneBotBridge {
     cfg: OnebotConfig,
     api: OneBotApi,
     sessions: Arc<dyn SessionStore>,
+    /// Per-source-session queue of pending outbound approval ids, in order.
+    pending_approvals: Mutex<HashMap<String, Vec<String>>>,
     action_rx: Option<mpsc::UnboundedReceiver<ActionRequest>>,
 }
 
@@ -110,6 +113,7 @@ impl OneBotBridge {
             cfg,
             api,
             sessions,
+            pending_approvals: Mutex::new(HashMap::new()),
             action_rx: Some(action_rx),
         }
     }
@@ -195,12 +199,15 @@ impl OneBotBridge {
             .as_ref()
             .map(|m| m.to_text())
             .unwrap_or_default();
-        if let Some((approved, permission_id)) = parse_approval(&raw_text) {
-            log::info!(
-                "OneBot permission {} (approved={approved})",
-                permission_id
-            );
-            self.permissions.resolve(&permission_id, approved).await;
+        if let Some((approved, seq)) = parse_approval(&raw_text) {
+            if let Some(session_id) = session_id_for(&msg)
+                && let Some(permission_id) = self.take_pending_approval(&session_id, seq)
+            {
+                log::info!(
+                    "OneBot approval {permission_id} (approved={approved}) from {session_id}"
+                );
+                self.permissions.resolve(&permission_id, approved).await;
+            }
             return;
         }
 
@@ -352,13 +359,26 @@ impl OneBotBridge {
         route: &ReplyRoute,
     ) {
         let (permission_id, decision) = self.permissions.register().await;
-        let notice = format!(
-            "persona 想向{}发送消息：{}\n回复「批准{}」同意，或「拒绝{}」拒绝",
-            describe_target(route),
-            event.content,
-            permission_id,
-            permission_id
-        );
+        let source_session = event.session_id.clone().unwrap_or_default();
+        let seq = {
+            let mut queue = self.pending_approvals.lock().unwrap();
+            let list = queue.entry(source_session.clone()).or_default();
+            list.push(permission_id.clone());
+            list.len()
+        };
+        let notice = if seq == 1 {
+            format!(
+                "persona 想向{}发送消息：{}\n回复「同意」批准，或「拒绝」拒绝\n（权限ID：{permission_id}）",
+                describe_target(route),
+                event.content
+            )
+        } else {
+            format!(
+                "persona 想向{}发送消息：{}\n这是第 {seq} 个待处理请求，回复「同意{seq}」或「拒绝{seq}」\n（权限ID：{permission_id}）",
+                describe_target(route),
+                event.content
+            )
+        };
 
         // Notify the session that started this turn (QQ via a reply, other
         // channels via a bus message event carrying the source session).
@@ -418,6 +438,27 @@ impl OneBotBridge {
                 log::warn!("failed to record shallow message: {e:#}");
             }
         });
+    }
+
+    /// Take the next pending approval id for a source session. `seq` is the
+    /// 1-based position in the queue (`None` or `1` = the first/only one).
+    fn take_pending_approval(
+        &self,
+        session_id: &str,
+        seq: Option<usize>,
+    ) -> Option<String> {
+        let mut queue = self.pending_approvals.lock().unwrap();
+        let list = queue.get_mut(session_id)?;
+        let index = match seq {
+            None | Some(1) if !list.is_empty() => 0,
+            Some(n) if n >= 1 && n <= list.len() => n - 1,
+            _ => return None,
+        };
+        let id = list.remove(index);
+        if list.is_empty() {
+            queue.remove(session_id);
+        }
+        Some(id)
     }
 
     /// Record an actually-delivered message in the session's shallow layer
@@ -480,6 +521,15 @@ fn session_to_route(session_id: &str) -> Option<ReplyRoute> {
     }
 }
 
+/// The session id for an incoming OneBot message.
+fn session_id_for(msg: &MessageEvent) -> Option<String> {
+    match msg.message_type.as_str() {
+        "private" => Some(format!("onebot_private_{}", msg.user_id)),
+        "group" => msg.group_id.map(|g| format!("onebot_group_{g}")),
+        _ => None,
+    }
+}
+
 /// Map an adapter-independent target (`private:<QQ>` / `group:<QQ>`) to a
 /// OneBot reply route.
 fn target_to_route(target: &str) -> Option<ReplyRoute> {
@@ -501,13 +551,19 @@ fn describe_target(route: &ReplyRoute) -> String {
 }
 
 /// Parse an approve/deny command from a chat message:
-/// `批准<permission-id>` / `同意<permission-id>` / `拒绝<permission-id>`.
-fn parse_approval(text: &str) -> Option<(bool, String)> {
-    for (prefix, approved) in [("批准", true), ("同意", true), ("拒绝", false)] {
+/// `同意` / `拒绝` (optionally `同意N` / `拒绝N` for the N-th pending
+/// request). `批准` is accepted as an alias of `同意`.
+fn parse_approval(text: &str) -> Option<(bool, Option<usize>)> {
+    for (prefix, approved) in [("同意", true), ("批准", true), ("拒绝", false)] {
         if let Some(rest) = text.trim().strip_prefix(prefix) {
-            let id = rest.trim();
-            if !id.is_empty() {
-                return Some((approved, id.to_string()));
+            let rest = rest.trim();
+            let seq = if rest.is_empty() {
+                None
+            } else {
+                rest.parse::<usize>().ok()
+            };
+            if seq.is_some() || rest.is_empty() {
+                return Some((approved, seq));
             }
         }
     }
@@ -894,7 +950,7 @@ mod tests {
     }
 
     fn extract_permission_id(notice: &str) -> String {
-        let start = notice.find("批准").unwrap() + "批准".len();
+        let start = notice.find("权限ID：").unwrap() + "权限ID：".len();
         notice[start..start + 36].to_string()
     }
 
@@ -923,7 +979,8 @@ mod tests {
         };
         let notice = &message[0].data.text;
         assert!(notice.contains("群 99999"));
-        assert!(notice.contains("批准"));
+        assert!(notice.contains("同意"));
+        assert!(notice.contains("权限ID"));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), action_rx.recv())
                 .await
@@ -991,10 +1048,15 @@ mod tests {
         bridge.cfg.friend_ids = vec![42];
         let mut bus_rx = bridge.bus.subscribe();
         let (permission_id, decision) = bridge.permissions.register().await;
+        {
+            let mut queue = bridge.pending_approvals.lock().unwrap();
+            queue
+                .entry("onebot_private_42".to_string())
+                .or_default()
+                .push(permission_id.clone());
+        }
 
-        bridge
-            .handle_onebot_event(private_event(42, &format!("批准{permission_id}")))
-            .await;
+        bridge.handle_onebot_event(private_event(42, "同意")).await;
 
         assert!(decision.await.unwrap());
         assert!(
@@ -1010,11 +1072,75 @@ mod tests {
         let mut bridge = test_bridge();
         bridge.cfg.friend_ids = vec![42];
         let (permission_id, decision) = bridge.permissions.register().await;
+        {
+            let mut queue = bridge.pending_approvals.lock().unwrap();
+            queue
+                .entry("onebot_private_42".to_string())
+                .or_default()
+                .push(permission_id.clone());
+        }
 
-        bridge
-            .handle_onebot_event(private_event(42, &format!("拒绝{permission_id}")))
-            .await;
+        bridge.handle_onebot_event(private_event(42, "拒绝")).await;
 
         assert!(!decision.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn approval_seq_targets_second_pending_request() {
+        let mut bridge = test_bridge();
+        bridge.cfg.friend_ids = vec![42];
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        bridge
+            .handle_bus_event(
+                BusEvent::outbound_message(
+                    "bob".to_string(),
+                    "one".to_string(),
+                    None,
+                    "group:99999".to_string(),
+                )
+                .with_session(Some("onebot_private_42".to_string())),
+                &action_tx,
+            )
+            .await;
+        bridge
+            .handle_bus_event(
+                BusEvent::outbound_message(
+                    "bob".to_string(),
+                    "two".to_string(),
+                    None,
+                    "group:88888".to_string(),
+                )
+                .with_session(Some("onebot_private_42".to_string())),
+                &action_tx,
+            )
+            .await;
+        let _n1 = action_rx.recv().await.unwrap();
+        let _n2 = action_rx.recv().await.unwrap();
+
+        let ids: Vec<String> = {
+            let queue = bridge.pending_approvals.lock().unwrap();
+            queue.get("onebot_private_42").unwrap().clone()
+        };
+        assert_eq!(ids.len(), 2);
+
+        // 同意2 approves the second pending request only.
+        bridge.handle_onebot_event(private_event(42, "同意2")).await;
+
+        assert!(
+            !bridge.permissions.resolve(&ids[1], false).await,
+            "second request was consumed and resolved"
+        );
+        assert!(
+            bridge.permissions.resolve(&ids[0], false).await,
+            "first request is still pending"
+        );
+        let remaining = {
+            let queue = bridge.pending_approvals.lock().unwrap();
+            queue
+                .get("onebot_private_42")
+                .cloned()
+                .unwrap_or_default()
+        };
+        assert_eq!(remaining, vec![ids[0].clone()]);
     }
 }
