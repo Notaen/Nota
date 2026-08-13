@@ -134,7 +134,7 @@ async fn read_deep(
     Path((name, session_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<ChatLogEntry>>, (StatusCode, Json<ErrorBody>)> {
     let entries = state
-        .session_store
+        .persona_store
         .read_deep(&Session::new(name, session_id), None)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

@@ -33,25 +33,12 @@ impl Session {
     }
 }
 
-/// Per-session chatlog storage: history is isolated per conversation, which
-/// keeps contexts from bleeding across channels and lets each session manage
-/// its own LLM history.
+/// Per-session **shallow** storage: only the messages actually delivered to
+/// the user (text / images / stickers) live here. The deep layer (LLM
+/// context) is managed by the persona module; sessions keep what was really
+/// said so future `dream` runs can learn from real interactions.
 #[async_trait]
 pub trait SessionStore: Send + Sync {
-    /// Append to the deep layer (LLM context).
-    async fn append_deep(
-        &self,
-        session: &Session,
-        entries: &[ChatLogEntry],
-    ) -> Result<()>;
-
-    /// Read the deep layer (LLM context).
-    async fn read_deep(
-        &self,
-        session: &Session,
-        since: Option<i64>,
-    ) -> Result<Vec<ChatLogEntry>>;
-
     /// Append to the shallow layer (what was actually delivered to the user).
     async fn append_shallow(
         &self,

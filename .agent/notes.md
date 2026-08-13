@@ -341,9 +341,9 @@ cloned as a git submodule.
 ### Sessions replace the broadcast-only bus (2026-08-13)
 - The event bus is kept as the message backbone, but every chat endpoint is
   now a **session** (`SessionStore` + `Session { persona, session_id }`).
-  Chatlogs moved from `personas/<name>/chatlog.json` to
-  `personas/<name>/sessions/<session_id>/chatlog.json` (file-based, same
-  store; the historical SQLite session stack was intentionally not revived).
+  Sessions are independent of personas: storage lives under
+  `~/.nota/sessions/<session_id>/` (the historical SQLite session stack was
+  intentionally not revived).
 - Adapter-assigned session ids: `onebot_private_<qq>` /
   `onebot_group_<qq>` for OneBot, `web_<uuid>` per WebSocket connection.
   `BusEvent` and `ToolContext` carry `session_id`; each adapter only routes
@@ -368,8 +368,10 @@ cloned as a git submodule.
 ### Two-layer sessions + session-level send_message (2026-08-13)
 - Each session now has two layers: `deep.json` (full LLM context: inbound,
   assistant turns, tool calls) and `shallow.json` (only messages actually
-  delivered to the user). Legacy `chatlog.json` is read as a fallback and
-  migrated to `deep.json` on first write.
+  delivered to the user). **Deep is owned by the persona module**
+  (`PersonaStore::append_deep/read_deep`), **shallow is owned by the session
+  module** (`SessionStore::append_shallow/read_shallow`); both live under
+  `~/.nota/sessions/<session_id>/`.
 - The adapter-specific `send_private_msg` / `send_group_msg` tools were
   replaced by one channel-agnostic `send_message(target, content)` in
   `nota-infra` (`tool/chat.rs`, with `skip_reply`). Target format is
@@ -395,9 +397,8 @@ cloned as a git submodule.
   them against its per-session queue and resolves the permission oneshot.
   Web clients use the existing `{type:"permission", …}` command with the id
   from the notice.
-- The notice reaches OneBot sessions as a reply and other sessions (e.g.
-  web) as a `system` bus message event; the web forwarder now also relays
-  request-id-less system notices.
-- The persona loop ignores `sender == "system"` events — otherwise a web
-  approval notice was fed back into the persona and caused an infinite
-  send/approve loop (observed and fixed during E2E).
+- The approval round-trip is an **OneBot adapter concern**: the notice is a
+  plain QQ reply to the originating OneBot session, and the 同意/拒绝 replies
+  are matched by the bridge's per-session queue. Non-OneBot sources are
+  dropped (other channels implement their own approval); there is no generic
+  "system notification" event on the bus.

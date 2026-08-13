@@ -9,7 +9,7 @@ use crate::agent::AgentRunner;
 use crate::bus::{BusEvent, EventBus, EventKind};
 use crate::llm::{ChatMessage, LlmClient};
 use crate::permissions::PermissionRegistry;
-use crate::session::{Session, SessionStore};
+use crate::session::Session;
 use crate::tool::{ToolContext, ToolRegistry};
 
 const SOLO_FILENAME: &str = "solo.md";
@@ -26,7 +26,6 @@ pub struct ChatLogEntry {
     pub sender: String,
     pub content: String,
     pub timestamp: i64,
-    pub context: String,
 }
 
 #[async_trait]
@@ -41,12 +40,27 @@ pub trait PersonaStore: Send + Sync {
     async fn delete_persona(&self, name: &str) -> Result<()>;
 
     async fn list_personas(&self) -> Result<Vec<String>>;
+
+    /// Append to a session's **deep** layer (the full history fed to the
+    /// LLM). Deep context is managed by the persona module; storage lives
+    /// under `sessions/<session_id>/`.
+    async fn append_deep(
+        &self,
+        session: &Session,
+        entries: &[ChatLogEntry],
+    ) -> Result<()>;
+
+    /// Read a session's **deep** layer (LLM context).
+    async fn read_deep(
+        &self,
+        session: &Session,
+        since: Option<i64>,
+    ) -> Result<Vec<ChatLogEntry>>;
 }
 
 pub struct PersonaRuntime {
     persona: Persona,
     store: Arc<dyn PersonaStore>,
-    sessions: Arc<dyn SessionStore>,
     llm: Arc<dyn LlmClient>,
     registry: Arc<dyn ToolRegistry>,
     permissions: Arc<PermissionRegistry>,
@@ -56,7 +70,6 @@ impl PersonaRuntime {
     pub fn new(
         persona: Persona,
         store: Arc<dyn PersonaStore>,
-        sessions: Arc<dyn SessionStore>,
         llm: Arc<dyn LlmClient>,
         registry: Arc<dyn ToolRegistry>,
         permissions: Arc<PermissionRegistry>,
@@ -64,7 +77,6 @@ impl PersonaRuntime {
         Self {
             persona,
             store,
-            sessions,
             llm,
             registry,
             permissions,
@@ -87,11 +99,6 @@ impl PersonaRuntime {
             };
 
             if event.sender == name {
-                continue;
-            }
-            // System notices (e.g. outbound approval requests) are routed to
-            // the channel, never fed back into the persona loop.
-            if event.sender == "system" {
                 continue;
             }
             // Only chat messages drive the persona; outbound instructions and
@@ -137,14 +144,13 @@ impl PersonaRuntime {
             };
 
             let _ = self
-                .sessions
+                .store
                 .append_deep(
                     &session,
                     &[ChatLogEntry {
                         sender: event.sender.clone(),
                         content: event.content.clone(),
                         timestamp: event.timestamp,
-                        context: event.context.clone(),
                     }],
                 )
                 .await;
@@ -164,12 +170,11 @@ impl PersonaRuntime {
                             sender: name.clone(),
                             content: entry_content.clone(),
                             timestamp: now,
-                            context: String::new(),
                         });
                     }
 
                     let _ = self
-                        .sessions
+                        .store
                         .append_deep(&session, &chatlog_entries)
                         .await;
 
@@ -212,7 +217,7 @@ impl PersonaRuntime {
     }
 
     async fn load_chatlog_context(&self, session: &Session) -> Result<Vec<ChatMessage>> {
-        let entries = self.sessions.read_deep(session, None).await?;
+        let entries = self.store.read_deep(session, None).await?;
 
         let mut messages = Vec::new();
         for entry in entries {

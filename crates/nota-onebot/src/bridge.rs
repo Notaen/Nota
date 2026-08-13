@@ -358,6 +358,20 @@ impl OneBotBridge {
         event: &BusEvent,
         route: &ReplyRoute,
     ) {
+        // The approval round-trip is an OneBot adapter concern: only sources
+        // reachable through OneBot can be asked. Other channels implement
+        // their own approval (or simply drop).
+        let Some(source_route) = event
+            .session_id
+            .as_deref()
+            .and_then(session_to_route)
+        else {
+            log::warn!(
+                "outbound approval request dropped: source is not an OneBot session"
+            );
+            return;
+        };
+
         let (permission_id, decision) = self.permissions.register().await;
         let source_session = event.session_id.clone().unwrap_or_default();
         let seq = {
@@ -380,19 +394,9 @@ impl OneBotBridge {
             )
         };
 
-        // Notify the session that started this turn (QQ via a reply, other
-        // channels via a bus message event carrying the source session).
-        match event.session_id.as_deref().and_then(session_to_route) {
-            Some(source_route) => {
-                self.send_reply(action_tx, &source_route, &notice);
-            }
-            None => {
-                self.bus.send(
-                    BusEvent::message("system".to_string(), notice, None)
-                        .with_session(event.session_id.clone()),
-                );
-            }
-        }
+        // Ask the OneBot source session; approvals are matched by the bridge
+        // from the user's 同意/拒绝 replies.
+        self.send_reply(action_tx, &source_route, &notice);
 
         // Wait for the decision; approved sends bypass the allowlist (the
         // user's explicit approval is the gate).
@@ -426,12 +430,11 @@ impl OneBotBridge {
             if let Err(e) = sessions
                 .append_shallow(
                     &Session::new(persona.clone(), route_to_session_id(&route)),
-                    &[ChatLogEntry {
-                        sender: persona,
-                        content,
-                        timestamp: chrono::Utc::now().timestamp(),
-                        context: String::new(),
-                    }],
+                        &[ChatLogEntry {
+                            sender: persona,
+                            content,
+                            timestamp: chrono::Utc::now().timestamp(),
+                        }],
                 )
                 .await
             {
@@ -468,7 +471,6 @@ impl OneBotBridge {
             sender: self.persona.clone(),
             content: content.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
-            context: String::new(),
         };
         if let Err(e) = self
             .sessions
@@ -607,29 +609,11 @@ mod tests {
     /// In-memory session store for tests.
     #[derive(Default)]
     struct MemSessionStore {
-        deep: Mutex<Vec<ChatLogEntry>>,
         shallow: Mutex<Vec<ChatLogEntry>>,
     }
 
     #[async_trait]
     impl SessionStore for MemSessionStore {
-        async fn append_deep(
-            &self,
-            _session: &Session,
-            entries: &[ChatLogEntry],
-        ) -> Result<()> {
-            self.deep.lock().unwrap().extend(entries.iter().cloned());
-            Ok(())
-        }
-
-        async fn read_deep(
-            &self,
-            _session: &Session,
-            _since: Option<i64>,
-        ) -> Result<Vec<ChatLogEntry>> {
-            Ok(self.deep.lock().unwrap().clone())
-        }
-
         async fn append_shallow(
             &self,
             _session: &Session,
@@ -1040,6 +1024,33 @@ mod tests {
                 .is_err(),
             "denied outbound message must not be sent"
         );
+    }
+
+    #[tokio::test]
+    async fn drops_approval_for_non_onebot_source() {
+        let mut bridge = test_bridge();
+        bridge.cfg.friend_ids = vec![42];
+        let (action_tx, mut action_rx) = mpsc::unbounded_channel();
+        let event = BusEvent::outbound_message(
+            "bob".to_string(),
+            "hi".to_string(),
+            None,
+            "group:99999".to_string(),
+        )
+        .with_session(Some("web_abc".to_string()));
+
+        bridge.handle_bus_event(event, &action_tx).await;
+
+        // No approval notice, no send, and nothing queued — other channels
+        // handle their own approvals.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), action_rx.recv())
+                .await
+                .is_err(),
+            "non-OneBot sources are not asked for OneBot approval"
+        );
+        let pending = bridge.pending_approvals.lock().unwrap();
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]

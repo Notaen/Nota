@@ -133,15 +133,6 @@ async fn forward_event(
                 })
                 .unwrap();
                 let _ = socket.send(Message::Text(payload.into())).await;
-            } else {
-                // System notices (e.g. outbound approval requests) carry no
-                // request id but must still reach the client.
-                let payload = serde_json::to_string(&ServerEvent::Message {
-                    content: event.content,
-                    request_id: String::new(),
-                })
-                .unwrap();
-                let _ = socket.send(Message::Text(payload.into())).await;
             }
         }
         EventKind::PermissionRequest => {

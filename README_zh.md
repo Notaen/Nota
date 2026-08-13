@@ -164,11 +164,11 @@ nota/
 │   └── <name>/
 │       ├── solo.md        # 系统提示词
 │       ├── memory.md      # 长期记忆
-│       └── sessions/      # 按会话隔离的历史
-│           └── <session_id>/
-│               ├── deep.json      # LLM 上下文（完整历史 + 工具调用）
-│               └── shallow.json   # 真正发送给用户的消息
 ├── .logs/                 # 日志（30 天轮转）
+├── sessions/
+│   └── <session_id>/      # 按会话隔离的历史（独立于 personas）
+│       ├── deep.json      # LLM 上下文——由 persona 模块管理
+│       └── shallow.json   # 真正发送给用户的消息——由 session 模块管理
 └── config.toml            # api_url、api_key、model
 ```
 

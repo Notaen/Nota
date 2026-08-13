@@ -178,11 +178,11 @@ Runtime data under the user's home directory:
 │   └── <name>/
 │       ├── solo.md        # system prompt
 │       ├── memory.md      # long-term memory
-│       └── sessions/      # per-conversation history
-│           └── <session_id>/
-│               ├── deep.json      # LLM context (full history + tool calls)
-│               └── shallow.json   # messages actually delivered to the user
 ├── .logs/                 # rotating logs (30-day)
+├── sessions/
+│   └── <session_id>/      # per-conversation history (independent of personas)
+│       ├── deep.json      # LLM context — owned by the persona module
+│       └── shallow.json   # messages actually delivered — owned by sessions
 └── config.toml            # api_url, api_key, model
 ```
 

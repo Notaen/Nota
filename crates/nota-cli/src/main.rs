@@ -26,8 +26,8 @@ use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
 use nota_core::session::SessionStore;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
-    ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
-    http_serve, register_builtin_tools, register_chat_tools,
+    ApiState, AppContext, ConfigStore, FilePersonaStore, FileSessionStore, OpenAiLlm,
+    ToolRegistryImpl, http_serve, register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -120,9 +120,8 @@ async fn run_server(
     let bus = Arc::new(EventBus::new());
     let permissions = Arc::new(PermissionRegistry::new());
 
-    let persona_store = Arc::new(FilePersonaStore::new(base));
-    let session_store: Arc<dyn SessionStore> = persona_store.clone();
-    let persona_store: Arc<dyn PersonaStore> = persona_store;
+    let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
+    let session_store: Arc<dyn SessionStore> = Arc::new(FileSessionStore::new(base));
     let llm: Arc<dyn nota_core::llm::LlmClient> = Arc::new(OpenAiLlm::new(
         &config.api_url,
         &config.api_key,
@@ -143,7 +142,6 @@ async fn run_server(
         let runtime = Arc::new(PersonaRuntime::new(
             persona,
             persona_store.clone(),
-            session_store.clone(),
             llm.clone(),
             tool_registry.clone(),
             permissions.clone(),

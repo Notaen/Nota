@@ -14,9 +14,6 @@ const SOLO_FILENAME: &str = "solo.md";
 const MEMORY_FILENAME: &str = "memory.md";
 const DEEP_FILENAME: &str = "deep.json";
 const SHALLOW_FILENAME: &str = "shallow.json";
-/// Legacy single-layer chatlog file; read as a fallback for the deep layer
-/// and migrated to `deep.json` on the first write.
-const LEGACY_CHATLOG_FILENAME: &str = "chatlog.json";
 
 type FileCache = HashMap<PathBuf, (String, SystemTime)>;
 
@@ -26,14 +23,46 @@ fn ensure_cache() -> &'static RwLock<FileCache> {
     PERSONA_FILE_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+async fn read_cached(path: &Path) -> Result<Option<String>> {
+    match fs::metadata(path).await {
+        Ok(meta) => {
+            let mtime = meta.modified()?;
+            {
+                let cache = ensure_cache().read().await;
+                if let Some((content, cached_mtime)) = cache.get(path)
+                    && *cached_mtime == mtime
+                {
+                    return Ok(Some(content.clone()));
+                }
+            }
+            let content = fs::read_to_string(path).await?;
+            let mut cache = ensure_cache().write().await;
+            cache.insert(path.to_path_buf(), (content.clone(), mtime));
+            Ok(Some(content))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+async fn invalidate_cache(path: &Path) {
+    if let Some(cache) = PERSONA_FILE_CACHE.get() {
+        cache.write().await.remove(path);
+    }
+}
+
+/// Persona files plus the per-session **deep** layer (the full history fed to
+/// the LLM). Sessions live independently under `~/.nota/sessions/<id>/`.
 pub struct FilePersonaStore {
     personas_dir: PathBuf,
+    sessions_dir: PathBuf,
 }
 
 impl FilePersonaStore {
     pub fn new(base_dir: &Path) -> Self {
         Self {
             personas_dir: base_dir.join("personas"),
+            sessions_dir: base_dir.join("sessions"),
         }
     }
 
@@ -41,38 +70,10 @@ impl FilePersonaStore {
         self.personas_dir.join(name)
     }
 
-    fn session_dir(&self, session: &Session) -> PathBuf {
-        self.workspace(&session.persona)
-            .join("sessions")
+    fn deep_path(&self, session: &Session) -> PathBuf {
+        self.sessions_dir
             .join(&session.session_id)
-    }
-
-    async fn read_cached(&self, path: &Path) -> Result<Option<String>> {
-        match fs::metadata(path).await {
-            Ok(meta) => {
-                let mtime = meta.modified()?;
-                {
-                    let cache = ensure_cache().read().await;
-                    if let Some((content, cached_mtime)) = cache.get(path)
-                        && *cached_mtime == mtime
-                    {
-                        return Ok(Some(content.clone()));
-                    }
-                }
-                let content = fs::read_to_string(path).await?;
-                let mut cache = ensure_cache().write().await;
-                cache.insert(path.to_path_buf(), (content.clone(), mtime));
-                Ok(Some(content))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn invalidate_cache(&self, path: &Path) {
-        if let Some(cache) = PERSONA_FILE_CACHE.get() {
-            cache.write().await.remove(path);
-        }
+            .join(DEEP_FILENAME)
     }
 }
 
@@ -80,7 +81,7 @@ impl FilePersonaStore {
 impl PersonaStore for FilePersonaStore {
     async fn read_persona_file(&self, name: &str, filename: &str) -> Result<String> {
         let path = self.workspace(name).join(filename);
-        match self.read_cached(&path).await? {
+        match read_cached(&path).await? {
             Some(content) => Ok(content),
             None => anyhow::bail!("persona file not found: {}/{}", name, filename),
         }
@@ -94,7 +95,7 @@ impl PersonaStore for FilePersonaStore {
     ) -> Result<()> {
         let path = self.workspace(name).join(filename);
         fs::write(&path, content).await?;
-        self.invalidate_cache(&path).await;
+        invalidate_cache(&path).await;
         Ok(())
     }
 
@@ -138,33 +139,24 @@ impl PersonaStore for FilePersonaStore {
         }
         Ok(names)
     }
-}
 
-#[async_trait]
-impl SessionStore for FilePersonaStore {
     async fn append_deep(
         &self,
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()> {
-        let dir = self.session_dir(session);
-        let path = dir.join(DEEP_FILENAME);
-        let legacy = dir.join(LEGACY_CHATLOG_FILENAME);
+        let path = self.deep_path(session);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        // One-time migration from the legacy single-layer chatlog.
-        let mut existing: Vec<ChatLogEntry> = match self.read_cached(&path).await? {
+        let mut existing: Vec<ChatLogEntry> = match read_cached(&path).await? {
             Some(content) => serde_json::from_str(&content).unwrap_or_default(),
-            None => match self.read_cached(&legacy).await? {
-                Some(content) => serde_json::from_str(&content).unwrap_or_default(),
-                None => Vec::new(),
-            },
+            None => Vec::new(),
         };
         existing.extend(entries.iter().cloned());
         let json = serde_json::to_string(&existing)?;
         fs::write(&path, &json).await?;
-        self.invalidate_cache(&path).await;
+        invalidate_cache(&path).await;
         Ok(())
     }
 
@@ -173,15 +165,10 @@ impl SessionStore for FilePersonaStore {
         session: &Session,
         since: Option<i64>,
     ) -> Result<Vec<ChatLogEntry>> {
-        let dir = self.session_dir(session);
-        let path = dir.join(DEEP_FILENAME);
-        let legacy = dir.join(LEGACY_CHATLOG_FILENAME);
-        let content = match self.read_cached(&path).await? {
+        let path = self.deep_path(session);
+        let content = match read_cached(&path).await? {
             Some(c) => c,
-            None => match self.read_cached(&legacy).await? {
-                Some(c) => c,
-                None => return Ok(Vec::new()),
-            },
+            None => return Ok(Vec::new()),
         };
         let entries: Vec<ChatLogEntry> =
             serde_json::from_str(&content).unwrap_or_default();
@@ -191,24 +178,47 @@ impl SessionStore for FilePersonaStore {
             Ok(entries)
         }
     }
+}
 
+/// Session **shallow** storage: only the messages actually delivered to the
+/// user. Sessions live independently under `~/.nota/sessions/<id>/`.
+pub struct FileSessionStore {
+    sessions_dir: PathBuf,
+}
+
+impl FileSessionStore {
+    pub fn new(base_dir: &Path) -> Self {
+        Self {
+            sessions_dir: base_dir.join("sessions"),
+        }
+    }
+
+    fn shallow_path(&self, session: &Session) -> PathBuf {
+        self.sessions_dir
+            .join(&session.session_id)
+            .join(SHALLOW_FILENAME)
+    }
+}
+
+#[async_trait]
+impl SessionStore for FileSessionStore {
     async fn append_shallow(
         &self,
         session: &Session,
         entries: &[ChatLogEntry],
     ) -> Result<()> {
-        let path = self.session_dir(session).join(SHALLOW_FILENAME);
+        let path = self.shallow_path(session);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let mut existing: Vec<ChatLogEntry> = match self.read_cached(&path).await? {
+        let mut existing: Vec<ChatLogEntry> = match read_cached(&path).await? {
             Some(content) => serde_json::from_str(&content).unwrap_or_default(),
             None => Vec::new(),
         };
         existing.extend(entries.iter().cloned());
         let json = serde_json::to_string(&existing)?;
         fs::write(&path, &json).await?;
-        self.invalidate_cache(&path).await;
+        invalidate_cache(&path).await;
         Ok(())
     }
 
@@ -217,8 +227,8 @@ impl SessionStore for FilePersonaStore {
         session: &Session,
         since: Option<i64>,
     ) -> Result<Vec<ChatLogEntry>> {
-        let path = self.session_dir(session).join(SHALLOW_FILENAME);
-        let content = match self.read_cached(&path).await? {
+        let path = self.shallow_path(session);
+        let content = match read_cached(&path).await? {
             Some(c) => c,
             None => return Ok(Vec::new()),
         };
