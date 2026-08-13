@@ -272,6 +272,9 @@ impl Tool for ReplyTool {
             )
             .with_session(Some(session_id)),
         );
+        // The explicit reply is the answer; suppress the automatic
+        // final-text reply so the user does not receive it twice.
+        ctx.suppress_reply.store(true, Ordering::SeqCst);
         Ok("已发送回复".to_string())
     }
 }
@@ -463,10 +466,12 @@ mod tests {
     async fn reply_tool_emits_outbound_bus_event() {
         let tool = ReplyTool;
         let ctx = tool_context(Some("onebot_private_42".to_string()));
+        let suppress = ctx.suppress_reply.clone();
         let mut bus_rx = ctx.bus.subscribe();
 
         tool.run(r#"{"content":"hello"}"#, ctx).await.unwrap();
 
+        assert!(suppress.load(Ordering::SeqCst));
         let event = bus_rx.recv().await.unwrap();
         assert_eq!(event.kind, EventKind::OutboundMessage);
         assert_eq!(event.sender, "bob");
@@ -506,6 +511,15 @@ mod tests {
         let event2 = bus_rx2.recv().await.unwrap();
         assert_eq!(event2.session_id.as_deref(), Some("onebot_group_30003"));
         assert_eq!(event2.content, "yo");
+
+        // Proactive sends must NOT suppress the automatic reply.
+        let ctx3 = tool_context(Some("onebot_private_42".to_string()));
+        let suppress3 = ctx3.suppress_reply.clone();
+        let mut bus_rx3 = ctx3.bus.subscribe();
+        let tool3 = SendPrivateMsgTool;
+        tool3.run(r#"{"user_id":42,"content":"yo"}"#, ctx3).await.unwrap();
+        let _ = bus_rx3.recv().await.unwrap();
+        assert!(!suppress3.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

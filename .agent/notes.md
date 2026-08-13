@@ -3,6 +3,10 @@
 ## Code Modification Rules
 - Do NOT delete, modify, or remove existing comments without explicit approval.
 - When in doubt about a comment change, ask first.
+- Do NOT edit `solo.md` (neither the template in `nota-infra/assets/` nor any
+  user persona file under `~/.nota/personas/`) without explicit user approval.
+  The user treats persona prompts as their own configuration; propose the
+  wording first and apply it only after they agree.
 
 ## Directory Naming
 - Use `personas` (plural) for the persona directory under `base_dir()`.

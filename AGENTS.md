@@ -41,3 +41,6 @@ nota-cli → nota-onebot → nota-core   (one-way; core never sees axum/reqwest/
 - **Logging boundary**: core/infra use `log::*` facade; only `nota-cli` uses `tracing`. `tracing-log::LogTracer` bridges them.
 - **DI only**: no `OnceLock<T>` or `RwLock<Option<T>>` for manager singletons. `nota-cli` creates adapters and injects them via `Arc`.
 - **Edition 2024**: requires nightly Rust.
+- **Never edit `solo.md` without asking**: both the `nota-infra/assets/solo.md`
+  template and user persona files (`~/.nota/personas/*/solo.md`) are treated as
+  user configuration. Propose changes first, apply only after explicit approval.
