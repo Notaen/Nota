@@ -1,6 +1,7 @@
 //! OneBot tools exposed to the persona (read group chat history, etc.).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -265,6 +266,35 @@ impl Tool for GetVoiceTextTool {
             .or_else(|| args["message_id"].as_i64())
             .ok_or_else(|| anyhow::anyhow!("missing or invalid 'message_id'"))?;
 
+        // NapCat 的语音转写偶尔会因语音尚未处理完而临时失败，重试几次再放弃。
+        const ATTEMPTS: usize = 3;
+        const RETRY_DELAY: Duration = Duration::from_secs(2);
+        let mut last_err = String::new();
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            match self.transcribe(message_id).await {
+                Ok(text) => return Ok(text),
+                Err(err) => {
+                    last_err = format!("{err:#}");
+                    log::warn!(
+                        "get_voice_text attempt {}/{} failed for {message_id}: {err:#}",
+                        attempt + 1,
+                        ATTEMPTS
+                    );
+                }
+            }
+        }
+        anyhow::bail!(
+            "语音 {message_id} 转写失败（重试 {ATTEMPTS} 次）：{last_err}。语音可能还在处理中，稍后重试或让用户重新发送"
+        )
+    }
+}
+
+impl GetVoiceTextTool {
+    /// One `fetch_ptt_text` call, rendered as a persona-facing string.
+    async fn transcribe(&self, message_id: i64) -> Result<String> {
         let resp = self
             .api
             .call(ActionRequest::fetch_ptt_text(message_id))
@@ -458,6 +488,39 @@ mod tests {
         let tool = GetVoiceTextTool::new(api);
 
         tokio::spawn(async move {
+            for _ in 0..3 {
+                let action = action_rx.recv().await.unwrap();
+                assert_eq!(action.action, "fetch_ptt_text");
+                let tx = pending
+                    .lock()
+                    .unwrap()
+                    .remove(&action.echo)
+                    .expect("pending response registered");
+                tx.send(ActionResponse {
+                    status: Some("failed".to_string()),
+                    retcode: Some(1200),
+                    echo: Some(action.echo),
+                    data: None,
+                })
+                .unwrap();
+            }
+        });
+
+        let err = tool
+            .run(r#"{"message_id":"99"}"#, tool_ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("转写失败（重试 3 次）"));
+        assert!(err.to_string().contains("retcode=Some(1200)"));
+    }
+
+    #[tokio::test]
+    async fn get_voice_text_retries_then_succeeds() {
+        let (api, mut action_rx, pending) = test_api();
+        let tool = GetVoiceTextTool::new(api);
+
+        tokio::spawn(async move {
+            // 第一次转写失败，第二次成功。
             let action = action_rx.recv().await.unwrap();
             let tx = pending
                 .lock()
@@ -466,18 +529,32 @@ mod tests {
                 .expect("pending response registered");
             tx.send(ActionResponse {
                 status: Some("failed".to_string()),
-                retcode: Some(100),
+                retcode: Some(1200),
                 echo: Some(action.echo),
                 data: None,
             })
             .unwrap();
+
+            let action = action_rx.recv().await.unwrap();
+            let tx = pending
+                .lock()
+                .unwrap()
+                .remove(&action.echo)
+                .expect("pending response registered");
+            tx.send(ActionResponse {
+                status: Some("ok".to_string()),
+                retcode: Some(0),
+                echo: Some(action.echo),
+                data: Some(serde_json::json!({"text": "现在能听见了吗？"})),
+            })
+            .unwrap();
         });
 
-        let err = tool
-            .run(r#"{"message_id":"99"}"#, tool_ctx())
+        let out = tool
+            .run(r#"{"message_id":"1193185804"}"#, tool_ctx())
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("fetch_ptt_text failed"));
+            .unwrap();
+        assert_eq!(out, "语音 1193185804 转文字: 现在能听见了吗？");
     }
 
     #[tokio::test]

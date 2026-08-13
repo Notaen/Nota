@@ -342,6 +342,12 @@ cloned as a git submodule.
 - `MessageContent::to_text_with_id` / `segment_to_text_with_id`, the
   `fetch_ptt_text` action serialization + response parsing, and the
   `get_voice_text` tool's success/failure paths are covered by unit tests.
+- Live testing against NapCat: `fetch_ptt_text` is **intermittent** — the
+  same message can return `retcode=1200` (voice still processing / service
+  hiccup) and succeed on a later retry, so `get_voice_text` retries up to 3
+  times (2s apart) before failing, and its error message tells the persona
+  the voice may still be processing. `message_id` is sent as a string, which
+  proved more reliable than a number against NapCat.
 
 ### Send/receive separation (2026-08-13)
 - The bridge no longer auto-routes persona replies. Inbound OneBot events
