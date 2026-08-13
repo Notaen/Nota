@@ -356,3 +356,11 @@ cloned as a git submodule.
   the bridge forwards after the allowlist check.
 - `GET /api/personas/{name}/chatlog/{session_id}` replaced the global
   chatlog endpoint.
+
+### reply tool removed (2026-08-13)
+- The `reply` tool was deleted: the persona's final assistant text IS the
+  reply (auto-routed to the session). No reply = empty final text, or call
+  `skip_reply`; both suppress the outbound push entirely. Proactive messages
+  still go through `send_private_msg` / `send_group_msg`.
+- This keeps exactly one reply path, eliminating double replies caused by
+  the LLM both calling `reply` and emitting final text.

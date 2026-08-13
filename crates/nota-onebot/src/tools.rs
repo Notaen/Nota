@@ -223,62 +223,6 @@ impl Tool for GetMsgTool {
     }
 }
 
-/// Reply to the message that triggered this turn. The target comes from the
-/// turn session, so the persona never has to guess the QQ number. The send
-/// goes through the bus (`OutboundMessage`); the OneBot bridge forwards it
-/// after the allowlist check.
-#[derive(Default)]
-pub struct ReplyTool;
-
-#[async_trait]
-impl Tool for ReplyTool {
-    fn name(&self) -> &str {
-        "reply"
-    }
-
-    fn description(&self) -> &str {
-        "Reply to the message that triggered this turn. The target chat is already known. Call this to send a reply; do NOT call it if the user asked you not to reply."
-    }
-
-    fn parameters(&self) -> ToolParams {
-        let mut props = HashMap::new();
-        props.insert(
-            "content".to_string(),
-            PropertyDef {
-                prop_type: "string".to_string(),
-                description: "The reply text to send".to_string(),
-                r#enum: vec![],
-            },
-        );
-        ToolParams::object(props, vec!["content".to_string()])
-    }
-
-    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let content = args["content"]
-            .as_str()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
-        let session_id = ctx
-            .session_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("no session for this turn"))?;
-        ctx.bus.send(
-            BusEvent::outbound_message(
-                ctx.persona_name.clone(),
-                content.to_string(),
-                ctx.request_id.clone(),
-                String::new(),
-            )
-            .with_session(Some(session_id)),
-        );
-        // The explicit reply is the answer; suppress the automatic
-        // final-text reply so the user does not receive it twice.
-        ctx.suppress_reply.store(true, Ordering::SeqCst);
-        Ok("已发送回复".to_string())
-    }
-}
-
 /// Proactively send a private message to a friend (must be allowlisted).
 #[derive(Default)]
 pub struct SendPrivateMsgTool;
@@ -460,32 +404,6 @@ mod tests {
             },
         };
         (out, rx)
-    }
-
-    #[tokio::test]
-    async fn reply_tool_emits_outbound_bus_event() {
-        let tool = ReplyTool;
-        let ctx = tool_context(Some("onebot_private_42".to_string()));
-        let suppress = ctx.suppress_reply.clone();
-        let mut bus_rx = ctx.bus.subscribe();
-
-        tool.run(r#"{"content":"hello"}"#, ctx).await.unwrap();
-
-        assert!(suppress.load(Ordering::SeqCst));
-        let event = bus_rx.recv().await.unwrap();
-        assert_eq!(event.kind, EventKind::OutboundMessage);
-        assert_eq!(event.sender, "bob");
-        assert_eq!(event.session_id.as_deref(), Some("onebot_private_42"));
-        assert_eq!(event.content, "hello");
-    }
-
-    #[tokio::test]
-    async fn reply_tool_without_session_fails() {
-        let tool = ReplyTool;
-        let ctx = tool_context(None);
-
-        let err = tool.run(r#"{"content":"hi"}"#, ctx).await.unwrap_err();
-        assert!(err.to_string().contains("session"));
     }
 
     #[tokio::test]

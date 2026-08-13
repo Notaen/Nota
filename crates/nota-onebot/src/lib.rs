@@ -16,6 +16,6 @@ pub use api::OneBotApi;
 pub use bridge::{OneBotBridge, Outbound};
 pub use config::OnebotConfig;
 pub use tools::{
-    GetLoginInfoTool, GetMsgTool, ReadGroupChatTool, ReplyTool, SendGroupMsgTool,
+    GetLoginInfoTool, GetMsgTool, ReadGroupChatTool, SendGroupMsgTool,
     SendPrivateMsgTool, SkipReplyTool,
 };

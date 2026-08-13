@@ -21,7 +21,7 @@ use crate::config::OnebotConfig;
 use crate::api::OneBotApi;
 use crate::client::{self, PendingResponses};
 use crate::tools::{
-    GetLoginInfoTool, GetMsgTool, ReadGroupChatTool, ReplyTool, SendGroupMsgTool,
+    GetLoginInfoTool, GetMsgTool, ReadGroupChatTool, SendGroupMsgTool,
     SendPrivateMsgTool, SkipReplyTool,
 };
 use crate::types::{
@@ -112,7 +112,6 @@ impl OneBotBridge {
         registry.register(Arc::new(ReadGroupChatTool::new(self.api())));
         registry.register(Arc::new(GetLoginInfoTool::new(self.api())));
         registry.register(Arc::new(GetMsgTool::new(self.api())));
-        registry.register(Arc::new(ReplyTool));
         registry.register(Arc::new(SendPrivateMsgTool));
         registry.register(Arc::new(SendGroupMsgTool));
         registry.register(Arc::new(SkipReplyTool));
