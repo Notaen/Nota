@@ -257,24 +257,54 @@ impl Tool for ScheduleTool {
     }
 }
 
-pub struct GetVersionTool;
+pub struct StatusTool {
+    started: std::time::Instant,
+}
+
+impl StatusTool {
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Default for StatusTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
-impl Tool for GetVersionTool {
+impl Tool for StatusTool {
     fn name(&self) -> &str {
-        "get_version"
+        "status"
     }
 
     fn description(&self) -> &str {
-        "Get the current Nota version"
+        "Get detailed Nota runtime status: version, platform, process id, uptime, and the current persona/session"
     }
 
     fn parameters(&self) -> ToolParams {
         ToolParams::object(HashMap::new(), vec![])
     }
 
-    async fn run(&self, _args: &str, _ctx: ToolContext) -> Result<String> {
-        Ok(env!("CARGO_PKG_VERSION").to_string())
+    async fn run(&self, _args: &str, ctx: ToolContext) -> Result<String> {
+        let status = serde_json::json!({
+            "name": "nota",
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": {
+                "os": std::env::consts::OS,
+                "arch": std::env::consts::ARCH,
+                "family": std::env::consts::FAMILY,
+            },
+            "pid": std::process::id(),
+            "uptime_secs": self.started.elapsed().as_secs(),
+            "persona": ctx.persona_name,
+            "session_id": ctx.session_id,
+            "request_id": ctx.request_id,
+        });
+        Ok(serde_json::to_string_pretty(&status)?)
     }
 }
 
@@ -290,5 +320,5 @@ pub fn register_builtin_tools(
     )));
     registry.register(Arc::new(FileWriteTool::new(personas_dir)));
     registry.register(Arc::new(ScheduleTool::new(scheduler)));
-    registry.register(Arc::new(GetVersionTool));
+    registry.register(Arc::new(StatusTool::new()));
 }
