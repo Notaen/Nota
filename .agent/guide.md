@@ -17,64 +17,62 @@ Use [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): 
 
 ## Architecture (Hexagonal / Ports & Adapters)
 
-The project is a Cargo workspace; dependency flow is one-way
-`nota-cli → nota-infra → nota-core`.
+One-way dependency flow: `nota-cli → nota-infra → nota-core`, plus
+`nota-onebot → nota-core` (core never sees axum/reqwest/tungstenite). See
+`AGENTS.md` for the crate table and `.agent/notes.md` for design decisions.
 
-| Crate | Role | Notable deps |
-|-------|------|--------------|
-| `nota-core` | Domain entities + **port traits** (`PersonaStore`, `LlmClient`, `Tool`, `ToolRegistry`, `AgentRunner`), `EventBus`, `PermissionRegistry`. No global state (DI). Logging via `log` facade only. | `log`, `serde`, `async-trait`, `chrono`, `anyhow`, `tokio` (sync) |
-| `nota-infra` | Adapters implementing the ports: `axum` HTTP (REST + WebSocket), filesystem persona store, `OpenAiLlm`, TOML config, built-in tools. | `nota-core`, `nota-onebot`, `axum`, `tokio`, `reqwest`, `serde_json` |
-| `nota-onebot` | OneBot 11 forward-WS transport: protocol types, WS client, bus bridge, OneBot tools (`reply`, `send_private_msg`, `send_group_msg`, `read_group_chat`, `get_msg`, `get_login_info`), `OnebotConfig`. Depends only on `nota-core`. | `nota-core`, `tokio-tungstenite`, `serde_json`, `uuid` |
-| `nota-cli` | Binary: tracing init + `tracing-log` bridge, config wizard, adapter wiring (DI), HTTP start, graceful shutdown. | `nota-core`, `nota-infra`, `tracing`, `dialoguer` |
-
-### Directory Layout (source)
+### Source Layout
 
 ```
 crates/nota-core/src/
-├── bus.rs                  # EventBus (mpsc broadcast to all subscribers) + BusEvent + EventKind
+├── bus.rs                  # EventBus (mpsc broadcast) + BusEvent + EventKind
 ├── permissions.rs          # PermissionRegistry (pending permission oneshots keyed by id)
-├── llm.rs                  # LlmClient trait + ToolDef/ToolCall/LlmResponse/ChatMessage
-├── session.rs              # Session + SessionStore (per-conversation chatlog)
-├── tool.rs                 # Tool / ToolRegistry traits + ToolContext (bus + permissions + session)
-├── agent/mod.rs            # AgentRunner: LLM ↔ tool loop, returns ChatMessage list
+├── llm.rs                  # LlmClient trait + ToolDef/ToolCall/LlmResponse/LlmItem
+├── history.rs              # HistoryKind + HistoryEntry (session chat history)
+├── session.rs              # SessionManager + Session (deliver, slash commands)
+├── scheduler.rs            # Scheduler port
+├── tool.rs                 # Tool / ToolRegistry traits + ToolContext (bus + permissions)
+├── agent/mod.rs            # AgentRunner: LLM ↔ tool loop, returns LlmItem list
 └── persona/mod.rs          # Persona + PersonaStore trait + PersonaRuntime (event loop)
 
 crates/nota-infra/src/
-├── persona_store/mod.rs    # FilePersonaStore (chatlog.json + solo.md + memory.md)
-├── llm/mod.rs              # OpenAiLlm (OpenAI-compatible chat completions)
+├── persona_store/mod.rs    # FilePersonaStore (solo.md/memory.md, mtime cache)
+├── llm/mod.rs              # OpenAiLlm (Responses API)
+├── history.rs              # SqliteHistoryStore (per-session history.db)
 ├── config/mod.rs           # Config + ConfigStore
-├── tool/{mod,builtin}.rs   # ToolRegistryImpl + file_read/file_write/schedule/get_version
+├── scheduler.rs            # TokioScheduler
+├── tool/{mod,builtin}.rs   # ToolRegistryImpl + file_read/file_write/schedule/status
 └── http/{mod,ws,api,admin}.rs  # axum router: REST /api/*, WS /ws/chat, /admin/stop
 
 crates/nota-onebot/src/
-├── config.rs               # OnebotConfig (enabled/mode/ws_url/token/persona/prefix + allowlists)
-├── types.rs                # OneBot 11 events, segments, actions, history types
+├── config.rs               # OnebotConfig
+├── types.rs                # OneBot 11 events, segments, actions
 ├── client.rs               # forward-WS client (reconnect, echo correlation)
-├── api.rs                  # OneBotApi::call (echo -> oneshot, 15s timeout)
-├── bridge.rs               # bus bridge: allowlist filter, reply routing, permission auto-deny
-└── tools.rs                # reply / send_* / read_group_chat / get_msg / get_login_info
+├── api.rs                  # OneBotApi::call (echo → oneshot, 15s timeout)
+├── bridge.rs               # bus bridge: allowlist filter, routing, permission auto-deny
+└── tools.rs                # send_message / read_group_chat / get_msg / get_login_info / get_voice_text
 ```
 
 ### Runtime Layout
 
 ```
 ~/.nota/
-├── personas/          # persona workspaces (plural, not "persona"); each has solo.md, memory.md, chatlog.json
-├── .logs/             # rotating logs (30-day)
-└── config.toml        # api_url, api_key, model
+├── personas/<name>/          # persona workspace: solo.md, memory.md
+├── sessions/<id>/history.db  # per-session chat history (SQLite, kind column)
+├── .logs/                    # rotating logs (30-day)
+└── config.toml               # api_url, api_key, model, web_search, [onebot]
 ```
 
-- `base_dir()` is resolved in `nota-cli` (`dirs::home_dir().join(".nota")`) and injected into adapters; the core never touches paths.
+`base_dir()` is resolved in `nota-cli` (`dirs::home_dir().join(".nota")`) and
+injected into adapters; the core never touches paths.
 
 ## Tech Stack
 
-- Rust (edition 2024)
-- Axum 0.8.9 (with `ws` feature for WebSocket support)
-- Tokio (rt-multi-thread, sync, fs)
-- reqwest 0.13 (OpenAI-compatible HTTP)
+- Rust (edition 2024, rustc ≥ 1.85)
+- Axum 0.8 (with `ws` feature), Tokio, reqwest, rusqlite (bundled SQLite)
 - serde, serde_json, TOML
 - log (core/infra) / tracing (cli only, via `tracing-log::LogTracer`)
-- dialoguer (cli onboarding wizard)
+- dialoguer + console (cli onboarding wizard)
 
 ## Event Bus
 
@@ -118,19 +116,11 @@ other's messages.
 | DELETE | `/api/personas/:name` | Delete persona |
 | GET | `/api/personas/:name/files/:filename` | Read persona file |
 | PUT | `/api/personas/:name/files/:filename` | Write persona file (`{"content": "..."}`) |
-| GET | `/api/personas/:name/chatlog` | Read chatlog |
+| GET | `/api/personas/:name/chatlog/:session_id` | Read session history |
 | GET | `/api/settings` | Get config (api_url, api_key, model) |
 | PUT | `/api/settings` | Update config |
 | GET | `/ws/chat` | WebSocket: chat channel |
 | POST | `/admin/stop` | Graceful shutdown |
-
-## OneBot 11 (QQ bot)
-
-The `nota-onebot` crate implements the OneBot 11 forward-WebSocket transport
-in plain Rust (no JS runtime). Config lives in `[onebot]` inside `config.toml`;
-`nota-cli` starts the bridge when `enabled = true`. Only `mode = "ws"` is
-implemented. See README for the config example and `.agent/notes.md` for the
-design decisions (routing, permission auto-deny, chunking).
 
 ### WebSocket protocol (`/ws/chat`)
 
@@ -147,16 +137,38 @@ Server → Client:
 { "type": "error", "content": "..." }
 ```
 
+## OneBot 11 (QQ bot)
+
+Forward-WebSocket only (`mode = "ws"`). Config lives in `[onebot]` inside
+`config.toml`; `enabled = false` by default; empty `persona` = first persona
+found; a configured persona that does not exist fails server startup. See
+README for the config example and `.agent/notes.md` for routing, allowlist,
+and permission details.
+
 ## Pitfalls
 
-1. **Chinese comments are authoritative** — they may be self-criticism, TODOs, or rules. If a comment describes a concrete fix, implement it and record the decision in `.agent/notes.md`. Never delete a comment without understanding why it was there.
-2. **Keep core pure** — never add `axum`/`reqwest`/`serde_json`/`tracing`/`dialoguer`/`dirs`/`walkdir`/`tokio-tungstenite` to `nota-core`. Adapters belong in `nota-infra`; wiring in `nota-cli`. `tokio` is allowed but only for sync primitives (`tokio::sync::RwLock`, etc.) — no runtime.
-3. **No global state** — `OnceLock<T>` / `RwLock<Option<T>>` are forbidden for manager singletons. `nota-cli` creates adapters and injects them via `Arc`.
-4. **Domain types over generics** — model the domain directly (`ToolParams`/`PropertyDef` for JSON Schema, `ChatMessage` for LLM turns). Serialization happens at the infra boundary, not in core.
-5. **Logging** — `nota-core`/`nota-infra` use the `log` facade; `nota-cli` bridges it into `tracing` via `tracing_log::LogTracer`. Don't call `tracing::*` from core/infra.
-6. **Async blocking** — never call `blocking_*` on a tokio RwLock from inside an async context. Use `.write().await`. `blocking_*` panics the runtime.
-7. **WebSocket ↔ bus routing** — the WS handler filters events by `request_id` in its `active_request_ids` set. Events with mismatched `request_id` are silently dropped (don't echo other clients' messages).
-8. **Default persona is gone** — `nota` no longer auto-creates any persona. Use `nota onboard` or manually create files under `~/.nota/personas/<name>/`.
+1. **Chinese comments are authoritative** — they may be self-criticism, TODOs,
+   or rules. If a comment describes a concrete fix, implement it and record the
+   decision in `.agent/notes.md`. Never delete a comment without understanding
+   why it was there.
+2. **Keep core pure** — never add `axum`/`reqwest`/`serde_json`/`tracing`/
+   `dialoguer`/`dirs`/`walkdir`/`tokio-tungstenite` to `nota-core`. `tokio`
+   (sync only) and `serde` are fine.
+3. **No global state** — `OnceLock<T>` / `RwLock<Option<T>>` are forbidden for
+   manager singletons. `nota-cli` creates adapters and injects them via `Arc`.
+4. **Domain types over generics** — model the domain directly
+   (`ToolParams`/`PropertyDef` for JSON Schema, `LlmItem`/`HistoryKind` for
+   history). Serialization happens at the infra boundary, not in core.
+5. **Logging** — `nota-core`/`nota-infra` use the `log` facade; `nota-cli`
+   bridges it into `tracing` via `tracing_log::LogTracer`. Don't call
+   `tracing::*` from core/infra.
+6. **Async blocking** — never call `blocking_*` on a tokio RwLock from inside
+   an async context. Use `.write().await`. `blocking_*` panics the runtime.
+7. **WebSocket ↔ bus routing** — the WS handler filters events by `request_id`
+   in its `active_request_ids` set; events with mismatched ids are silently
+   dropped (don't echo other clients' messages).
+8. **Default persona is gone** — `nota` no longer auto-creates any persona.
+   Use `nota onboard` or manually create files under `~/.nota/personas/<name>/`.
 9. **NapCat forward WS drops client pings** — NapCat (and likely other OneBot
    implementations) resets the WebSocket connection immediately when the
    *client* sends an unsolicited Ping frame (observed: disconnect exactly at
