@@ -14,6 +14,9 @@ cargo run -p nota-cli -- onboard   # configure API + create your first persona
 cargo run -p nota-cli              # start the server (REST + WS on :2349)
 ```
 
+First run: `nota` fails fast instead of auto-configuring — run `nota onboard`
+once to set up the API and create a first persona (or `nota persona create`).
+
 ## OneBot 11 (QQ bot)
 
 `nota-onebot` is a standalone Rust crate (no JS/plugin runtime) speaking

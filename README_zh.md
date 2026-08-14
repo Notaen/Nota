@@ -14,6 +14,9 @@ cargo run -p nota-cli -- onboard   # 配置 API + 创建首个 persona
 cargo run -p nota-cli              # 启动服务（REST + WS，端口 :2349）
 ```
 
+首次运行：`nota` 会快速失败而不是自动配置——先运行一次 `nota onboard`
+配置 API 并创建首个 persona（或用 `nota persona create`）。
+
 ## OneBot 11（QQ 机器人）
 
 `nota-onebot` 是独立 Rust crate（无 JS/插件运行时），目前支持**正向

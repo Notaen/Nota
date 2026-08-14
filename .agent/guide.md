@@ -167,8 +167,10 @@ and permission details.
 7. **WebSocket ↔ bus routing** — the WS handler filters events by `request_id`
    in its `active_request_ids` set; events with mismatched ids are silently
    dropped (don't echo other clients' messages).
-8. **Default persona is gone** — `nota` no longer auto-creates any persona.
-   Use `nota onboard` or manually create files under `~/.nota/personas/<name>/`.
+8. **No auto-created default persona** — personas are never silently created
+   (no hardcoded default name). `nota` fails fast with guidance instead of
+   auto-jumping: missing/corrupt `config.toml` → error "run `nota onboard`";
+   zero personas → error "run `nota persona create` / `nota onboard`".
 9. **NapCat forward WS drops client pings** — NapCat (and likely other OneBot
    implementations) resets the WebSocket connection immediately when the
    *client* sends an unsolicited Ping frame (observed: disconnect exactly at
