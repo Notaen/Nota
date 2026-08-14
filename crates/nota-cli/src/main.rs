@@ -15,9 +15,8 @@ use tracing_appender::{
 };
 use tracing_log::LogTracer;
 use tracing_subscriber::{
-    filter::LevelFilter,
+    filter::{LevelFilter, Targets},
     fmt::{self, format::Writer, time::FormatTime},
-    layer::{Context, Filter},
     prelude::*,
 };
 
@@ -61,18 +60,6 @@ enum PersonaCommand {
 #[derive(Clone)]
 struct ChronoLocalTimer;
 
-/// 文件日志过滤器：自己 crate（target 以 `nota_` 开头，即
-/// nota-core/infra/onebot/cli）全级别放行；其余第三方库只保留 INFO
-/// 及以上——避免 h2/hyper/reqwest 等传输层的帧级/连接级 DEBUG 噪音，
-/// 也不用维护一长串第三方 crate 名单。
-struct OurCratesDebug;
-
-impl<S: tracing::Subscriber> Filter<S> for OurCratesDebug {
-    fn enabled(&self, meta: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
-        meta.level() >= &tracing::Level::INFO || meta.target().starts_with("nota_")
-    }
-}
-
 impl FormatTime for ChronoLocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
@@ -106,8 +93,19 @@ fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
         .with_line_number(false)
         .with_filter(LevelFilter::INFO);
 
-    // 文件层：只放行自己 crate 的 DEBUG（见 OurCratesDebug），第三方库
-    // 的帧级/连接级 DEBUG（如 h2 的 `received frame=...`）一律不记录。
+    // 文件层过滤器：默认 INFO，只把我们自己的 crate（nota_*）放开到
+    // TRACE/DEBUG——第三方库（h2/hyper/reqwest/tungstenite 等）的帧级/
+    // 连接级 DEBUG 噪音（如 h2 的 `received frame=...`）一律不进日志，
+    // 也不用维护第三方 crate 黑名单（新依赖自动就是 INFO）。
+    // 注意：per-layer Filter 对事件真正生效的是内置 Targets 这类实现；
+    // 手写 enabled/callsite_enabled 的 Filter 在本版本里对事件不拦截。
+    let file_filter = Targets::new()
+        .with_default(LevelFilter::INFO)
+        .with_target("nota_core", LevelFilter::TRACE)
+        .with_target("nota_infra", LevelFilter::TRACE)
+        .with_target("nota_onebot", LevelFilter::TRACE)
+        .with_target("nota_cli", LevelFilter::TRACE);
+
     let file_layer = fmt::layer()
         .with_writer(non_blocking_writer)
         .with_timer(timer)
@@ -115,7 +113,7 @@ fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
         .with_file(false)
         .with_line_number(false)
         .with_ansi(false)
-        .with_filter(OurCratesDebug);
+        .with_filter(file_filter);
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -397,6 +395,78 @@ mod tests {
         // 损坏的 TOML：同样报错停止
         std::fs::write(dir.join("config.toml"), "not valid toml [[[").unwrap();
         assert!(load_config_for_server(&store).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端验证文件层过滤器：h2 的 DEBUG/TRACE 被挡掉，自己 crate 的
+    /// DEBUG 保留，第三方 INFO 保留。（tracing 全局 subscriber 只能初始化
+    /// 一次，本测试独占这份初始化。）
+    #[test]
+    fn our_crates_debug_filter_blocks_third_party_noise() {
+        let dir = std::env::temp_dir().join(format!("nota_log_filter_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("out.log");
+        let file = std::fs::File::create(&log_path).unwrap();
+        let console_file = std::fs::File::create(dir.join("console.log")).unwrap();
+
+        let file_filter = tracing_subscriber::filter::Targets::new()
+            .with_default(LevelFilter::INFO)
+            .with_target("nota_core", LevelFilter::TRACE)
+            .with_target("nota_infra", LevelFilter::TRACE)
+            .with_target("nota_onebot", LevelFilter::TRACE)
+            .with_target("nota_cli", LevelFilter::TRACE);
+
+        let init_ok = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(console_file)
+                    .with_filter(LevelFilter::INFO),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file)
+                    .with_filter(file_filter),
+            )
+            .try_init();
+        assert!(
+            init_ok.is_ok(),
+            "tracing subscriber init failed: {init_ok:?}"
+        );
+
+        let h2_noise = "received frame=Data { stream_id: StreamId(1) }";
+        tracing::debug!(target: "h2::codec::framed_read", "{}", h2_noise);
+        tracing::debug!(
+            target: "nota_core::session",
+            "[in] session 'onebot_private_1' -> persona 'alice' from 'u': hello"
+        );
+        tracing::info!(target: "h2", "connection established");
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            content.contains("nota_core::session"),
+            "our DEBUG must be recorded, got:\n{content}"
+        );
+        assert!(
+            !content.contains("received frame"),
+            "third-party DEBUG must be filtered out, got:\n{content}"
+        );
+        assert!(
+            content.contains("connection established"),
+            "third-party INFO must be kept, got:\n{content}"
+        );
+
+        // 控制台层（INFO）在全局 current()=TRACE 时也不能漏 DEBUG
+        let console_content = std::fs::read_to_string(dir.join("console.log")).unwrap();
+        assert!(
+            !console_content.contains("received frame"),
+            "console must not show h2 DEBUG, got:\n{console_content}"
+        );
+        assert!(
+            console_content.contains("connection established"),
+            "console must keep INFO, got:\n{console_content}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -167,13 +167,20 @@ adapters; see `AGENTS.md` and `.agent/guide.md` for the full layout.
   logs `[in] session '…' -> persona '…' from '…': <content>` (deliver) and
   `[out] session '…' target '…': <content>` (route_outbound, covers replies,
   `send_message`, slash acks). Core stays on the `log::*` facade.
-- Transport-crate DEBUG noise is filtered out of the file layer by an
-  **inverted allowlist filter** (`OurCratesDebug` in nota-cli): targets
-  starting with `nota_` (nota-core/infra/onebot/cli) pass at every level,
-  everything else is INFO+. No per-crate blacklist to maintain — new deps
-  are automatically INFO. The worst offender was `h2` logging every
-  HTTP/2 frame (`received frame=Data { stream_id: StreamId(1) }`) on every
-  LLM API call.
+- Transport-crate DEBUG noise is filtered out of the file layer with
+  **`Targets`** (built-in): `with_default(INFO)` + the four `nota_*` crates at
+  `TRACE`. New third-party deps are automatically INFO — no blacklist to
+  maintain. The worst offender was `h2` logging every HTTP/2 frame
+  (`received frame=Data { stream_id: StreamId(1) }`) on every LLM API call.
+- Pitfall (2026-08-14, verified with a unit test): in tracing-subscriber
+  0.3.23, **hand-rolled `Filter` impls (even with `enabled` +
+  `event_enabled` + `callsite_enabled` + `max_level_hint`, and even
+  `filter_fn`) do NOT gate events in this setup — events leak through**
+  (probes showed every method returning `false` yet the event was recorded),
+  while the built-in `Targets` works. The console layer's `LevelFilter::INFO`
+  filter is fine. The regression test
+  `our_crates_debug_filter_blocks_third_party_noise` pins the two-layer
+  behavior (console INFO + file Targets).
 
 ## General lessons
 - When the user says "add", don't replace existing types — keep both.
