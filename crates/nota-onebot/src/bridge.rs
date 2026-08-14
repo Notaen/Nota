@@ -197,8 +197,8 @@ impl OneBotBridge {
         }
 
         let Some(content) = msg.message else { return };
-        // 语音段渲染为 [语音 消息ID:<id>]，persona 需要时自己调用
-        // get_voice_text 工具转写，不在桥接层自动处理。
+        // 非文本段统一渲染为 [{segment_type} msg id:<id>]，persona 需要时
+        // 自己调用工具（如 get_voice_text / get_msg）获取内容，不在桥接层自动处理。
         let mut text = content.to_text_with_id(&msg.message_id.to_string());
         if text.trim().is_empty() {
             return;
@@ -715,7 +715,7 @@ mod tests {
         bridge.handle_onebot_event(voice_event(42)).await;
 
         let msg = inbox.recv().await.unwrap();
-        assert_eq!(msg.content, "[语音 消息ID:99]");
+        assert_eq!(msg.content, "[record msg id:99]");
         assert_eq!(msg.session.session_id, "onebot_private_42");
     }
 

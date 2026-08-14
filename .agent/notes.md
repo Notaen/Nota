@@ -323,15 +323,17 @@ cloned as a git submodule.
 - `format_history` renders every history line as
   `[HH:MM] 昵称(QQ) 消息ID:<id>: text`; message ids are parsed leniently
   (number or string) via `de_id_as_string`.
-- `reply` quote segments render as `[回复消息ID:<id>]` so the persona can
-  resolve the quoted message with the `get_msg` tool (standard OneBot API,
-  verified live against NapCat: `get_msg` / `get_friend_msg_history` return
-  numeric `message_id` + `message_seq`).
+- Non-text segments render uniformly as `[{segment_type} msg id:<id>]`
+  (e.g. `[image msg id:123]`, `[reply msg id:456]`), so the persona knows
+  what kind of media arrived and can fetch its content with a tool
+  (`get_msg`, `get_voice_text`, …). The `get_msg` tool is the standard
+  OneBot API, verified live against NapCat: `get_msg` /
+  `get_friend_msg_history` return numeric `message_id` + `message_seq`.
 - `get_login_info` tool exposes the bot's own QQ number/nickname.
 
 ### Voice messages: persona-driven transcription (2026-08-13)
 - Voice (`record`) segments are rendered with the containing message id —
-  `[语音 消息ID:<id>]` — in inbound events, `get_msg`, and
+  `[record msg id:<id>]` — in inbound events, `get_msg`, and
   `format_history`, so the persona can see there is a voice message and
   knows which one it is.
 - Transcription is **not** automatic in the bridge: the persona calls the
@@ -348,6 +350,21 @@ cloned as a git submodule.
   times (2s apart) before failing, and its error message tells the persona
   the voice may still be processing. `message_id` is sent as a string, which
   proved more reliable than a number against NapCat.
+
+### Uniform non-text segment rendering (2026-08-13)
+- `segment_to_text` / `segment_to_text_with_id` no longer special-case each
+  segment type with a Chinese placeholder (`[图片]` / `[表情]` / `[语音]` /
+  `[回复消息ID:…]` …). Text segments keep their raw content; **every other
+  segment type renders uniformly as `[{segment_type} msg id:<id>]`** where
+  `id` is the containing message id. The persona sees e.g. `[image msg
+  id:1758219899]` and decides whether to fetch content with a tool — nothing
+  is auto-processed in the bridge.
+- The id-less `to_text` (used for local parsing like approval commands) keeps
+  text content and renders non-text segments as `[{type}]` without an id.
+- Consequence: a `reply` quote no longer surfaces the *quoted* message id
+  directly — the persona gets the containing message id and can resolve the
+  quote with `get_msg` if needed. Voice transcription hooks stay unchanged
+  (`get_voice_text` takes the id from `[record msg id:…]`).
 
 ### Send/receive separation (2026-08-13)
 - The bridge no longer auto-routes persona replies. Inbound OneBot events

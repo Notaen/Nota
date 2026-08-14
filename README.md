@@ -39,14 +39,18 @@ group_ids = []                      # allowlist: only these groups get a reply
 
 Notes:
 
-- Non-text segments (image, face, at, …) are flattened to placeholders before
-  reaching the LLM; replies are sent as plain text and chunked at 4000 chars.
+- Non-text segments (image, face, at, …) are flattened uniformly to
+  `[{segment_type} msg id:<id>]` (e.g. `[image msg id:123]`) before reaching
+  the LLM, so the persona knows what kind of media arrived and which message
+  to fetch with a tool; plain text keeps its content. Replies are sent as
+  plain text and chunked at 4000 chars.
 - Inbound messages are prefixed with the chat identity and QQ numbers
   (`[私聊 昵称(QQ) → bot(QQ)]` / `[群 群号 昵称(QQ) → bot(QQ)]`), so the
   persona always knows who is talking (sender QQ, group QQ, bot's own QQ).
-- A `reply` quote segment carries its message id as `[回复消息ID:…]`; the
-  `get_msg` tool fetches the quoted message by that id, and group history
-  lines include `消息ID:…` so the persona can correlate quotes to messages.
+- A `reply` quote segment renders as `[reply msg id:…]` (the containing
+  message id, like every other non-text segment); the `get_msg` tool fetches
+  the message content, and group history lines include `消息ID:…` so the
+  persona can correlate messages.
 - **Sessions & send/receive**: each chat endpoint (a QQ friend, a group, a
   web client) is its own conversation **session** with two history layers:
   `deep.json` (full LLM context) and `shallow.json` (only messages actually

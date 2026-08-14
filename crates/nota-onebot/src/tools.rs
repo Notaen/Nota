@@ -144,7 +144,7 @@ impl Tool for GetLoginInfoTool {
 }
 
 /// Fetch a single message by its message id (e.g. the id from a
-/// `[回复消息ID:…]` quote), so the persona can see exactly which message a
+/// `[reply msg id:…]` segment), so the persona can see exactly which message a
 /// reply refers to.
 pub struct GetMsgTool {
     api: OneBotApi,
@@ -163,7 +163,7 @@ impl Tool for GetMsgTool {
     }
 
     fn description(&self) -> &str {
-        "Get a specific QQ message by its message id (e.g. the id in a [回复消息ID:...] quote) and return sender, time and full text."
+        "Get a specific QQ message by its message id (e.g. the id in a [reply msg id:...] segment) and return sender, time and full text."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -172,7 +172,7 @@ impl Tool for GetMsgTool {
             "message_id".to_string(),
             PropertyDef {
                 prop_type: "string".to_string(),
-                description: "Message id from a [回复消息ID:...] quote in an incoming message".to_string(),
+                description: "Message id from a [reply msg id:...] segment in an incoming message".to_string(),
                 r#enum: vec![],
             },
         );
@@ -224,7 +224,7 @@ impl Tool for GetMsgTool {
 
 /// Transcribe a QQ voice message (语音) into text via NapCat's
 /// `fetch_ptt_text`, so the persona can read the content of a
-/// `[语音 消息ID:…]` segment from an incoming or historical message.
+/// `[record msg id:…]` segment from an incoming or historical message.
 pub struct GetVoiceTextTool {
     api: OneBotApi,
 }
@@ -242,7 +242,7 @@ impl Tool for GetVoiceTextTool {
     }
 
     fn description(&self) -> &str {
-        "Transcribe a QQ voice message (语音) into text via the OneBot connection (NapCat fetch_ptt_text). Pass the message id from a [语音 消息ID:...] segment."
+        "Transcribe a QQ voice message (语音) into text via the OneBot connection (NapCat fetch_ptt_text). Pass the message id from a [record msg id:...] segment."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -251,7 +251,7 @@ impl Tool for GetVoiceTextTool {
             "message_id".to_string(),
             PropertyDef {
                 prop_type: "string".to_string(),
-                description: "Message id from a [语音 消息ID:...] segment in an incoming or historical message".to_string(),
+                description: "Message id from a [record msg id:...] segment in an incoming or historical message".to_string(),
                 r#enum: vec![],
             },
         );

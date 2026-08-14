@@ -95,7 +95,8 @@ pub struct MessageSegment {
 }
 
 impl MessageContent {
-    /// Flatten to plain text for the LLM; non-text segments become placeholders.
+    /// Flatten to plain text for local parsing (e.g. approval commands);
+    /// non-text segments become `[{type}]` placeholders without a message id.
     pub fn to_text(&self) -> String {
         match self {
             MessageContent::Text(s) => s.clone(),
@@ -105,9 +106,11 @@ impl MessageContent {
         }
     }
 
-    /// Flatten to plain text like [`to_text`], but render `record` segments
-    /// with the containing message id (`[语音 消息ID:<id>]`) so the persona
-    /// can transcribe them via the `get_voice_text` tool.
+    /// Flatten to plain text for the LLM. Text segments keep their content;
+    /// every other segment is rendered uniformly as
+    /// `[{segment_type} msg id:<id>]` so the persona knows what kind of
+    /// media arrived and can fetch its content with a tool (`get_msg`,
+    /// `get_voice_text`, …).
     pub fn to_text_with_id(&self, message_id: &str) -> String {
         match self {
             MessageContent::Text(s) => s.clone(),
@@ -128,26 +131,6 @@ fn segment_to_text(seg: &MessageSegment) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        "at" => {
-            let qq = data
-                .get("qq")
-                .and_then(|v| v.as_str())
-                .unwrap_or("someone");
-            format!("@{qq}")
-        }
-        "image" => "[图片]".to_string(),
-        "face" => "[表情]".to_string(),
-        "record" => "[语音]".to_string(),
-        "video" => "[视频]".to_string(),
-        "reply" => {
-            let id = data
-                .get("id")
-                .map(json_value_to_string)
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "unknown".to_string());
-            format!("[回复消息ID:{id}]")
-        }
-        "forward" => "[聊天记录]".to_string(),
         other => format!("[{other}]"),
     }
 }
@@ -160,13 +143,20 @@ fn json_value_to_string(v: &serde_json::Value) -> String {
     }
 }
 
-/// Render a segment for [`MessageContent::to_text_with_id`]; `record`
-/// (voice) segments carry the message id so the persona can transcribe them.
+/// Render a segment for [`MessageContent::to_text_with_id`]: text segments
+/// keep their content, every other segment becomes
+/// `[{segment_type} msg id:{message_id}]` so the persona can fetch the real
+/// content (image OCR, voice transcription, …) with a tool.
 fn segment_to_text_with_id(seg: &MessageSegment, message_id: &str) -> String {
-    if seg.segment_type == "record" {
-        return format!("[语音 消息ID:{message_id}]");
+    let data = &seg.data;
+    match seg.segment_type.as_str() {
+        "text" => data
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        other => format!("[{other} msg id:{message_id}]"),
     }
-    segment_to_text(seg)
 }
 
 /// Deserialize a message id that implementations may send as either a
@@ -468,7 +458,7 @@ mod tests {
         };
         assert_eq!(msg.message_type, "private");
         assert_eq!(msg.user_id, 10001);
-        assert_eq!(msg.message.unwrap().to_text(), "hello [表情] world");
+        assert_eq!(msg.message.unwrap().to_text(), "hello [face] world");
     }
 
     #[test]
@@ -571,7 +561,7 @@ mod tests {
                 data: HashMap::from([("text".to_string(), serde_json::json!(" 收到"))]),
             },
         ]);
-        assert_eq!(content.to_text(), "[回复消息ID:1234567890] 收到");
+        assert_eq!(content.to_text(), "[reply] 收到");
     }
 
     #[test]
@@ -580,7 +570,7 @@ mod tests {
             segment_type: "reply".to_string(),
             data: HashMap::from([("id".to_string(), serde_json::json!(42))]),
         }]);
-        assert_eq!(content.to_text(), "[回复消息ID:42]");
+        assert_eq!(content.to_text(), "[reply]");
     }
 
     #[test]
@@ -589,8 +579,8 @@ mod tests {
             segment_type: "record".to_string(),
             data: HashMap::from([("file".to_string(), serde_json::json!("voice.amr"))]),
         }]);
-        assert_eq!(voice.to_text(), "[语音]");
-        assert_eq!(voice.to_text_with_id("99"), "[语音 消息ID:99]");
+        assert_eq!(voice.to_text(), "[record]");
+        assert_eq!(voice.to_text_with_id("99"), "[record msg id:99]");
 
         let mixed = MessageContent::Segments(vec![
             MessageSegment {
@@ -602,7 +592,45 @@ mod tests {
                 data: HashMap::new(),
             },
         ]);
-        assert_eq!(mixed.to_text_with_id("42"), "收到 [语音 消息ID:42]");
+        assert_eq!(mixed.to_text_with_id("42"), "收到 [record msg id:42]");
+    }
+
+    #[test]
+    fn renders_all_non_text_segments_uniformly_with_message_id() {
+        let content = MessageContent::Segments(vec![
+            MessageSegment {
+                segment_type: "image".to_string(),
+                data: HashMap::new(),
+            },
+            MessageSegment {
+                segment_type: "face".to_string(),
+                data: HashMap::from([("id".to_string(), serde_json::json!(1))]),
+            },
+            MessageSegment {
+                segment_type: "video".to_string(),
+                data: HashMap::new(),
+            },
+            MessageSegment {
+                segment_type: "at".to_string(),
+                data: HashMap::from([("qq".to_string(), serde_json::json!("10001"))]),
+            },
+            MessageSegment {
+                segment_type: "forward".to_string(),
+                data: HashMap::new(),
+            },
+            MessageSegment {
+                segment_type: "some_future_type".to_string(),
+                data: HashMap::new(),
+            },
+        ]);
+        assert_eq!(
+            content.to_text_with_id("77"),
+            "[image msg id:77][face msg id:77][video msg id:77][at msg id:77][forward msg id:77][some_future_type msg id:77]"
+        );
+        assert_eq!(
+            content.to_text(),
+            "[image][face][video][at][forward][some_future_type]"
+        );
     }
 
     #[test]
