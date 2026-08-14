@@ -1,5 +1,6 @@
 use anyhow::Result;
-use dialoguer::{Confirm, Input, Password, Select};
+use console::{Key, Term};
+use dialoguer::{Confirm, Input, Select};
 
 use nota_infra::{Config, provider_default_model, provider_ids, provider_name, provider_url};
 use nota_onebot::OnebotConfig;
@@ -145,10 +146,7 @@ fn prompt_onebot(existing: Option<&Config>) -> Result<Option<OnebotConfig>> {
         .default(default_url)
         .interact_text()?;
 
-    let access_token: String = Password::new()
-        .with_prompt("OneBot access token (leave empty if none)")
-        .allow_empty_password(true)
-        .interact()?;
+    let access_token: String = prompt_masked("OneBot access token (leave empty if none)", true)?;
 
     let default_persona = defaults
         .as_ref()
@@ -206,21 +204,71 @@ fn prompt_for_key(prompt: &str, existing: Option<String>) -> Result<String> {
     {
         let masked = mask_key(&key);
         let display = format!("{prompt} [current: {masked}]");
-        let input: String = Password::new()
-            .with_prompt(&display)
-            .allow_empty_password(true)
-            .interact()?;
+        let input = prompt_masked(&display, true)?;
         if input.is_empty() {
             Ok(key)
         } else {
             Ok(input)
         }
     } else {
-        let input: String = Password::new()
-            .with_prompt(prompt)
-            .allow_empty_password(false)
-            .interact()?;
-        Ok(input)
+        prompt_masked(prompt, false)
+    }
+}
+
+/// Read a secret from the terminal, echoing one `*` per character as it is
+/// typed or pasted.
+///
+/// `dialoguer::Password` reads the whole line with terminal echo disabled
+/// (`Term::read_secure_line`), so nothing appears on screen while the user
+/// types or pastes — only after Enter does it print `[hidden]`, which makes
+/// it look like the input was never received. This prompt shows masked
+/// feedback immediately while keeping the actual value hidden.
+fn prompt_masked(prompt: &str, allow_empty: bool) -> Result<String> {
+    let term = Term::stderr();
+    // 与 dialoguer 一致：非终端环境下直接报错，而不是无限等待按键
+    if !term.is_term() {
+        anyhow::bail!("not a terminal");
+    }
+
+    loop {
+        term.write_str(&format!("{prompt}: "))?;
+        term.flush()?;
+
+        let mut buf = String::new();
+        let mut masked = 0usize; // 已打印的掩码字符数
+        loop {
+            match term.read_key()? {
+                Key::Char(c) if !c.is_ascii_control() => {
+                    buf.push(c);
+                    term.write_str("*")?;
+                    masked += 1;
+                }
+                Key::Backspace if !buf.is_empty() => {
+                    buf.pop();
+                    if masked > 0 {
+                        term.clear_chars(1)?;
+                        masked -= 1;
+                    }
+                }
+                // Windows 下 Ctrl+C 以 '\x03' 到达（Unix 下 read_key 会自行触发 SIGINT）
+                Key::Char('\x03') => anyhow::bail!("interrupted"),
+                Key::Enter => break,
+                _ => {}
+            }
+            term.flush()?;
+        }
+
+        // 抹掉输入期间显示的掩码，再用 [hidden]/[empty] 标记收尾
+        if masked > 0 {
+            term.clear_chars(masked)?;
+        }
+        if buf.is_empty() && !allow_empty {
+            term.write_line("")?;
+            term.write_line(&format!("error: {prompt} cannot be empty"))?;
+            continue;
+        }
+        term.write_line(if buf.is_empty() { "[empty]" } else { "[hidden]" })?;
+        return Ok(buf);
     }
 }
 

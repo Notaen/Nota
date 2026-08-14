@@ -16,6 +16,7 @@ nota-onebot = { path = "../nota-onebot" }
 anyhow.workspace = true
 chrono.workspace = true
 clap = { workspace = true, features = ["derive"] }
+console.workspace = true
 dirs.workspace = true
 dialoguer.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

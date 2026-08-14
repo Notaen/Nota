@@ -517,6 +517,22 @@ cloned as a git submodule.
   `https://api.deepseek.com/v1/responses`, and an end-to-end WS chat
   through persona Nota produced a reply.
 
+### `nota onboard` wizard secrets: masked feedback (2026-08-13)
+- `nota-cli` no longer uses `dialoguer::Password` for secrets (LLM API key,
+  OneBot access token). dialoguer 0.12's `Password` reads the whole line with
+  terminal echo disabled (`Term::read_secure_line`), so **nothing appears on
+  screen while typing/pasting** — only after Enter does it print `[hidden]`,
+  which reads as "the paste did nothing".
+- New `prompt_masked` in `config_wizard.rs` reads keys one at a time via
+  `console::Term::read_key` (echo off per key) and prints one `*` per
+  character, so pasting/typing gives immediate feedback while the value stays
+  hidden. After Enter the stars are erased and `[hidden]` / `[empty]` is
+  printed in their place. Empty-but-required re-prompts with an error line.
+- Ctrl+C still interrupts: Unix `read_key` raises SIGINT itself; on Windows
+  Ctrl+C arrives as `Key::Char('\x03')` and aborts with an error.
+- `console = "0.16"` added to the workspace deps (already in the lock via
+  dialoguer, no new crates).
+
 ### Built-in web_search tool in Responses API mode (2026-08-13)
 - `Config.web_search` (default `true`) attaches DeepSeek's server-side
   built-in `web_search` tool to every Responses API request:

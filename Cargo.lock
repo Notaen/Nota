@@ -1170,6 +1170,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "console",
  "dialoguer",
  "dirs",
  "nota-core",
