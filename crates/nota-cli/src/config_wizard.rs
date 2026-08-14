@@ -288,7 +288,6 @@ pub fn prompt_create_persona() -> Result<String> {
 
     let name: String = Input::new()
         .with_prompt("Persona name")
-        .default("default".to_string())
         .interact_text()?;
 
     Ok(name)

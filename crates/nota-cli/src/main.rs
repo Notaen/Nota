@@ -43,6 +43,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Onboard,
+    Persona {
+        #[command(subcommand)]
+        action: PersonaCommand,
+    },
+}
+
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+enum PersonaCommand {
+    List,
+    Create {
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -111,6 +123,37 @@ fn load_or_create_config(store: &ConfigStore) -> Result<nota_infra::Config> {
             Ok(cfg)
         }
     }
+}
+
+async fn run_persona_command(base: &Path, action: PersonaCommand) -> Result<()> {
+    let persona_store = FilePersonaStore::new(base);
+
+    match action {
+        PersonaCommand::List => {
+            let names = persona_store.list_personas().await?;
+            if names.is_empty() {
+                println!("No personas found.");
+            } else {
+                for name in names {
+                    println!("{name}");
+                }
+            }
+        }
+        PersonaCommand::Create { name } => {
+            let name = match name {
+                Some(name) => name,
+                None => config_wizard::prompt_create_persona()?,
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                anyhow::bail!("persona name cannot be empty");
+            }
+            persona_store.create_persona(name).await?;
+            println!("Persona '{name}' created");
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_server(
@@ -247,6 +290,35 @@ async fn start_onebot(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_persona_list_command() {
+        let cli = Cli::try_parse_from(["nota", "persona", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Persona {
+                action: PersonaCommand::List,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_persona_create_command() {
+        let cli = Cli::try_parse_from(["nota", "persona", "create", "alice"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Persona {
+                action: PersonaCommand::Create {
+                    name: Some(name),
+                },
+            }) if name == "alice"
+        ));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -266,6 +338,9 @@ async fn main() -> Result<()> {
             let persona_name = config_wizard::prompt_create_persona()?;
             persona_store.create_persona(&persona_name).await?;
             info!("Persona '{}' created", persona_name);
+        }
+        Some(Command::Persona { action }) => {
+            run_persona_command(&base, action).await?;
         }
         None => {
             info!("Nota started");
