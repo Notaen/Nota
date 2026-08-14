@@ -48,8 +48,12 @@ adapters; see `AGENTS.md` and `.agent/guide.md` for the full layout.
   LLM context is built from rows after the last boundary. Raw history is served
   by `GET /api/personas/{name}/chatlog/{session_id}`. Adapter-assigned session
   ids: `onebot_private_<qq>` / `onebot_group_<qq>` / `web_<uuid>`.
-- **No default persona**: `nota` never auto-creates one. Use `nota onboard`,
-  create the directory by hand, or `POST /api/personas`.
+- **No default persona**: no hardcoded default name, and `nota` never
+  auto-creates or auto-jumps — running the server with a missing/corrupt
+  `config.toml` errors out with "run `nota onboard`"; with zero personas it
+  errors out with "run `nota persona create` / `nota onboard`". Both fail
+  fast with guidance, no interactive detour. Setup paths: `nota onboard`
+  (wizard + persona prompt) or `nota persona create`.
 
 ## Event bus & permissions
 
@@ -152,8 +156,26 @@ adapters; see `AGENTS.md` and `.agent/guide.md` for the full layout.
   disconnected clients (messages sent during a disconnect window are lost);
   `fetch_ptt_text` is intermittent (retcode=1200 then success on retry).
 
-## General lessons
+### solo.md template + session message DEBUG logs (2026-08-14)
+- `nota-infra/assets/solo.md` template rewritten (user-approved): identity,
+  chat-style reply rules, honesty + "不要回答" silence contract, tool/memory
+  usage (`file_read/write` in workspace, `schedule`, `send_message`,
+  `status`, memory.md), and session context (independent sessions, identity
+  headers like `[好友 昵称(QQ)]`). Only affects newly created personas —
+  existing `~/.nota/personas/*/solo.md` are user config and untouched.
+- File logs at DEBUG now carry the session message flow: `SessionManager`
+  logs `[in] session '…' -> persona '…' from '…': <content>` (deliver) and
+  `[out] session '…' target '…': <content>` (route_outbound, covers replies,
+  `send_message`, slash acks). Core stays on the `log::*` facade.
+- Transport-crate DEBUG noise is filtered out of the file layer by an
+  **inverted allowlist filter** (`OurCratesDebug` in nota-cli): targets
+  starting with `nota_` (nota-core/infra/onebot/cli) pass at every level,
+  everything else is INFO+. No per-crate blacklist to maintain — new deps
+  are automatically INFO. The worst offender was `h2` logging every
+  HTTP/2 frame (`received frame=Data { stream_id: StreamId(1) }`) on every
+  LLM API call.
 
+## General lessons
 - When the user says "add", don't replace existing types — keep both.
 - Don't auto-add defaults (persona, …) unless explicitly requested; don't
   hardcode names that belong in filesystem config.

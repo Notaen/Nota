@@ -17,6 +17,7 @@ use tracing_log::LogTracer;
 use tracing_subscriber::{
     filter::LevelFilter,
     fmt::{self, format::Writer, time::FormatTime},
+    layer::{Context, Filter},
     prelude::*,
 };
 
@@ -60,6 +61,18 @@ enum PersonaCommand {
 #[derive(Clone)]
 struct ChronoLocalTimer;
 
+/// 文件日志过滤器：自己 crate（target 以 `nota_` 开头，即
+/// nota-core/infra/onebot/cli）全级别放行；其余第三方库只保留 INFO
+/// 及以上——避免 h2/hyper/reqwest 等传输层的帧级/连接级 DEBUG 噪音，
+/// 也不用维护一长串第三方 crate 名单。
+struct OurCratesDebug;
+
+impl<S: tracing::Subscriber> Filter<S> for OurCratesDebug {
+    fn enabled(&self, meta: &tracing::Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
+        meta.level() >= &tracing::Level::INFO || meta.target().starts_with("nota_")
+    }
+}
+
 impl FormatTime for ChronoLocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
@@ -93,6 +106,8 @@ fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
         .with_line_number(false)
         .with_filter(LevelFilter::INFO);
 
+    // 文件层：只放行自己 crate 的 DEBUG（见 OurCratesDebug），第三方库
+    // 的帧级/连接级 DEBUG（如 h2 的 `received frame=...`）一律不记录。
     let file_layer = fmt::layer()
         .with_writer(non_blocking_writer)
         .with_timer(timer)
@@ -100,7 +115,7 @@ fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
         .with_file(false)
         .with_line_number(false)
         .with_ansi(false)
-        .with_filter(LevelFilter::DEBUG);
+        .with_filter(OurCratesDebug);
 
     tracing_subscriber::registry()
         .with(console_layer)
@@ -111,18 +126,17 @@ fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
     Ok(guard)
 }
 
-fn load_or_create_config(store: &ConfigStore) -> Result<nota_infra::Config> {
-    match store.load() {
-        Ok(()) => Ok(store.get().unwrap()),
-        Err(e) => {
-            tracing::warn!("The config.toml doesn't exist or failed to load: {e}");
-            let cfg = config_wizard::run_wizard(None)?;
-            store.set(cfg.clone());
-            store.save(&cfg)?;
-            info!("Config saved");
-            Ok(cfg)
-        }
-    }
+/// 直接运行 `nota` 就是启动服务：配置文件缺失或损坏时直接报错并停止，
+/// 不自动进入向导——首次配置请先运行 `nota onboard`。
+fn load_config_for_server(store: &ConfigStore) -> Result<nota_infra::Config> {
+    store.load().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to load ~/.nota/config.toml: {e}. Run `nota onboard` to configure the API first."
+        )
+    })?;
+    store
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("config loaded but not stored"))
 }
 
 async fn run_persona_command(base: &Path, action: PersonaCommand) -> Result<()> {
@@ -187,7 +201,9 @@ async fn run_server(
 
     let persona_names = persona_store.list_personas().await?;
     if persona_names.is_empty() {
-        tracing::warn!("No personas found in ~/.nota/personas/. Create one via the onboard wizard.");
+        anyhow::bail!(
+            "No personas found in ~/.nota/personas/. Create one via `nota persona create` or `nota onboard` first."
+        );
     }
 
     for name in &persona_names {
@@ -290,35 +306,6 @@ async fn start_onebot(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_persona_list_command() {
-        let cli = Cli::try_parse_from(["nota", "persona", "list"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Persona {
-                action: PersonaCommand::List,
-            })
-        ));
-    }
-
-    #[test]
-    fn parses_persona_create_command() {
-        let cli = Cli::try_parse_from(["nota", "persona", "create", "alice"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Persona {
-                action: PersonaCommand::Create {
-                    name: Some(name),
-                },
-            }) if name == "alice"
-        ));
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -346,10 +333,71 @@ async fn main() -> Result<()> {
             info!("Nota started");
             let config_store = ConfigStore::new(&base);
             let cancel_token = CancellationToken::new();
-            let config = load_or_create_config(&config_store)?;
+            let config = load_config_for_server(&config_store)?;
             run_server(&base, config, cancel_token).await?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_persona_list_command() {
+        let cli = Cli::try_parse_from(["nota", "persona", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Persona {
+                action: PersonaCommand::List,
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_persona_create_command() {
+        let cli = Cli::try_parse_from(["nota", "persona", "create", "alice"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Persona {
+                action: PersonaCommand::Create {
+                    name: Some(name),
+                },
+            }) if name == "alice"
+        ));
+    }
+
+    #[test]
+    fn load_config_for_server_fails_fast_without_config() {
+        let dir = std::env::temp_dir().join(format!("nota_config_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 无配置文件：报错并引导 `nota onboard`，而不是自动进向导
+        let store = ConfigStore::new(&dir);
+        let err = load_config_for_server(&store)
+            .err()
+            .expect("expected an error without config.toml")
+            .to_string();
+        assert!(err.contains("nota onboard"), "unexpected error: {err}");
+
+        // 有效配置：正常加载
+        std::fs::write(
+            dir.join("config.toml"),
+            "api_url = \"https://api.deepseek.com/v1\"\napi_key = \"k\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let cfg = load_config_for_server(&store).unwrap();
+        assert_eq!(cfg.api_url, "https://api.deepseek.com/v1");
+        assert_eq!(cfg.api_key, "k");
+        assert_eq!(cfg.model, "m");
+
+        // 损坏的 TOML：同样报错停止
+        std::fs::write(dir.join("config.toml"), "not valid toml [[[").unwrap();
+        assert!(load_config_for_server(&store).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

@@ -148,6 +148,15 @@ impl SessionManager {
             timestamp: chrono::Utc::now().timestamp(),
             request_id,
         };
+        // DEBUG：记录流入 persona 的消息内容，方便排查会话里到底发生了什么
+        log::debug!(
+            "[in] session '{}' -> persona '{}' from '{}': {}{}",
+            session.session_id,
+            session.persona,
+            sender,
+            prefix,
+            content
+        );
         let inbox = self
             .persona_inboxes
             .lock()
@@ -179,6 +188,13 @@ impl SessionManager {
             content: content.to_string(),
             request_id,
         });
+        // DEBUG：记录 persona 发出的消息内容（回复 / send_message / 命令回执）
+        log::debug!(
+            "[out] session '{}' target '{}': {}",
+            session_id.unwrap_or("-"),
+            target.unwrap_or("-"),
+            content
+        );
         let outboxes = self.adapter_outboxes.lock().unwrap();
         match session_id {
             Some(sid) => {
