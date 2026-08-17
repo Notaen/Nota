@@ -2,6 +2,10 @@
 
 **Read this first.** Files in this directory are project-specific instructions for AI agents.
 
+Human docs (start here for context): `README.md` / `README.zh.md` (what Nota
+does, quick start) and `CONTRIBUTING.md` (full architecture, HTTP API,
+directory layout).
+
 ## Hard Rules (non-negotiable)
 
 1. **Never delete or modify existing code comments** without explicit approval.
@@ -15,7 +19,7 @@
 | File | Read when... | Purpose |
 |------|--------------|---------|
 | `notes.md` | **Always** | Hard rules, current architecture, design decisions. |
-| `guide.md` | Working on code (Rust, API, WS) | Tech stack, API endpoints, pitfalls. |
+| `guide.md` | Working on code (Rust, API, WS) | Architecture, routing, pitfalls (HTTP API / tech stack: see `CONTRIBUTING.md`). |
 | `retrospective.md` | Optional | Past session lessons — mistakes to avoid. |
 
 Start with `notes.md`. Read `guide.md` before writing Rust code.

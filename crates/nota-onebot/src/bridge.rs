@@ -1,7 +1,7 @@
 //! OneBot 11 adapter bridge.
 //!
 //! There is no global bus anymore: the bridge subscribes to the `onebot`
-//! adapter channel of the [`SessionManager`]. Inbound QQ messages are
+//! adapter channel of the [`ConversationManager`]. Inbound OneBot messages are
 //! delivered straight to the target persona's inbox; outbound events
 //! (automatic replies, `send_message`) and permission requests come back
 //! through the adapter channel. The bridge owns the OneBot allowlist and the
@@ -10,9 +10,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use nota_core::conversation::{
+    AdapterEvent, Conversation, ConversationManager, PermissionEvent,
+};
 use nota_core::permissions::PermissionRegistry;
-use nota_core::session::{AdapterEvent, PermissionEvent, Session, SessionManager};
-use nota_core::tool::ToolRegistry;
+use nota_llm::tool::ToolRegistry;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
@@ -24,16 +26,16 @@ use crate::types::{
     ActionRequest, MessageEvent, PostEvent, ReplyRoute, chunk_text, identity,
 };
 
-/// Max characters per outbound QQ message.
+/// Max characters per outbound OneBot message.
 const MAX_MESSAGE_CHARS: usize = 4000;
 
 pub struct OneBotBridge {
-    manager: Arc<SessionManager>,
+    manager: Arc<ConversationManager>,
     permissions: Arc<PermissionRegistry>,
     persona: String,
     cfg: OnebotConfig,
     api: OneBotApi,
-    /// Per-source-session queue of pending approval ids, in order.
+    /// Per-source-conversation queue of pending approval ids, in order.
     pending_approvals: Mutex<HashMap<String, Vec<String>>>,
     action_rx: Option<UnboundedReceiver<ActionRequest>>,
 }
@@ -92,7 +94,7 @@ impl Outbound {
 
 impl OneBotBridge {
     pub fn new(
-        manager: Arc<SessionManager>,
+        manager: Arc<ConversationManager>,
         permissions: Arc<PermissionRegistry>,
         persona: String,
         cfg: OnebotConfig,
@@ -185,11 +187,12 @@ impl OneBotBridge {
             .map(|m| m.to_text())
             .unwrap_or_default();
         if let Some((approved, seq)) = parse_approval(&raw_text) {
-            if let Some(session_id) = session_id_for(&msg)
-                && let Some(permission_id) = self.take_pending_approval(&session_id, seq)
+        if let Some(conversation_id) = conversation_id_for(&msg)
+            && let Some(permission_id) =
+                self.take_pending_approval(&conversation_id, seq)
             {
                 log::info!(
-                    "OneBot approval {permission_id} (approved={approved}) from {session_id}"
+                    "OneBot approval {permission_id} (approved={approved}) from {conversation_id}"
                 );
                 self.permissions.resolve(&permission_id, approved).await;
             }
@@ -212,9 +215,9 @@ impl OneBotBridge {
         }
 
         // The identity header is carried separately as `prefix`; `text` stays
-        // the user's real content (so slash commands reach the session
+        // the user's real content (so slash commands reach the conversation
         // manager verbatim).
-        let (session_id, prefix) = match msg.message_type.as_str() {
+        let (conversation_id, prefix) = match msg.message_type.as_str() {
             "private" => {
                 let prefix = format!(
                     "[好友 {}] ",
@@ -237,7 +240,7 @@ impl OneBotBridge {
         log::info!("OneBot -> {}: {text}", self.persona);
         self.manager
             .deliver(
-                &Session::new(self.persona.clone(), session_id),
+                &Conversation::new(self.persona.clone(), conversation_id),
                 "user",
                 &prefix,
                 &text,
@@ -265,7 +268,7 @@ impl OneBotBridge {
         match event {
             AdapterEvent::Outbound(e) => {
                 if let Some(target) = e.target.as_deref() {
-                    // send_message: `target` is the destination, `session_id`
+                    // send_message: `target` is the destination, `conversation_id`
                     // is the source for the approval notice.
                     let Some(route) = target_to_route(target) else {
                         log::warn!("OneBot outbound event has no usable target: '{target}'");
@@ -278,21 +281,21 @@ impl OneBotBridge {
                     } else {
                         self.request_outbound_approval(
                             action_tx,
-                            e.session_id.as_deref(),
+                            e.conversation_id.as_deref(),
                             &route,
                             &e.content,
                         )
                         .await;
                     }
-                } else if let Some(sid) = e.session_id.as_deref() {
-                    // Automatic reply: the session is the destination.
-                    let Some(route) = session_to_route(sid) else { return };
+                } else if let Some(cid) = e.conversation_id.as_deref() {
+                    // Automatic reply: the conversation is the destination.
+                    let Some(route) = conversation_to_route(cid) else { return };
                     if self.route_allowed(&route) {
                         if let Err(err) = self.send_route(action_tx, &route, &e.content) {
                             log::warn!("OneBot reply suppressed: {err:#}");
                         }
                     } else {
-                        self.request_outbound_approval(action_tx, Some(sid), &route, &e.content)
+                        self.request_outbound_approval(action_tx, Some(cid), &route, &e.content)
                             .await;
                     }
                 }
@@ -327,18 +330,18 @@ impl OneBotBridge {
     async fn request_outbound_approval(
         &self,
         action_tx: &UnboundedSender<ActionRequest>,
-        source_session: Option<&str>,
+        source_conversation: Option<&str>,
         route: &ReplyRoute,
         content: &str,
     ) {
-        let Some(source_route) = source_session.and_then(session_to_route) else {
-            log::warn!("outbound approval request dropped: source is not an OneBot session");
+        let Some(source_route) = source_conversation.and_then(conversation_to_route) else {
+            log::warn!("outbound approval request dropped: source is not an OneBot conversation");
             return;
         };
 
         let (permission_id, decision) = self.permissions.register().await;
-        let source_session = source_session.unwrap_or_default().to_string();
-        let seq = self.push_pending(&source_session, permission_id.clone());
+        let source_conversation = source_conversation.unwrap_or_default().to_string();
+        let seq = self.push_pending(&source_conversation, permission_id.clone());
         let notice = if seq == 1 {
             format!(
                 "persona 想向{}发送消息：{}\n回复「同意」批准，或「拒绝」拒绝\n（权限ID：{permission_id}）",
@@ -381,17 +384,17 @@ impl OneBotBridge {
     }
 
     /// Ask the user to approve a tool permission request routed to a OneBot
-    /// session (e.g. file access outside the workspace).
+    /// conversation (e.g. file access outside the workspace).
     async fn request_permission_approval(
         &self,
         action_tx: &UnboundedSender<ActionRequest>,
         p: &PermissionEvent,
     ) {
-        let Some(route) = session_to_route(&p.session_id) else {
-            log::warn!("permission request dropped: not an OneBot session");
+        let Some(route) = conversation_to_route(&p.conversation_id) else {
+            log::warn!("permission request dropped: not an OneBot conversation");
             return;
         };
-        let seq = self.push_pending(&p.session_id, p.permission_id.clone());
+        let seq = self.push_pending(&p.conversation_id, p.permission_id.clone());
         let notice = if seq == 1 {
             format!(
                 "需要你授权：{}\n回复「同意」批准，或「拒绝」拒绝\n（权限ID：{}）",
@@ -406,22 +409,22 @@ impl OneBotBridge {
         self.send_reply(action_tx, &route, &notice);
     }
 
-    fn push_pending(&self, session_id: &str, permission_id: String) -> usize {
+    fn push_pending(&self, conversation_id: &str, permission_id: String) -> usize {
         let mut queue = self.pending_approvals.lock().unwrap();
-        let list = queue.entry(session_id.to_string()).or_default();
+        let list = queue.entry(conversation_id.to_string()).or_default();
         list.push(permission_id);
         list.len()
     }
 
-    /// Take the next pending approval id for a source session. `seq` is the
+    /// Take the next pending approval id for a source conversation. `seq` is the
     /// 1-based position in the queue (`None` or `1` = the first/only one).
     fn take_pending_approval(
         &self,
-        session_id: &str,
+        conversation_id: &str,
         seq: Option<usize>,
     ) -> Option<String> {
         let mut queue = self.pending_approvals.lock().unwrap();
-        let list = queue.get_mut(session_id)?;
+        let list = queue.get_mut(conversation_id)?;
         let index = match seq {
             None | Some(1) if !list.is_empty() => 0,
             Some(n) if n >= 1 && n <= list.len() => n - 1,
@@ -429,7 +432,7 @@ impl OneBotBridge {
         };
         let id = list.remove(index);
         if list.is_empty() {
-            queue.remove(session_id);
+            queue.remove(conversation_id);
         }
         Some(id)
     }
@@ -460,9 +463,9 @@ impl OneBotBridge {
     }
 }
 
-/// Map a OneBot session id back to its reply route.
-fn session_to_route(session_id: &str) -> Option<ReplyRoute> {
-    let rest = session_id.strip_prefix("onebot_")?;
+/// Map a OneBot conversation id back to its reply route.
+fn conversation_to_route(conversation_id: &str) -> Option<ReplyRoute> {
+    let rest = conversation_id.strip_prefix("onebot_")?;
     let (kind, id) = rest.split_once('_')?;
     let id: i64 = id.parse().ok()?;
     match kind {
@@ -472,8 +475,8 @@ fn session_to_route(session_id: &str) -> Option<ReplyRoute> {
     }
 }
 
-/// The session id for an incoming OneBot message.
-fn session_id_for(msg: &MessageEvent) -> Option<String> {
+/// The conversation id for an incoming OneBot message.
+fn conversation_id_for(msg: &MessageEvent) -> Option<String> {
     match msg.message_type.as_str() {
         "private" => Some(format!("onebot_private_{}", msg.user_id)),
         "group" => msg.group_id.map(|g| format!("onebot_group_{g}")),
@@ -481,7 +484,7 @@ fn session_id_for(msg: &MessageEvent) -> Option<String> {
     }
 }
 
-/// Map an adapter-independent target (`private:<QQ>` / `group:<QQ>`) to a
+/// Map an adapter-independent target (`private:<id>` / `group:<id>`) to a
 /// OneBot reply route.
 fn target_to_route(target: &str) -> Option<ReplyRoute> {
     let (kind, id) = target.split_once(':')?;
@@ -537,60 +540,13 @@ fn send_via(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Result;
-    use async_trait::async_trait;
     use crate::types::{
         ActionParams, MessageContent, MessageEvent, MessageSegment, Sender,
     };
-    use nota_core::history::{HistoryEntry, HistoryStore};
-    use nota_core::permissions::PathPolicy;
-    use nota_core::session::OutboundEvent;
+    use nota_core::conversation::OutboundEvent;
 
-    /// In-memory history store for tests.
-    #[derive(Default)]
-    struct MemHistoryStore {
-        entries: Mutex<Vec<(i64, HistoryEntry)>>,
-    }
-
-    #[async_trait]
-    impl HistoryStore for MemHistoryStore {
-        async fn append(
-            &self,
-            _s: &Session,
-            entries: &[HistoryEntry],
-        ) -> Result<()> {
-            let mut all = self.entries.lock().unwrap();
-            for e in entries {
-                let next = all.len() as i64 + 1;
-                all.push((next, e.clone()));
-            }
-            Ok(())
-        }
-        async fn read_context(&self, _s: &Session) -> Result<Vec<HistoryEntry>> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(_, e)| e.clone())
-                .collect())
-        }
-        async fn read_raw(
-            &self,
-            _s: &Session,
-        ) -> Result<Vec<(i64, HistoryEntry)>> {
-            Ok(self.entries.lock().unwrap().clone())
-        }
-        async fn add_clear_boundary(&self, _s: &Session) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    fn test_bridge() -> (OneBotBridge, Arc<SessionManager>) {
-        let manager = Arc::new(SessionManager::new(
-            Arc::new(MemHistoryStore::default()),
-            Arc::new(PathPolicy::default()),
-        ));
+    fn test_bridge() -> (OneBotBridge, Arc<ConversationManager>) {
+        let manager = Arc::new(ConversationManager::new());
         let bridge = OneBotBridge::new(
             manager.clone(),
             Arc::new(PermissionRegistry::new()),
@@ -649,12 +605,12 @@ mod tests {
     }
 
     fn outbound(
-        session_id: Option<&str>,
+        conversation_id: Option<&str>,
         target: Option<&str>,
         content: &str,
     ) -> AdapterEvent {
         AdapterEvent::Outbound(OutboundEvent {
-            session_id: session_id.map(str::to_string),
+            conversation_id: conversation_id.map(str::to_string),
             target: target.map(str::to_string),
             content: content.to_string(),
             request_id: None,
@@ -673,8 +629,8 @@ mod tests {
         assert_eq!(msg.sender, "user");
         assert_eq!(msg.prefix, "[好友 Alice(42)] ");
         assert_eq!(msg.content, "hello");
-        assert_eq!(msg.session.persona, "bob");
-        assert_eq!(msg.session.session_id, "onebot_private_42");
+        assert_eq!(msg.conversation.persona, "bob");
+        assert_eq!(msg.conversation.conversation_id, "onebot_private_42");
     }
 
     #[tokio::test]
@@ -703,7 +659,7 @@ mod tests {
         let msg = inbox.recv().await.unwrap();
         assert_eq!(msg.prefix, "[群 30003 Alice(42)] ");
         assert_eq!(msg.content, "hi");
-        assert_eq!(msg.session.session_id, "onebot_group_30003");
+        assert_eq!(msg.conversation.conversation_id, "onebot_group_30003");
     }
 
     #[tokio::test]
@@ -716,7 +672,7 @@ mod tests {
 
         let msg = inbox.recv().await.unwrap();
         assert_eq!(msg.content, "[record msg id:99]");
-        assert_eq!(msg.session.session_id, "onebot_private_42");
+        assert_eq!(msg.conversation.conversation_id, "onebot_private_42");
     }
 
     #[tokio::test]
@@ -749,7 +705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_routes_persona_reply_by_session() {
+    async fn auto_routes_persona_reply_by_conversation() {
         let (mut bridge, _) = test_bridge();
         bridge.cfg.friend_ids = vec![42];
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
@@ -947,7 +903,7 @@ mod tests {
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
         let (permission_id, decision) = bridge.permissions.register().await;
         let event = AdapterEvent::Permission(PermissionEvent {
-            session_id: "onebot_private_42".to_string(),
+            conversation_id: "onebot_private_42".to_string(),
             permission_id: permission_id.clone(),
             prompt: "Allow file_read on /etc/passwd?".to_string(),
             parent_request_id: Some("p1".to_string()),

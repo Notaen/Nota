@@ -9,7 +9,7 @@ use axum::{
     routing::get,
 };
 use nota_core::permissions::PermissionRegistry;
-use nota_core::session::SessionManager;
+use nota_core::conversation::ConversationManager;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -41,7 +41,7 @@ async fn health() -> (StatusCode, Json<Health<'static>>) {
 }
 
 pub struct AppContext {
-    pub manager: Arc<SessionManager>,
+    pub manager: Arc<ConversationManager>,
     pub permissions: Arc<PermissionRegistry>,
     pub api_state: Arc<ApiState>,
 }

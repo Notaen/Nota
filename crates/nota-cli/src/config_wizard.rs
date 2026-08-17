@@ -123,7 +123,7 @@ pub fn run_wizard(existing: Option<&Config>) -> Result<Config> {
 fn prompt_onebot(existing: Option<&Config>) -> Result<Option<OnebotConfig>> {
     println!();
     let enable = Confirm::new()
-        .with_prompt("Enable OneBot 11 (QQ bot) support?")
+        .with_prompt("Enable OneBot 11 support?")
         .default(
             existing
                 .and_then(|c| c.onebot.as_ref())
@@ -163,7 +163,7 @@ fn prompt_onebot(existing: Option<&Config>) -> Result<Option<OnebotConfig>> {
         .map(|ob| ob.friend_ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
         .unwrap_or_default();
     let friends: String = Input::new()
-        .with_prompt("Allowed friend QQ ids, comma separated (empty = none)")
+        .with_prompt("Allowed friend ids, comma separated (empty = none)")
         .default(default_friends)
         .allow_empty(true)
         .interact_text()?;

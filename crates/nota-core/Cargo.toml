@@ -9,6 +9,5 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 log.workspace = true
-serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync"] }
 uuid = { workspace = true, features = ["v4"] }

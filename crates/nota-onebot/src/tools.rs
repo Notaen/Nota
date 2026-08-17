@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::TimeZone;
-use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams};
+use nota_llm::tool::{PropertyDef, Tool, ToolContext, ToolParams};
 
 use crate::api::OneBotApi;
 use crate::types::{
@@ -14,7 +14,7 @@ use crate::types::{
     format_history, identity,
 };
 
-/// Actively read recent messages of any QQ group via NapCat's
+/// Actively read recent messages of any group via NapCat's
 /// `get_group_msg_history` extended API. Not gated by the reply allowlist:
 /// the bot may read a group without ever responding in it.
 pub struct ReadGroupChatTool {
@@ -34,7 +34,7 @@ impl Tool for ReadGroupChatTool {
     }
 
     fn description(&self) -> &str {
-        "Read recent messages of a QQ group via the OneBot connection (NapCat get_group_msg_history). Returns the last N messages as text."
+        "Read recent messages of a group via the OneBot connection (NapCat get_group_msg_history). Returns the last N messages as text."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -43,7 +43,7 @@ impl Tool for ReadGroupChatTool {
             "group_id".to_string(),
             PropertyDef {
                 prop_type: "integer".to_string(),
-                description: "QQ group id to read".to_string(),
+                description: "group id to read".to_string(),
                 r#enum: vec![],
             },
         );
@@ -96,9 +96,9 @@ impl Tool for ReadGroupChatTool {
     }
 }
 
-/// Query the bot's own QQ account (QQ number + nickname) via the standard
+/// Query the bot's own account (user id + nickname) via the standard
 /// OneBot `get_login_info` API, so the persona can answer questions like
-/// "what is your QQ number?".
+/// "what is your user id?".
 pub struct GetLoginInfoTool {
     api: OneBotApi,
 }
@@ -116,7 +116,7 @@ impl Tool for GetLoginInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Get the bot's own QQ account info (QQ number and nickname) via the OneBot connection."
+        "Get the bot's own account info (user id and nickname) via the OneBot connection."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -137,7 +137,7 @@ impl Tool for GetLoginInfoTool {
             None => anyhow::bail!("get_login_info returned no data"),
         };
         Ok(format!(
-            "Bot login info: QQ {} ({})",
+            "Bot login info: user {} ({})",
             data.user_id, data.nickname
         ))
     }
@@ -163,7 +163,7 @@ impl Tool for GetMsgTool {
     }
 
     fn description(&self) -> &str {
-        "Get a specific QQ message by its message id (e.g. the id in a [reply msg id:...] segment) and return sender, time and full text."
+        "Get a specific message by its message id (e.g. the id in a [reply msg id:...] segment) and return sender, time and full text."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -222,7 +222,7 @@ impl Tool for GetMsgTool {
     }
 }
 
-/// Transcribe a QQ voice message (语音) into text via NapCat's
+/// Transcribe a voice message (语音) into text via NapCat's
 /// `fetch_ptt_text`, so the persona can read the content of a
 /// `[record msg id:…]` segment from an incoming or historical message.
 pub struct GetVoiceTextTool {
@@ -242,7 +242,7 @@ impl Tool for GetVoiceTextTool {
     }
 
     fn description(&self) -> &str {
-        "Transcribe a QQ voice message (语音) into text via the OneBot connection (NapCat fetch_ptt_text). Pass the message id from a [record msg id:...] segment."
+        "Transcribe a voice message (语音) into text via the OneBot connection (NapCat fetch_ptt_text). Pass the message id from a [record msg id:...] segment."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -326,65 +326,21 @@ mod tests {
     use crate::client::PendingResponses;
     use crate::config::OnebotConfig;
     use crate::types::{ActionParams, ActionResponse};
-    use nota_core::history::{HistoryEntry, HistoryStore};
-    use nota_core::permissions::{PathPolicy, PermissionRegistry};
-    use nota_core::session::{Session, SessionManager};
-    use nota_core::tool::ToolContext;
+    use nota_core::conversation::ConversationManager;
+    use nota_core::permissions::PermissionRegistry;
+    use nota_llm::tool::ToolContext;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    #[derive(Default)]
-    struct MemHistoryStore {
-        entries: std::sync::Mutex<Vec<HistoryEntry>>,
-    }
-
-    #[async_trait]
-    impl HistoryStore for MemHistoryStore {
-        async fn append(
-            &self,
-            _s: &Session,
-            entries: &[HistoryEntry],
-        ) -> Result<()> {
-            self.entries
-                .lock()
-                .unwrap()
-                .extend(entries.iter().cloned());
-            Ok(())
-        }
-        async fn read_context(&self, _s: &Session) -> Result<Vec<HistoryEntry>> {
-            Ok(self.entries.lock().unwrap().clone())
-        }
-        async fn read_raw(
-            &self,
-            _s: &Session,
-        ) -> Result<Vec<(i64, HistoryEntry)>> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(i, e)| (i as i64 + 1, e))
-                .collect())
-        }
-        async fn add_clear_boundary(&self, _s: &Session) -> Result<()> {
-            Ok(())
-        }
-    }
-
     fn tool_ctx() -> ToolContext {
-        let manager = Arc::new(SessionManager::new(
-            Arc::new(MemHistoryStore::default()),
-            Arc::new(PathPolicy::default()),
-        ));
+        let manager = Arc::new(ConversationManager::new());
         ToolContext {
             persona_name: "bob".to_string(),
             manager,
             request_id: None,
             permissions: Arc::new(PermissionRegistry::new()),
-            session_id: None,
+            conversation_id: None,
             suppress_reply: Arc::new(AtomicBool::new(false)),
         }
     }

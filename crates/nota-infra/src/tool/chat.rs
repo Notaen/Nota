@@ -1,6 +1,6 @@
 //! Channel-agnostic chat tools available to every persona.
 //!
-//! These tools speak only in session terms (target / suppress flag) and never
+//! These tools speak only in conversation terms (target / suppress flag) and never
 //! touch a concrete adapter; the bus carries the intent and the owning
 //! adapter bridge (e.g. OneBot) performs the actual delivery.
 
@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
+use nota_llm::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
 
-/// Send a message to any conversation session. The target is an
-/// adapter-independent reference (`private:<QQ>` / `group:<QQ>`); each
-/// adapter maps it to one of its own sessions and enforces its allowlist.
+/// Send a message to any conversation. The target is an
+/// adapter-independent reference (`private:<id>` / `group:<id>`); each
+/// adapter maps it to one of its own conversations and enforces its allowlist.
 #[derive(Default)]
 pub struct SendMessageTool;
 
@@ -24,7 +24,7 @@ impl Tool for SendMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a conversation session. target is private:<QQ> or group:<QQ>. The target must be allowlisted by its channel."
+        "Send a message to a conversation. target is private:<id> or group:<id>. The target must be allowlisted by its channel."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -33,7 +33,7 @@ impl Tool for SendMessageTool {
             "target".to_string(),
             PropertyDef {
                 prop_type: "string".to_string(),
-                description: "Target session, e.g. private:2961354039 or group:551947633".to_string(),
+                description: "Target conversation, e.g. private:2961354039 or group:551947633".to_string(),
                 r#enum: vec![],
             },
         );
@@ -54,7 +54,7 @@ impl Tool for SendMessageTool {
             .as_str()
             .filter(|t| is_valid_target(t))
             .ok_or_else(|| {
-                anyhow::anyhow!("missing or invalid 'target' (expected private:<QQ> or group:<QQ>)")
+                anyhow::anyhow!("missing or invalid 'target' (expected private:<id> or group:<id>)")
             })?
             .to_string();
         let content = args["content"]
@@ -64,7 +64,7 @@ impl Tool for SendMessageTool {
 
         ctx.manager
             .route_outbound(
-                ctx.session_id.as_deref(),
+                ctx.conversation_id.as_deref(),
                 Some(&target),
                 content,
                 ctx.request_id.clone(),
@@ -124,65 +124,18 @@ pub fn register_chat_tools(registry: &dyn ToolRegistry) {
 mod tests {
     use super::*;
     use nota_core::permissions::PermissionRegistry;
-    use nota_core::history::{HistoryEntry, HistoryStore};
-    use nota_core::permissions::PathPolicy;
-    use nota_core::session::{AdapterEvent, Session, SessionManager};
-    use anyhow::Result;
-    use async_trait::async_trait;
+    use nota_core::conversation::{AdapterEvent, ConversationManager};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
-    #[derive(Default)]
-    struct MemHistoryStore {
-        entries: std::sync::Mutex<Vec<HistoryEntry>>,
-    }
-
-    #[async_trait]
-    impl HistoryStore for MemHistoryStore {
-        async fn append(
-            &self,
-            _s: &Session,
-            entries: &[HistoryEntry],
-        ) -> Result<()> {
-            self.entries
-                .lock()
-                .unwrap()
-                .extend(entries.iter().cloned());
-            Ok(())
-        }
-        async fn read_context(&self, _s: &Session) -> Result<Vec<HistoryEntry>> {
-            Ok(self.entries.lock().unwrap().clone())
-        }
-        async fn read_raw(
-            &self,
-            _s: &Session,
-        ) -> Result<Vec<(i64, HistoryEntry)>> {
-            Ok(self
-                .entries
-                .lock()
-                .unwrap()
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(i, e)| (i as i64 + 1, e))
-                .collect())
-        }
-        async fn add_clear_boundary(&self, _s: &Session) -> Result<()> {
-            Ok(())
-        }
-    }
-
     fn tool_ctx() -> ToolContext {
-        let manager = Arc::new(SessionManager::new(
-            Arc::new(MemHistoryStore::default()),
-            Arc::new(PathPolicy::default()),
-        ));
+        let manager = Arc::new(ConversationManager::new());
         ToolContext {
             persona_name: "bob".to_string(),
             manager,
             request_id: None,
             permissions: Arc::new(PermissionRegistry::new()),
-            session_id: Some("onebot_private_42".to_string()),
+            conversation_id: Some("onebot_private_42".to_string()),
             suppress_reply: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -203,7 +156,7 @@ mod tests {
         let AdapterEvent::Outbound(e) = event else {
             panic!("expected outbound event");
         };
-        assert_eq!(e.session_id.as_deref(), Some("onebot_private_42"));
+        assert_eq!(e.conversation_id.as_deref(), Some("onebot_private_42"));
         assert_eq!(e.target.as_deref(), Some("group:30003"));
         assert_eq!(e.content, "yo");
     }

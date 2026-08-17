@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::llm::{LlmClient, LlmItem, MessageRole, ToolCall, ToolDef};
-use crate::tool::{ToolContext, ToolRegistry};
+use crate::tool::{Tool, ToolContext, ToolRegistry};
 
 const MAX_ITERATIONS: usize = 16;
 
@@ -17,21 +17,36 @@ impl AgentRunner {
         Self { llm, registry }
     }
 
+    /// Register a tool on this runner (delegates to the shared registry), so
+    /// its definition is automatically attached to every LLM request.
+    pub fn register_tool(&self, tool: Arc<dyn Tool>) {
+        self.registry.register(tool);
+    }
+
+    /// Remove a tool from this runner by name.
+    pub fn unregister_tool(&self, name: &str) {
+        self.registry.unregister(name);
+    }
+
     pub async fn run(
         &self,
         system: &str,
         items: &[LlmItem],
         tool_ctx: ToolContext,
-    ) -> Result<Vec<LlmItem>> {
+    ) -> Result<(Vec<LlmItem>, Option<String>)> {
         let mut conversation: Vec<LlmItem> = items.to_vec();
         let mut new_items: Vec<LlmItem> = Vec::new();
         let tool_defs = self.build_tool_defs();
+        let mut last_response_id = None;
 
         for _iteration in 0..MAX_ITERATIONS {
             let response = self
                 .llm
                 .chat(system, &conversation, &tool_defs)
                 .await?;
+            if let Some(id) = &response.id {
+                last_response_id = Some(id.clone());
+            }
 
             if !response.tool_calls.is_empty() {
                 for tc in &response.tool_calls {
@@ -70,10 +85,10 @@ impl AgentRunner {
                     content,
                 };
                 new_items.push(assistant_item);
-                return Ok(new_items);
+                return Ok((new_items, last_response_id));
             }
 
-            return Ok(new_items);
+            return Ok((new_items, last_response_id));
         }
 
         anyhow::bail!("agent loop exceeded max iterations ({MAX_ITERATIONS})");

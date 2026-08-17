@@ -20,15 +20,15 @@ use tracing_subscriber::{
     prelude::*,
 };
 
+use nota_core::conversation::ConversationManager;
 use nota_core::permissions::{PathPolicy, PermissionRegistry};
-use nota_core::persona::{Persona, PersonaRuntime, PersonaStore};
+use nota_core::persona::{Persona, PersonaStore};
 use nota_core::scheduler::Scheduler;
-use nota_core::session::SessionManager;
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
-    ApiState, AppContext, ConfigStore, FilePersonaStore, OpenAiLlm, ToolRegistryImpl,
-    SqliteHistoryStore, TokioScheduler, http_serve, register_builtin_tools,
-    register_chat_tools,
+    ApiState, AppContext, ConfigStore, FilePersonaStore, LlmClient,
+    OpenAiLlm, PersonaRuntime, ToolRegistryImpl, TokioScheduler, http_serve,
+    register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -103,6 +103,7 @@ fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
         .with_default(LevelFilter::INFO)
         .with_target("nota_core", LevelFilter::TRACE)
         .with_target("nota_infra", LevelFilter::TRACE)
+        .with_target("nota_llm", LevelFilter::TRACE)
         .with_target("nota_onebot", LevelFilter::TRACE)
         .with_target("nota_cli", LevelFilter::TRACE);
 
@@ -177,11 +178,10 @@ async fn run_server(
     let path_policy = Arc::new(PathPolicy::new());
 
     let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
-    let history: Arc<dyn nota_core::history::HistoryStore> =
-        Arc::new(SqliteHistoryStore::new(base)?);
-    let manager = Arc::new(SessionManager::new(history.clone(), path_policy.clone()));
+    let conversation_dir = base.join("conversation");
+    let manager = Arc::new(ConversationManager::new());
     let scheduler: Arc<dyn Scheduler> = Arc::new(TokioScheduler::new(manager.clone()));
-    let llm: Arc<dyn nota_core::llm::LlmClient> = Arc::new(OpenAiLlm::new(
+    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiLlm::new(
         &config.api_url,
         &config.api_key,
         &config.model,
@@ -193,7 +193,7 @@ async fn run_server(
         &tool_registry,
         base.join("personas"),
         scheduler.clone(),
-        path_policy,
+        path_policy.clone(),
     );
     register_chat_tools(tool_registry.as_ref());
 
@@ -209,10 +209,11 @@ async fn run_server(
         let runtime = Arc::new(PersonaRuntime::new(
             persona,
             persona_store.clone(),
-            history.clone(),
+            conversation_dir.clone(),
             llm.clone(),
             tool_registry.clone(),
             permissions.clone(),
+            path_policy.clone(),
         ));
 
         let persona_loop_runtime = runtime.clone();
@@ -241,7 +242,7 @@ async fn run_server(
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
         persona_store,
-        history,
+        conversation_dir,
         config: config_arc,
         config_path,
     });
@@ -264,7 +265,7 @@ async fn run_server(
 
 /// Wire the OneBot 11 adapter: resolve the target persona and start the bridge.
 async fn start_onebot(
-    manager: Arc<SessionManager>,
+    manager: Arc<ConversationManager>,
     permissions: Arc<PermissionRegistry>,
     persona_store: Arc<dyn PersonaStore>,
     tool_registry: Arc<ToolRegistryImpl>,
@@ -415,6 +416,7 @@ mod tests {
             .with_default(LevelFilter::INFO)
             .with_target("nota_core", LevelFilter::TRACE)
             .with_target("nota_infra", LevelFilter::TRACE)
+            .with_target("nota_llm", LevelFilter::TRACE)
             .with_target("nota_onebot", LevelFilter::TRACE)
             .with_target("nota_cli", LevelFilter::TRACE);
 
@@ -438,14 +440,14 @@ mod tests {
         let h2_noise = "received frame=Data { stream_id: StreamId(1) }";
         tracing::debug!(target: "h2::codec::framed_read", "{}", h2_noise);
         tracing::debug!(
-            target: "nota_core::session",
-            "[in] session 'onebot_private_1' -> persona 'alice' from 'u': hello"
+            target: "nota_core::conversation",
+            "[in] conversation 'onebot_private_1' -> persona 'alice' from 'u': hello"
         );
         tracing::info!(target: "h2", "connection established");
 
         let content = std::fs::read_to_string(&log_path).unwrap();
         assert!(
-            content.contains("nota_core::session"),
+            content.contains("nota_core::conversation"),
             "our DEBUG must be recorded, got:\n{content}"
         );
         assert!(

@@ -18,30 +18,45 @@ Use [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): 
 ## Architecture (Hexagonal / Ports & Adapters)
 
 One-way dependency flow: `nota-cli → nota-infra → nota-core`, plus
-`nota-onebot → nota-core` (core never sees axum/reqwest/tungstenite). See
-`AGENTS.md` for the crate table and `.agent/notes.md` for design decisions.
+`nota-cli → nota-onebot → nota-llm → nota-core` (onebot implements tools
+against `nota-llm`), and `nota-infra → nota-llm → nota-core`. Core never sees
+axum/reqwest/tungstenite/rusqlite and holds **no LLM content and no tools**.
+See `AGENTS.md` for the crate table and `.agent/notes.md` for design decisions.
+
+### Terminology
+
+- **session** = one LLM-level dialogue (OpenAI-style message items: messages
+  and tool calls/results), managed by `nota-llm`. Sessions are
+  conversation-agnostic: uuid v4 ids, one SQLite file per session, no default
+  store path — the caller points the manager at a directory and tracks the
+  current session id itself.
+- **conversation** = the user-visible chat (OneBot private/group, web) owned by an
+  adapter; `nota-core` routes by conversation. A conversation can rotate
+  through several sessions; old ones stay archived.
 
 ### Source Layout
 
 ```
 crates/nota-core/src/
-├── bus.rs                  # EventBus (mpsc broadcast) + BusEvent + EventKind
-├── permissions.rs          # PermissionRegistry (pending permission oneshots keyed by id)
-├── llm.rs                  # LlmClient trait + ToolDef/ToolCall/LlmResponse/LlmItem
-├── history.rs              # HistoryKind + HistoryEntry (session chat history)
-├── session.rs              # SessionManager + Session (deliver, slash commands)
+├── permissions.rs          # PermissionRegistry + PathPolicy
+├── conversation.rs         # Conversation + ConversationManager (deliver / route_outbound / send_permission)
 ├── scheduler.rs            # Scheduler port
-├── tool.rs                 # Tool / ToolRegistry traits + ToolContext (bus + permissions)
-├── agent/mod.rs            # AgentRunner: LLM ↔ tool loop, returns LlmItem list
-└── persona/mod.rs          # Persona + PersonaStore trait + PersonaRuntime (event loop)
+└── persona/mod.rs          # Persona + PersonaStore trait
+
+crates/nota-llm/src/
+├── llm.rs                  # LlmClient trait + ToolDef/ToolCall/LlmResponse/LlmItem (OpenAI message-item shape)
+├── tool.rs                 # Tool / ToolRegistry / ToolRegistryImpl + ToolContext + ToolParams/PropertyDef
+├── session.rs              # LlmSession + LlmSessionManager (create / session / latest / list)
+├── store.rs                # SqliteSessionStore (one <session_id>.db per session, caller-specified dir)
+├── agent.rs                # AgentRunner: LLM ↔ tool loop (register_tool), returns LlmItem list
+└── responses.rs            # OpenAiLlm (Responses API)
 
 crates/nota-infra/src/
 ├── persona_store/mod.rs    # FilePersonaStore (solo.md/memory.md, mtime cache)
-├── llm/mod.rs              # OpenAiLlm (Responses API)
-├── history.rs              # SqliteHistoryStore (per-session history.db)
+├── persona_runtime.rs      # PersonaRuntime: conversation → LLM session → reply loop + slash commands
 ├── config/mod.rs           # Config + ConfigStore
 ├── scheduler.rs            # TokioScheduler
-├── tool/{mod,builtin}.rs   # ToolRegistryImpl + file_read/file_write/schedule/status
+├── tool/{mod,builtin,chat}.rs  # ToolRegistryImpl + file_read/file_write/schedule/status/send_message/skip_reply
 └── http/{mod,ws,api,admin}.rs  # axum router: REST /api/*, WS /ws/chat, /admin/stop
 
 crates/nota-onebot/src/
@@ -49,95 +64,63 @@ crates/nota-onebot/src/
 ├── types.rs                # OneBot 11 events, segments, actions
 ├── client.rs               # forward-WS client (reconnect, echo correlation)
 ├── api.rs                  # OneBotApi::call (echo → oneshot, 15s timeout)
-├── bridge.rs               # bus bridge: allowlist filter, routing, permission auto-deny
-└── tools.rs                # send_message / read_group_chat / get_msg / get_login_info / get_voice_text
+├── bridge.rs               # allowlist filter, routing, approval round-trip
+└── tools.rs                # read_group_chat / get_msg / get_login_info / get_voice_text
 ```
 
 ### Runtime Layout
 
 ```
 ~/.nota/
-├── personas/<name>/          # persona workspace: solo.md, memory.md
-├── sessions/<id>/history.db  # per-session chat history (SQLite, kind column)
-├── .logs/                    # rotating logs (30-day)
-└── config.toml               # api_url, api_key, model, web_search, [onebot]
+├── personas/<name>/                  # persona workspace: solo.md, memory.md
+├── conversation/<conversation_id>/  # per-conversation dirs; inside: current.json + <session_id>.db files
+├── .logs/                            # rotating logs (30-day)
+└── config.toml                       # api_url, api_key, model, web_search, [onebot]
 ```
 
 `base_dir()` is resolved in `nota-cli` (`dirs::home_dir().join(".nota")`) and
 injected into adapters; the core never touches paths.
 
-## Tech Stack
+Full HTTP API, tech stack, and directory layout: see `CONTRIBUTING.md`.
 
-- Rust (edition 2024, rustc ≥ 1.85)
-- Axum 0.8 (with `ws` feature), Tokio, reqwest, rusqlite (bundled SQLite)
-- serde, serde_json, TOML
-- log (core/infra) / tracing (cli only, via `tracing-log::LogTracer`)
-- dialoguer + console (cli onboarding wizard)
+## Conversation Routing
 
-## Event Bus
+There is no global broadcast bus: `nota-core::conversation::ConversationManager`
+routes messages by conversation.
 
-`nota-core::bus::EventBus` is a multi-producer / multi-consumer FIFO. Every
-subscriber (`bus.subscribe()`) gets its own unbounded mpsc receiver; `bus.send(event)`
-clones the event to all of them.
+- **Inbound**: an adapter calls `manager.deliver(&Conversation, sender,
+  prefix, content, request_id)` → the message lands in the target persona's
+  inbox (`subscribe_persona`), consumed by `PersonaRuntime`.
+- **Outbound**: the persona calls `manager.route_outbound(conversation_id,
+  target, content, request_id)` → every adapter with that conversation's
+  prefix receives an `AdapterEvent::Outbound` (or all adapters when only a
+  channel-agnostic `target` is set).
+- **Permissions**: `manager.send_permission(...)` routes the request to the
+  conversation's adapter, which surfaces the prompt to the user.
 
-`BusEvent`:
-```rust
-pub struct BusEvent {
-    pub kind: EventKind,                  // Message | PermissionRequest
-    pub sender: String,
-    pub content: String,
-    pub timestamp: i64,
-    pub context: String,
-    pub request_id: Option<String>,
-    pub parent_request_id: Option<String>,
-    pub target: Option<String>,           // if Some, only the persona with this name processes it
-}
-```
-
-Persona loop filters by `target`:
-```rust
-if event.sender == name { continue; }
-if let Some(ref t) = event.target { if t != &name { continue; } }
-```
-
-The HTTP layer subscribes once, tracks `active_request_ids` per WS connection,
-and only forwards events whose `request_id` (or `parent_request_id` for permission
-requests) is in that set — so multiple WS clients coexist without leaking each
+The HTTP/WS layer only forwards events whose `conversation_id` matches its
+own web conversation, so multiple WS clients coexist without leaking each
 other's messages.
 
-## API Endpoints
+## LLM Sessions
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/health` | Health check |
-| GET | `/api/personas` | List personas |
-| POST | `/api/personas` | Create persona (`{"name": "..."}`) |
-| GET | `/api/personas/:name` | Persona info |
-| DELETE | `/api/personas/:name` | Delete persona |
-| GET | `/api/personas/:name/files/:filename` | Read persona file |
-| PUT | `/api/personas/:name/files/:filename` | Write persona file (`{"content": "..."}`) |
-| GET | `/api/personas/:name/chatlog/:session_id` | Read session history |
-| GET | `/api/settings` | Get config (api_url, api_key, model) |
-| PUT | `/api/settings` | Update config |
-| GET | `/ws/chat` | WebSocket: chat channel |
-| POST | `/admin/stop` | Graceful shutdown |
+`nota-llm` owns the dialogues: sessions are conversation-agnostic, each one an
+ordered list of OpenAI-style message items with a uuid v4 id and its own
+SQLite file. The llm crate has **no default store path** — `PersonaRuntime`
+gives each conversation its own directory (`~/.nota/conversation/<id>/`) and
+persists the current session id in `current.json` there; first contact reads
+that pointer (creating and persisting a fresh session when absent), and
+`//clear` calls `create()` and rewrites the pointer while the old session
+stays archived. Items are stored verbatim as JSON in `<session_id>.db`; the
+system prompt is **not** persisted — callers inject it per request. Each
+session stores the last Responses API `response_id` for future stateful
+continuations. DeepSeek is stateless: cost savings come from its automatic
+prefix cache, so keep request prefixes byte-identical (history in stored
+order, tools sorted by name).
 
-### WebSocket protocol (`/ws/chat`)
+HTTP endpoints and the `/ws/chat` protocol: see `CONTRIBUTING.md`.
 
-Client → Server:
-```json
-{ "type": "send", "persona": "alice", "content": "hello", "request_id": "<uuid>" }
-{ "type": "permission", "permission_id": "<uuid>", "approved": true }
-```
-
-Server → Client:
-```json
-{ "type": "message", "content": "hi", "request_id": "<uuid>" }
-{ "type": "permission_needed", "permission_id": "<uuid>", "prompt": "Allow file_read on /etc/passwd?", "request_id": "<uuid>" }
-{ "type": "error", "content": "..." }
-```
-
-## OneBot 11 (QQ bot)
+## OneBot 11
 
 Forward-WebSocket only (`mode = "ws"`). Config lives in `[onebot]` inside
 `config.toml`; `enabled = false` by default; empty `persona` = first persona
@@ -152,21 +135,22 @@ and permission details.
    decision in `.agent/notes.md`. Never delete a comment without understanding
    why it was there.
 2. **Keep core pure** — never add `axum`/`reqwest`/`serde_json`/`tracing`/
-   `dialoguer`/`dirs`/`walkdir`/`tokio-tungstenite` to `nota-core`. `tokio`
-   (sync only) and `serde` are fine.
+   `dialoguer`/`dirs`/`walkdir`/`tokio-tungstenite`/`rusqlite` to `nota-core`.
+   `tokio` (sync only) and `serde` are fine. LLM domain types and tool
+   abstractions live in `nota-llm`, never in core.
 3. **No global state** — `OnceLock<T>` / `RwLock<Option<T>>` are forbidden for
    manager singletons. `nota-cli` creates adapters and injects them via `Arc`.
 4. **Domain types over generics** — model the domain directly
-   (`ToolParams`/`PropertyDef` for JSON Schema, `LlmItem`/`HistoryKind` for
-   history). Serialization happens at the infra boundary, not in core.
-5. **Logging** — `nota-core`/`nota-infra` use the `log` facade; `nota-cli`
-   bridges it into `tracing` via `tracing_log::LogTracer`. Don't call
-   `tracing::*` from core/infra.
+   (`ToolParams`/`PropertyDef` for JSON Schema, `LlmItem` for dialogue
+   items). Serialization happens at the infra boundary, not in core.
+5. **Logging** — `nota-core`/`nota-llm`/`nota-infra` use the `log` facade;
+   `nota-cli` bridges it into `tracing` via `tracing_log::LogTracer`. Don't
+   call `tracing::*` from core/llm/infra.
 6. **Async blocking** — never call `blocking_*` on a tokio RwLock from inside
    an async context. Use `.write().await`. `blocking_*` panics the runtime.
-7. **WebSocket ↔ bus routing** — the WS handler filters events by `request_id`
-   in its `active_request_ids` set; events with mismatched ids are silently
-   dropped (don't echo other clients' messages).
+7. **WebSocket ↔ conversation routing** — the WS handler filters events by its
+   own `conversation_id`; events with mismatched ids are silently dropped
+   (don't echo other clients' messages).
 8. **No auto-created default persona** — personas are never silently created
    (no hardcoded default name). `nota` fails fast with guidance instead of
    auto-jumping: missing/corrupt `config.toml` → error "run `nota onboard`";

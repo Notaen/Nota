@@ -1,6 +1,12 @@
 [workspace]
 default-members=["crates/nota-cli"]
-members = ["crates/nota-core", "crates/nota-infra", "crates/nota-onebot", "crates/nota-cli"]
+members = [
+    "crates/nota-core",
+    "crates/nota-llm",
+    "crates/nota-infra",
+    "crates/nota-onebot",
+    "crates/nota-cli",
+]
 resolver = "3"
 
 [workspace.lints.clippy]

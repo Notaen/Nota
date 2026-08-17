@@ -6,7 +6,7 @@ use axum::{
     response::Response,
 };
 use nota_core::permissions::PermissionRegistry;
-use nota_core::session::{AdapterEvent, Session, SessionManager};
+use nota_core::conversation::{AdapterEvent, Conversation, ConversationManager};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -49,14 +49,14 @@ pub async fn ws_chat_handler(
 }
 
 pub struct WsState {
-    pub manager: Arc<SessionManager>,
+    pub manager: Arc<ConversationManager>,
     pub permissions: Arc<PermissionRegistry>,
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
-    // Each web connection is its own conversation session, so multiple
+    // Each web connection is its own conversation, so multiple
     // clients (or tabs) never see each other's messages or history.
-    let session_id = format!("web_{}", Uuid::new_v4());
+    let conversation_id = format!("web_{}", Uuid::new_v4());
     let mut rx = state.manager.subscribe_adapter("web");
 
     loop {
@@ -64,7 +64,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_command(&text, &state, &session_id).await {
+                        if let Err(e) = handle_command(&text, &state, &conversation_id).await {
                             let _ = socket.send(Message::Text(
                                 serde_json::to_string(&ServerEvent::Error {
                                     content: e.to_string(),
@@ -80,7 +80,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
             }
             event = rx.recv() => {
                 if let Some(event) = event {
-                    forward_event(event, &mut socket, &session_id).await;
+                    forward_event(event, &mut socket, &conversation_id).await;
                 }
             }
         }
@@ -90,7 +90,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<WsState>) {
 async fn handle_command(
     text: &str,
     state: &Arc<WsState>,
-    session_id: &str,
+    conversation_id: &str,
 ) -> anyhow::Result<()> {
     let cmd: ClientCommand = serde_json::from_str(text)?;
     match cmd {
@@ -98,7 +98,7 @@ async fn handle_command(
             state
                 .manager
                 .deliver(
-                    &Session::new(persona, session_id),
+                    &Conversation::new(persona, conversation_id),
                     "user",
                     "",
                     &content,
@@ -116,10 +116,10 @@ async fn handle_command(
 async fn forward_event(
     event: AdapterEvent,
     socket: &mut WebSocket,
-    session_id: &str,
+    conversation_id: &str,
 ) {
     match event {
-        AdapterEvent::Outbound(e) if e.session_id.as_deref() == Some(session_id) => {
+        AdapterEvent::Outbound(e) if e.conversation_id.as_deref() == Some(conversation_id) => {
             let payload = serde_json::to_string(&ServerEvent::Message {
                 content: e.content,
                 request_id: e.request_id.unwrap_or_default(),
@@ -127,7 +127,7 @@ async fn forward_event(
             .unwrap();
             let _ = socket.send(Message::Text(payload.into())).await;
         }
-        AdapterEvent::Permission(p) if p.session_id == session_id => {
+        AdapterEvent::Permission(p) if p.conversation_id == conversation_id => {
             let payload = serde_json::to_string(&ServerEvent::PermissionNeeded {
                 permission_id: p.permission_id,
                 prompt: p.prompt,

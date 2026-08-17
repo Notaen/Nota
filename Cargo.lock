@@ -1192,7 +1192,6 @@ dependencies = [
  "async-trait",
  "chrono",
  "log",
- "serde",
  "tokio",
  "uuid",
 ]
@@ -1207,14 +1206,30 @@ dependencies = [
  "chrono",
  "log",
  "nota-core",
+ "nota-llm",
  "nota-onebot",
- "reqwest",
- "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "toml",
+ "uuid",
+]
+
+[[package]]
+name = "nota-llm"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "log",
+ "nota-core",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -1229,6 +1244,7 @@ dependencies = [
  "http",
  "log",
  "nota-core",
+ "nota-llm",
  "serde",
  "serde_json",
  "tokio",

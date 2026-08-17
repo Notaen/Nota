@@ -1,21 +1,21 @@
 [package]
-name = "nota-onebot"
+name = "nota-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 nota-core = { path = "../nota-core" }
-nota-llm = { path = "../nota-llm" }
 
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
-futures-util.workspace = true
-http.workspace = true
 log.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+rusqlite = { workspace = true, features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "macros", "rt", "net"] }
-tokio-tungstenite = { workspace = true, features = ["connect", "handshake"] }
 uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

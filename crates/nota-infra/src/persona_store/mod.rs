@@ -48,8 +48,8 @@ async fn invalidate_cache(path: &Path) {
     }
 }
 
-/// Persona files (`solo.md`, `memory.md`). Conversation history lives in the
-/// SQLite `HistoryStore`, not here.
+/// Persona files (`solo.md`, `memory.md`). LLM session history lives in
+/// `nota-llm`'s SQLite store, not here.
 pub struct FilePersonaStore {
     personas_dir: PathBuf,
 }

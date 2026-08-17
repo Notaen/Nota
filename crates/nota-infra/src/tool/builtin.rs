@@ -5,12 +5,12 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::DateTime;
+use nota_core::conversation::Conversation;
 use nota_core::permissions::PathPolicy;
 use nota_core::scheduler::Scheduler;
-use nota_core::session::Session;
-use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
-
-use super::ToolRegistryImpl;
+use nota_llm::tool::{
+    PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry, ToolRegistryImpl,
+};
 
 pub struct FileReadTool {
     personas_dir: PathBuf,
@@ -206,7 +206,7 @@ impl Tool for ScheduleTool {
     }
 
     fn description(&self) -> &str {
-        "Schedule a reminder to be delivered in this session at a future time (ISO 8601 trigger_at)."
+        "Schedule a reminder to be delivered in this conversation at a future time (ISO 8601 trigger_at)."
     }
 
     fn parameters(&self) -> ToolParams {
@@ -245,13 +245,13 @@ impl Tool for ScheduleTool {
             .ok_or_else(|| anyhow::anyhow!("missing 'trigger_at'"))?;
         let parsed = DateTime::parse_from_rfc3339(trigger_at)
             .map_err(|e| anyhow::anyhow!("invalid trigger_at (expected ISO 8601): {e}"))?;
-        let session_id = ctx
-            .session_id
+        let conversation_id = ctx
+            .conversation_id
             .clone()
-            .ok_or_else(|| anyhow::anyhow!("no session available for scheduling"))?;
-        let session = Session::new(ctx.persona_name.clone(), session_id);
+            .ok_or_else(|| anyhow::anyhow!("no conversation available for scheduling"))?;
+        let conversation = Conversation::new(ctx.persona_name.clone(), conversation_id);
         self.scheduler
-            .schedule_reminder(parsed.timestamp(), session, message.to_string())
+            .schedule_reminder(parsed.timestamp(), conversation, message.to_string())
             .await?;
         Ok(format!("已安排于 {trigger_at} 提醒"))
     }
@@ -282,7 +282,7 @@ impl Tool for StatusTool {
     }
 
     fn description(&self) -> &str {
-        "Get detailed Nota runtime status: version, platform, process id, uptime, and the current persona/session"
+        "Get detailed Nota runtime status: version, platform, process id, uptime, and the current persona/conversation"
     }
 
     fn parameters(&self) -> ToolParams {
@@ -301,7 +301,7 @@ impl Tool for StatusTool {
             "pid": std::process::id(),
             "uptime_secs": self.started.elapsed().as_secs(),
             "persona": ctx.persona_name,
-            "session_id": ctx.session_id,
+            "conversation_id": ctx.conversation_id,
             "request_id": ctx.request_id,
         });
         Ok(serde_json::to_string_pretty(&status)?)

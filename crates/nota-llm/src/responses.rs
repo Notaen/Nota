@@ -1,7 +1,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use nota_core::llm::{LlmClient, LlmItem, LlmResponse, MessageRole, ToolCall, ToolDef};
 use serde::{Deserialize, Serialize};
+
+use crate::llm::{LlmClient, LlmItem, LlmResponse, MessageRole, ToolCall, ToolDef};
 
 // ── Responses API wire types ─────────────────────────────────────────
 
@@ -59,12 +60,26 @@ enum ResponsesTool {
 #[derive(Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     status: Option<String>,
     #[serde(default)]
     output: Vec<ResponsesOutputItem>,
     /// Provider convenience field: concatenated assistant text.
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
+}
+
+/// Provider usage counters; DeepSeek reports prefix-cache hit/miss tokens so
+/// callers can observe how much of the request was served from cache.
+#[derive(Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u64>,
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -196,7 +211,19 @@ impl OpenAiLlm {
             Some(content)
         };
 
-        Ok(LlmResponse { content, tool_calls })
+        if let Some(usage) = parsed.usage {
+            log::debug!(
+                "LLM cache: hit={} miss={}",
+                usage.prompt_cache_hit_tokens.unwrap_or(0),
+                usage.prompt_cache_miss_tokens.unwrap_or(0)
+            );
+        }
+
+        Ok(LlmResponse {
+            id: parsed.id,
+            content,
+            tool_calls,
+        })
     }
 }
 
@@ -212,7 +239,7 @@ impl LlmClient for OpenAiLlm {
     }
 }
 
-/// Map core `LlmItem`s one-to-one onto Responses API input items. The agent
+/// Map LLM `LlmItem`s one-to-one onto Responses API input items. The agent
 /// loop already emits each `function_call` immediately followed by its
 /// `function_call_output`, satisfying DeepSeek's strict adjacency rule.
 fn to_responses_input(items: &[LlmItem]) -> Vec<ResponsesInputItem> {
@@ -370,7 +397,7 @@ mod tests {
         let tools = vec![ToolDef {
             name: "get_weather".to_string(),
             description: "Get the weather".to_string(),
-            parameters: nota_core::tool::ToolParams::object(
+            parameters: crate::tool::ToolParams::object(
                 std::collections::HashMap::new(),
                 Vec::new(),
             ),

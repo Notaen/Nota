@@ -26,7 +26,7 @@ pub enum PostEvent {
 /// A private or group message event.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageEvent {
-    /// QQ number of the bot itself.
+    /// user id of the bot itself.
     pub self_id: i64,
     /// Event timestamp (Unix seconds).
     pub time: i64,
@@ -35,7 +35,7 @@ pub struct MessageEvent {
     pub message_type: String,
     #[serde(default)]
     pub sub_type: Option<String>,
-    /// Sender QQ number.
+    /// Sender user id.
     pub user_id: i64,
     /// Message body; implementations may send an array of segments or a string.
     #[serde(default)]
@@ -68,8 +68,8 @@ impl Sender {
     }
 }
 
-/// Render a chat participant as `nickname(QQ)` (card preferred over
-/// nickname), falling back to the bare QQ number when no name is known.
+/// Render a chat participant as `nickname(id)` (card preferred over
+/// nickname), falling back to the bare user id when no name is known.
 pub fn identity(sender: Option<&Sender>, user_id: i64) -> String {
     match sender.map(Sender::display_name).filter(|n| !n.is_empty()) {
         Some(name) => format!("{name}({user_id})"),
@@ -365,7 +365,7 @@ pub struct FetchPttTextData {
 }
 
 /// Render history messages as readable text for the LLM, one per line:
-/// `[HH:MM] nickname(QQ) 消息ID:{id}: text`.
+/// `[HH:MM] nickname(id) 消息ID:{id}: text`.
 pub fn format_history(messages: &[HistoryMessage]) -> String {
     let mut out = Vec::new();
     for msg in messages {
@@ -409,7 +409,7 @@ impl ReplyRoute {
 }
 
 /// Split text into chunks of at most `max_chars` characters, so long replies
-/// stay under the QQ message length limit.
+/// stay under the OneBot message length limit.
 pub fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
     if max_chars == 0 {
         return vec![text.to_string()];

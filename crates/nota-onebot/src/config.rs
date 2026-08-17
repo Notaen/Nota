@@ -26,7 +26,7 @@ pub struct OnebotConfig {
     /// and the prefix is stripped before handing the text to the persona.
     #[serde(default)]
     pub prefix: String,
-    /// Allowlisted friend QQ ids (private chats). The persona only responds
+    /// Allowlisted friend ids (private chats). The persona only responds
     /// to these friends; everyone else is ignored without calling the LLM.
     /// Empty list = no private chat is allowed.
     #[serde(default)]

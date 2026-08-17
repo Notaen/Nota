@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -6,9 +7,8 @@ use axum::{
     http::StatusCode,
     routing::{delete, get},
 };
-use nota_core::history::HistoryStore;
 use nota_core::persona::PersonaStore;
-use nota_core::session::Session;
+use nota_llm::{LlmItem, LlmSessionManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -16,7 +16,7 @@ use crate::config::{Config, ConfigStore};
 
 pub struct ApiState {
     pub persona_store: Arc<dyn PersonaStore>,
-    pub history: Arc<dyn HistoryStore>,
+    pub conversation_dir: PathBuf,
     pub config: Arc<RwLock<Config>>,
     pub config_path: std::path::PathBuf,
 }
@@ -40,6 +40,13 @@ struct FileWriteBody {
 #[derive(Serialize)]
 struct FileReadResponse {
     content: String,
+}
+
+#[derive(Serialize)]
+struct SessionLog {
+    session_id: String,
+    created_at: i64,
+    messages: Vec<(i64, LlmItem)>,
 }
 
 #[derive(Serialize)]
@@ -132,14 +139,27 @@ async fn write_file(
 
 async fn read_history(
     State(state): State<Arc<ApiState>>,
-    Path((name, session_id)): Path<(String, String)>,
-) -> Result<Json<Vec<(i64, nota_core::history::HistoryEntry)>>, (StatusCode, Json<ErrorBody>)> {
-    let entries = state
-        .history
-        .read_raw(&Session::new(name, session_id))
+    Path((_name, conversation_id)): Path<(String, String)>,
+) -> Result<Json<Vec<SessionLog>>, (StatusCode, Json<ErrorBody>)> {
+    let session_manager = LlmSessionManager::new(&state.conversation_dir.join(&conversation_id))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let sessions = session_manager
+        .list()
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(entries))
+    let mut logs = Vec::new();
+    for (session_id, _seq, created_at) in sessions {
+        let messages = session_manager
+            .raw_history(&session_id)
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        logs.push(SessionLog {
+            session_id,
+            created_at,
+            messages,
+        });
+    }
+    Ok(Json(logs))
 }
 
 async fn get_settings(State(state): State<Arc<ApiState>>) -> Json<Config> {
@@ -172,7 +192,7 @@ pub fn router() -> Router<Arc<ApiState>> {
         .route("/personas/{name}", delete(delete_persona).get(get_persona_info))
         .route("/personas/{name}/files/{filename}", get(read_file).put(write_file))
         .route(
-            "/personas/{name}/chatlog/{session_id}",
+            "/personas/{name}/chatlog/{conversation_id}",
             get(read_history),
         )
         .route("/settings", get(get_settings).put(put_settings))
