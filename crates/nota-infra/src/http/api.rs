@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -8,7 +8,7 @@ use axum::{
     routing::{delete, get},
 };
 use nota_core::persona::PersonaStore;
-use nota_llm::{LlmItem, LlmSessionManager};
+use nota_core::session::{SessionItem, SessionManager};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -16,7 +16,8 @@ use crate::config::{Config, ConfigStore};
 
 pub struct ApiState {
     pub persona_store: Arc<dyn PersonaStore>,
-    pub conversation_dir: PathBuf,
+    /// Per-persona session managers, assembled by the composition root.
+    pub session_managers: HashMap<String, Arc<dyn SessionManager>>,
     pub config: Arc<RwLock<Config>>,
     pub config_path: std::path::PathBuf,
 }
@@ -46,7 +47,7 @@ struct FileReadResponse {
 struct SessionLog {
     session_id: String,
     created_at: i64,
-    messages: Vec<(i64, LlmItem)>,
+    messages: Vec<(i64, SessionItem)>,
 }
 
 #[derive(Serialize)]
@@ -139,22 +140,28 @@ async fn write_file(
 
 async fn read_history(
     State(state): State<Arc<ApiState>>,
-    Path((_name, conversation_id)): Path<(String, String)>,
+    Path((name, conversation_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<SessionLog>>, (StatusCode, Json<ErrorBody>)> {
-    let session_manager = LlmSessionManager::new(&state.conversation_dir.join(&conversation_id))
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let session_manager = state
+        .session_managers
+        .get(&name)
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("persona not found: {name}")))?;
     let sessions = session_manager
-        .list()
+        .list(&conversation_id)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut logs = Vec::new();
-    for (session_id, _seq, created_at) in sessions {
-        let messages = session_manager
-            .raw_history(&session_id)
+    for session in sessions {
+        let messages = session
+            .raw_history()
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let created_at = session
+            .created_at()
             .await
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         logs.push(SessionLog {
-            session_id,
+            session_id: session.id().to_string(),
             created_at,
             messages,
         });

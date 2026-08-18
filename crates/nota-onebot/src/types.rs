@@ -108,9 +108,9 @@ impl MessageContent {
 
     /// Flatten to plain text for the LLM. Text segments keep their content;
     /// every other segment is rendered uniformly as
-    /// `[{segment_type} msg id:<id>]` so the persona knows what kind of
-    /// media arrived and can fetch its content with a tool (`get_msg`,
-    /// `get_voice_text`, …).
+    /// `[{segment_type} msg id:<id> k=v …]` (all `data` fields included) so
+    /// the persona knows what kind of media arrived and can fetch its
+    /// content with a tool (`onebot_get_content`, `onebot_voice_text`, …).
     pub fn to_text_with_id(&self, message_id: &str) -> String {
         match self {
             MessageContent::Text(s) => s.clone(),
@@ -123,30 +123,37 @@ impl MessageContent {
     }
 }
 
-fn segment_to_text(seg: &MessageSegment) -> String {
-    let data = &seg.data;
-    match seg.segment_type.as_str() {
-        "text" => data
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        other => format!("[{other}]"),
-    }
-}
-
 fn json_value_to_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
         _ => String::new(),
     }
 }
 
+/// Render a segment's `data` map as ` k=v` pairs in sorted key order. Sorted
+/// on purpose: inbound text is part of the persisted LLM session prefix, and
+/// DeepSeek's prefix cache requires byte-identical history across turns —
+/// HashMap iteration order is random and would silently break the cache.
+fn render_segment_data(data: &HashMap<String, serde_json::Value>) -> String {
+    let mut keys: Vec<&String> = data.keys().collect();
+    keys.sort();
+    let mut out = String::new();
+    for key in keys {
+        let value = json_value_to_string(&data[key]);
+        if !value.is_empty() {
+            out.push_str(&format!(" {key}={value}"));
+        }
+    }
+    out
+}
+
 /// Render a segment for [`MessageContent::to_text_with_id`]: text segments
 /// keep their content, every other segment becomes
-/// `[{segment_type} msg id:{message_id}]` so the persona can fetch the real
-/// content (image OCR, voice transcription, …) with a tool.
+/// `[{segment_type} msg id:{message_id} k=v …]` (all `data` fields included)
+/// so the persona can fetch the real content (image OCR, voice
+/// transcription, …) with a tool.
 fn segment_to_text_with_id(seg: &MessageSegment, message_id: &str) -> String {
     let data = &seg.data;
     match seg.segment_type.as_str() {
@@ -155,7 +162,22 @@ fn segment_to_text_with_id(seg: &MessageSegment, message_id: &str) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        other => format!("[{other} msg id:{message_id}]"),
+        other => format!(
+            "[{other} msg id:{message_id}{}]",
+            render_segment_data(data)
+        ),
+    }
+}
+
+fn segment_to_text(seg: &MessageSegment) -> String {
+    let data = &seg.data;
+    match seg.segment_type.as_str() {
+        "text" => data
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        other => format!("[{other}{}]", render_segment_data(data)),
     }
 }
 
@@ -191,6 +213,11 @@ pub enum ActionParams {
     },
     GroupHistory {
         group_id: i64,
+        message_seq: i64,
+        count: i64,
+    },
+    FriendHistory {
+        user_id: i64,
         message_seq: i64,
         count: i64,
     },
@@ -253,6 +280,19 @@ impl ActionRequest {
         }
     }
 
+    /// NapCat / go-cqhttp extended API: fetch recent messages of a friend.
+    pub fn get_friend_msg_history(user_id: i64, count: i64) -> Self {
+        Self {
+            action: "get_friend_msg_history".to_string(),
+            params: ActionParams::FriendHistory {
+                user_id,
+                message_seq: 0,
+                count,
+            },
+            echo: Uuid::new_v4().to_string(),
+        }
+    }
+
     /// Standard OneBot API: query the bot's own account info.
     pub fn get_login_info() -> Self {
         Self {
@@ -307,9 +347,9 @@ pub struct ActionResponse {
     pub data: Option<serde_json::Value>,
 }
 
-/// `data` payload of `get_group_msg_history`.
+/// `data` payload of `get_group_msg_history` / `get_friend_msg_history`.
 #[derive(Debug, Clone, Deserialize)]
-pub struct GroupMsgHistoryData {
+pub struct MsgHistoryData {
     #[serde(default)]
     pub messages: Vec<HistoryMessage>,
 }
@@ -458,7 +498,7 @@ mod tests {
         };
         assert_eq!(msg.message_type, "private");
         assert_eq!(msg.user_id, 10001);
-        assert_eq!(msg.message.unwrap().to_text(), "hello [face] world");
+        assert_eq!(msg.message.unwrap().to_text(), "hello [face id=1] world");
     }
 
     #[test]
@@ -517,6 +557,16 @@ mod tests {
     }
 
     #[test]
+    fn serializes_friend_history_action() {
+        let action = ActionRequest::get_friend_msg_history(10001, 20);
+        let value = serde_json::to_value(&action).unwrap();
+        assert_eq!(value["action"], "get_friend_msg_history");
+        assert_eq!(value["params"]["user_id"], 10001);
+        assert_eq!(value["params"]["count"], 20);
+        assert_eq!(value["params"]["message_seq"], 0);
+    }
+
+    #[test]
     fn parses_history_response_and_formats() {
         let json = r#"{
             "status": "ok",
@@ -541,7 +591,7 @@ mod tests {
             }
         }"#;
         let resp: ActionResponse = serde_json::from_str(json).unwrap();
-        let data: GroupMsgHistoryData =
+        let data: MsgHistoryData =
             serde_json::from_value(resp.data.unwrap()).unwrap();
         let text = format_history(&data.messages);
         assert!(text.contains("Alice(10001) 消息ID:1: hello"));
@@ -561,7 +611,7 @@ mod tests {
                 data: HashMap::from([("text".to_string(), serde_json::json!(" 收到"))]),
             },
         ]);
-        assert_eq!(content.to_text(), "[reply] 收到");
+        assert_eq!(content.to_text(), "[reply id=1234567890] 收到");
     }
 
     #[test]
@@ -570,7 +620,7 @@ mod tests {
             segment_type: "reply".to_string(),
             data: HashMap::from([("id".to_string(), serde_json::json!(42))]),
         }]);
-        assert_eq!(content.to_text(), "[reply]");
+        assert_eq!(content.to_text(), "[reply id=42]");
     }
 
     #[test]
@@ -579,8 +629,11 @@ mod tests {
             segment_type: "record".to_string(),
             data: HashMap::from([("file".to_string(), serde_json::json!("voice.amr"))]),
         }]);
-        assert_eq!(voice.to_text(), "[record]");
-        assert_eq!(voice.to_text_with_id("99"), "[record msg id:99]");
+        assert_eq!(voice.to_text(), "[record file=voice.amr]");
+        assert_eq!(
+            voice.to_text_with_id("99"),
+            "[record msg id:99 file=voice.amr]"
+        );
 
         let mixed = MessageContent::Segments(vec![
             MessageSegment {
@@ -625,11 +678,11 @@ mod tests {
         ]);
         assert_eq!(
             content.to_text_with_id("77"),
-            "[image msg id:77][face msg id:77][video msg id:77][at msg id:77][forward msg id:77][some_future_type msg id:77]"
+            "[image msg id:77][face msg id:77 id=1][video msg id:77][at msg id:77 qq=10001][forward msg id:77][some_future_type msg id:77]"
         );
         assert_eq!(
             content.to_text(),
-            "[image][face][video][at][forward][some_future_type]"
+            "[image][face id=1][video][at qq=10001][forward][some_future_type]"
         );
     }
 

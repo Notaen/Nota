@@ -2,8 +2,8 @@
 //! layer.
 //!
 //! Terminology: **conversation** is the user-visible chat (OneBot private/group,
-//! web) that adapters own; **session** is the LLM-level context managed by
-//! `nota-llm`.
+//! web) that adapters own; **session** is the LLM-level context abstracted
+//! here (`session.rs`) and implemented by `nota-llm`.
 //!
 //! There is no global broadcast bus: every message is routed by conversation.
 //! - **Inbound**: an adapter delivers a chat message to the *target
@@ -189,7 +189,7 @@ impl ConversationManager {
             content: content.to_string(),
             request_id,
         });
-        // DEBUG：记录 persona 发出的消息内容（回复 / send_message / 命令回执）
+        // DEBUG：记录 persona 发出的消息内容（reply / onebot_send_msg / 命令回执）
         log::debug!(
             "[out] conversation '{}' target '{}': {}",
             conversation_id.unwrap_or("-"),

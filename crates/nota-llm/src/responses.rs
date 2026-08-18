@@ -1,8 +1,44 @@
+//! Responses API client (internal to the llm crate — there is no public
+//! LLM client abstraction; the session manager owns the only client).
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::llm::{LlmClient, LlmItem, LlmResponse, MessageRole, ToolCall, ToolDef};
+use nota_core::session::{MessageRole, SessionItem, ToolCall};
+use nota_core::tool::ToolParams;
+
+// ── LLM-facing wire shapes (internal) ────────────────────────────────
+
+/// One tool attached to an LLM request, built from a core `Tool`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub parameters: ToolParams,
+}
+
+/// The model's answer to one chat call.
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmResponse {
+    /// The Responses API id of this response, if the provider returns one.
+    /// Saved per session for future stateful continuations.
+    pub id: Option<String>,
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// Test seam inside the crate: the concrete session manager talks to the
+/// model through this internal trait, so tests can substitute a mock.
+#[async_trait]
+pub(crate) trait ChatLlm: Send + Sync {
+    async fn chat(
+        &self,
+        system: &str,
+        items: &[SessionItem],
+        tools: &[ToolDef],
+    ) -> Result<LlmResponse>;
+}
 
 // ── Responses API wire types ─────────────────────────────────────────
 
@@ -133,10 +169,10 @@ impl OpenAiLlm {
     async fn chat_responses(
         &self,
         system: &str,
-        items: &[LlmItem],
+        items: &[SessionItem],
         tools: &[ToolDef],
     ) -> Result<LlmResponse> {
-        let instructions = (!system.is_empty()).then(|| system.to_string());
+        let instructions = build_instructions(system);
         let input = to_responses_input(items);
 
         let api_tools = build_responses_tools(tools, self.web_search);
@@ -228,48 +264,68 @@ impl OpenAiLlm {
 }
 
 #[async_trait]
-impl LlmClient for OpenAiLlm {
+impl ChatLlm for OpenAiLlm {
     async fn chat(
         &self,
         system: &str,
-        items: &[LlmItem],
+        items: &[SessionItem],
         tools: &[ToolDef],
     ) -> Result<LlmResponse> {
         self.chat_responses(system, items, tools).await
     }
 }
 
-/// Map LLM `LlmItem`s one-to-one onto Responses API input items. The agent
+/// The system slot sent to the API: exactly the system prompt passed at
+/// `SessionManager` construction. Stored session items never contribute —
+/// the system prompt is not a stored role.
+fn build_instructions(system: &str) -> Option<String> {
+    (!system.trim().is_empty()).then(|| system.to_string())
+}
+
+/// The provider string role for a stored message item. `Context` items
+/// (persona content injected at session creation) are emitted as `system`
+/// input messages.
+fn wire_role(role: MessageRole) -> Option<&'static str> {
+    match role {
+        MessageRole::User => Some("user"),
+        MessageRole::Assistant => Some("assistant"),
+        MessageRole::Context => Some("system"),
+    }
+}
+
+/// Map session items one-to-one onto Responses API input items. The turn
 /// loop already emits each `function_call` immediately followed by its
 /// `function_call_output`, satisfying DeepSeek's strict adjacency rule.
-fn to_responses_input(items: &[LlmItem]) -> Vec<ResponsesInputItem> {
+fn to_responses_input(items: &[SessionItem]) -> Vec<ResponsesInputItem> {
     items
         .iter()
-        .map(|item| match item {
-            LlmItem::Message { role, content } => {
+        .filter_map(|item| match item {
+            SessionItem::Message { role, content } => {
+                let role = wire_role(*role)?;
                 let part = match role {
-                    MessageRole::User => ResponsesContentPart::InputText {
+                    "user" | "system" => ResponsesContentPart::InputText {
                         text: content.clone(),
                     },
-                    MessageRole::Assistant => ResponsesContentPart::OutputText {
+                    "assistant" => ResponsesContentPart::OutputText {
                         text: content.clone(),
                     },
+                    _ => unreachable!("wire_role only returns user/assistant/system"),
                 };
-                ResponsesInputItem::Message {
-                    role: role.as_str().to_string(),
+                Some(ResponsesInputItem::Message {
+                    role: role.to_string(),
                     content: vec![part],
-                }
+                })
             }
-            LlmItem::FunctionCall(call) => ResponsesInputItem::FunctionCall {
+            SessionItem::FunctionCall(call) => Some(ResponsesInputItem::FunctionCall {
                 call_id: call.id.clone(),
                 name: call.name.clone(),
                 arguments: call.arguments.clone(),
-            },
-            LlmItem::FunctionCallOutput { call_id, output } => {
-                ResponsesInputItem::FunctionCallOutput {
+            }),
+            SessionItem::FunctionCallOutput { call_id, output } => {
+                Some(ResponsesInputItem::FunctionCallOutput {
                     call_id: call_id.clone(),
                     output: output.clone(),
-                }
+                })
             }
         })
         .collect()
@@ -294,8 +350,8 @@ fn build_responses_tools(tools: &[ToolDef], web_search: bool) -> Vec<ResponsesTo
 mod tests {
     use super::*;
 
-    fn msg(role: MessageRole, content: &str) -> LlmItem {
-        LlmItem::Message {
+    fn msg(role: MessageRole, content: &str) -> SessionItem {
+        SessionItem::Message {
             role,
             content: content.to_string(),
         }
@@ -303,25 +359,25 @@ mod tests {
 
     #[test]
     fn responses_input_keeps_call_and_output_pairing() {
-        // This is exactly the order the agent loop emits: each function_call
+        // This is exactly the order the turn loop emits: each function_call
         // is immediately followed by its function_call_output.
         let items = vec![
             msg(MessageRole::User, "hi"),
-            LlmItem::FunctionCall(ToolCall {
+            SessionItem::FunctionCall(ToolCall {
                 id: "call_A".to_string(),
                 name: "foo".to_string(),
                 arguments: "{}".to_string(),
             }),
-            LlmItem::FunctionCallOutput {
+            SessionItem::FunctionCallOutput {
                 call_id: "call_A".to_string(),
                 output: "result A".to_string(),
             },
-            LlmItem::FunctionCall(ToolCall {
+            SessionItem::FunctionCall(ToolCall {
                 id: "call_B".to_string(),
                 name: "bar".to_string(),
                 arguments: "{}".to_string(),
             }),
-            LlmItem::FunctionCallOutput {
+            SessionItem::FunctionCallOutput {
                 call_id: "call_B".to_string(),
                 output: "result B".to_string(),
             },
@@ -397,7 +453,7 @@ mod tests {
         let tools = vec![ToolDef {
             name: "get_weather".to_string(),
             description: "Get the weather".to_string(),
-            parameters: crate::tool::ToolParams::object(
+            parameters: ToolParams::object(
                 std::collections::HashMap::new(),
                 Vec::new(),
             ),
@@ -422,6 +478,68 @@ mod tests {
     fn responses_tools_omit_web_search_when_disabled() {
         let value = serde_json::to_value(build_responses_tools(&[], false)).unwrap();
         assert_eq!(value, serde_json::json!([]));
+    }
+
+    #[test]
+    fn input_emits_context_as_system_message() {
+        let items = vec![
+            msg(MessageRole::Context, "# solo.md\npersona"),
+            msg(MessageRole::User, "hi"),
+        ];
+        let wire = to_responses_input(&items);
+        assert_eq!(wire.len(), 2);
+        assert!(matches!(
+            &wire[0],
+            ResponsesInputItem::Message { role, .. } if role == "system"
+        ));
+        assert!(matches!(
+            &wire[1],
+            ResponsesInputItem::Message { role, .. } if role == "user"
+        ));
+    }
+
+    #[test]
+    fn context_serializes_as_system_input_message() {
+        let wire = to_responses_input(&[msg(MessageRole::Context, "# solo.md\npersona")]);
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{ "type": "input_text", "text": "# solo.md\npersona" }],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn instructions_come_from_system_param_only() {
+        // The system prompt is a `SessionManager` constructor argument, never
+        // a stored session role, so stored items cannot influence it.
+        assert_eq!(
+            build_instructions("You are Nota.").as_deref(),
+            Some("You are Nota.")
+        );
+        assert_eq!(build_instructions("   "), None);
+    }
+
+    #[test]
+    fn roles_serialize_as_numbers_with_zero_reserved() {
+        assert_eq!(serde_json::to_value(MessageRole::User).unwrap(), 1);
+        assert_eq!(serde_json::to_value(MessageRole::Assistant).unwrap(), 2);
+        assert_eq!(serde_json::to_value(MessageRole::Context).unwrap(), 3);
+
+        assert_eq!(
+            serde_json::from_value::<MessageRole>(serde_json::json!(2)).unwrap(),
+            MessageRole::Assistant
+        );
+        // 0 is reserved: unknown numbers are rejected, ready for future roles.
+        assert!(serde_json::from_value::<MessageRole>(serde_json::json!(0)).is_err());
+        // 4 was the old Context numbering before the System role was removed.
+        assert!(serde_json::from_value::<MessageRole>(serde_json::json!(4)).is_err());
+        assert!(serde_json::from_value::<MessageRole>(serde_json::json!(9)).is_err());
     }
 
     #[test]

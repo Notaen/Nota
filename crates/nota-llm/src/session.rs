@@ -1,224 +1,682 @@
-//! LLM-level sessions: one self-contained dialogue, conversation-agnostic.
+//! Concrete session manager — the only public surface of the llm crate.
 //!
-//! A **session** is a single LLM dialogue: an ordered list of OpenAI-style
-//! message items (user/assistant messages plus tool calls and results), with
-//! a uuid v4 id and its own SQLite file. The llm crate knows nothing about
-//! conversations or personas and has no default store path: the caller
-//! supplies a directory, and typically gives each conversation its own
-//! directory (so clearing a conversation means removing that directory).
-//! Creation and retrieval are explicit — there is no implicit get-or-create
-//! and no "current session" concept here: the caller decides which session id
-//! is current (e.g. a pointer file in its conversation directory) and simply
-//! reads it.
+//! Other modules never see the LLM client or the turn loop; they hold the
+//! core [`SessionManager`] / [`Session`] abstractions and simply feed
+//! content into a session. This crate supplies the SQLite-backed
+//! implementation:
+//!
+//! - one manager per persona, created with a storage root, the system
+//!   prompt, the shared [`ToolRegistry`], and the routing/approval ports;
+//! - sessions are conversation-namespaced (`<conversation_id>/<uuid>`) and
+//!   stored as `<uuid>.db` under `<root>/<conversation_id>/`, so a whole
+//!   conversation can be wiped by removing its directory;
+//! - each session runs the whole turn internally: append the user message →
+//!   LLM call (tools resolved live from the registry, sorted by name for
+//!   prefix-cache stability) → execute tool calls with a per-session
+//!   `ToolContext` → persist items and the response id.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use async_trait::async_trait;
+use nota_core::conversation::ConversationManager;
+use nota_core::permissions::PermissionRegistry;
+use nota_core::session::{MessageRole, Session, SessionItem, SessionManager};
+use nota_core::tool::{ToolContext, ToolRegistry};
+use serde::{Deserialize, Serialize};
 
-use crate::llm::LlmItem;
+use crate::responses::{ChatLlm, LlmResponse, OpenAiLlm, ToolDef};
 use crate::store::SqliteSessionStore;
 
-/// One LLM-level session: an ordered dialogue of message items, backed by
-/// its own `<session_id>.db` file.
-pub struct LlmSession {
-    /// uuid v4 session id; the caller never needs to parse it.
-    pub id: String,
+const MAX_ITERATIONS: usize = 16;
+
+/// LLM provider configuration, passed by the composition root.
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    pub api_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub web_search: bool,
+}
+
+/// One session of one conversation, backed by its own `<uuid>.db` file under
+/// `<root>/<conversation_id>/`.
+struct SqliteSession {
+    id: String,
+    conversation_id: String,
+    persona_name: String,
+    system: String,
+    tools: Arc<ToolRegistry>,
+    manager: Arc<ConversationManager>,
+    permissions: Arc<PermissionRegistry>,
+    llm: Arc<dyn ChatLlm>,
     store: Arc<SqliteSessionStore>,
+    session_uuid: String,
+    created_at: i64,
 }
 
-impl LlmSession {
-    pub(crate) fn new(id: String, store: Arc<SqliteSessionStore>) -> Self {
-        Self { id, store }
-    }
-
-    /// Append dialogue items (messages and tool calls/results) to this
-    /// session's raw history.
-    pub async fn append(&self, items: &[LlmItem]) -> Result<()> {
-        self.store.append(&self.id, items).await
-    }
-
-    /// The full dialogue of this session, oldest first.
-    pub async fn context(&self) -> Result<Vec<LlmItem>> {
-        self.store.read_items(&self.id).await
-    }
-
-    /// All items with their storage row ids, oldest first.
-    pub async fn raw_history(&self) -> Result<Vec<(i64, LlmItem)>> {
-        self.store.read_raw(&self.id).await
-    }
-
-    /// The last Responses API id of this session, if any (saved for future
-    /// stateful continuations; DeepSeek's Responses endpoint is stateless).
-    pub async fn response_id(&self) -> Result<Option<String>> {
-        self.store.response_id(&self.id).await
-    }
-
-    /// Save the last Responses API id of this session.
-    pub async fn set_response_id(&self, id: &str) -> Result<()> {
-        self.store.set_response_id(&self.id, id).await
-    }
-}
-
-/// Owns the sessions in one caller-specified directory (typically one
-/// conversation's sessions). Creation and retrieval are explicit.
-pub struct LlmSessionManager {
-    store: Arc<SqliteSessionStore>,
-    current: Mutex<HashMap<String, Arc<LlmSession>>>,
-}
-
-impl LlmSessionManager {
-    /// Open the session store rooted at `dir` (caller-specified; the llm
-    /// crate has no default store path). Sessions live flat inside as
-    /// `<session_id>.db`.
-    pub fn new(dir: &Path) -> Result<Self> {
+impl SqliteSession {
+    #[allow(clippy::too_many_arguments)]
+    async fn new(
+        conversation_id: &str,
+        session_uuid: String,
+        persona_name: String,
+        system: String,
+        tools: Arc<ToolRegistry>,
+        manager: Arc<ConversationManager>,
+        permissions: Arc<PermissionRegistry>,
+        llm: Arc<dyn ChatLlm>,
+        store: Arc<SqliteSessionStore>,
+    ) -> Result<Self> {
+        let created_at = store.created_at(&session_uuid).await?;
         Ok(Self {
-            store: Arc::new(SqliteSessionStore::new(dir)?),
-            current: Mutex::new(HashMap::new()),
+            id: format!("{conversation_id}/{session_uuid}"),
+            conversation_id: conversation_id.to_string(),
+            persona_name,
+            system,
+            tools,
+            manager,
+            permissions,
+            llm,
+            store,
+            session_uuid,
+            created_at,
         })
     }
 
-    /// Create a fresh session with a new uuid v4 id.
-    pub async fn create(&self) -> Result<Arc<LlmSession>> {
-        let id = self.store.create().await?;
-        let session = Arc::new(LlmSession::new(id.clone(), self.store.clone()));
-        self.current.lock().unwrap().insert(id, session.clone());
+    async fn run_turn(&self, content: String, request_id: Option<String>) -> Result<()> {
+        let user_item = SessionItem::Message {
+            role: MessageRole::User,
+            content,
+        };
+        let mut items = self.store.read_items(&self.session_uuid).await?;
+        items.push(user_item.clone());
+        self.store.append(&self.session_uuid, &[user_item]).await?;
+
+        let ctx = ToolContext {
+            persona_name: self.persona_name.clone(),
+            manager: self.manager.clone(),
+            request_id,
+            permissions: self.permissions.clone(),
+            conversation_id: Some(self.conversation_id.clone()),
+        };
+
+        let mut last_response_id = self.store.response_id(&self.session_uuid).await?;
+
+        for _iteration in 0..MAX_ITERATIONS {
+            let tool_defs: Vec<ToolDef> = self
+                .tools
+                .list()
+                .iter()
+                .map(|t| ToolDef {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters(),
+                })
+                .collect();
+
+            let resp: LlmResponse = self
+                .llm
+                .chat(&self.system, &items, &tool_defs)
+                .await?;
+            if let Some(id) = &resp.id {
+                last_response_id = Some(id.clone());
+            }
+
+            if !resp.tool_calls.is_empty() {
+                for tc in &resp.tool_calls {
+                    // Each function_call is immediately followed by its
+                    // function_call_output: DeepSeek's Responses endpoint
+                    // rejects interleaved items between a call and its result.
+                    let call_item = SessionItem::FunctionCall(tc.clone());
+                    items.push(call_item.clone());
+                    self.store.append(&self.session_uuid, &[call_item]).await?;
+
+                    let result = match self.tools.get(&tc.name) {
+                        Some(tool) => tool.run(&tc.arguments, ctx.clone()).await,
+                        None => Err(anyhow::anyhow!("unknown tool: {}", tc.name)),
+                    };
+                    let output_item = SessionItem::FunctionCallOutput {
+                        call_id: tc.id.clone(),
+                        output: match result {
+                            Ok(out) => out,
+                            Err(e) => format!("tool error: {e}"),
+                        },
+                    };
+                    items.push(output_item.clone());
+                    self.store
+                        .append(&self.session_uuid, &[output_item])
+                        .await?;
+                }
+                continue;
+            }
+
+            if let Some(content) = resp.content {
+                let assistant_item = SessionItem::Message {
+                    role: MessageRole::Assistant,
+                    content,
+                };
+                items.push(assistant_item.clone());
+                self.store
+                    .append(&self.session_uuid, &[assistant_item])
+                    .await?;
+            }
+            break;
+        }
+
+        if let Some(id) = last_response_id {
+            self.store.set_response_id(&self.session_uuid, &id).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Session for SqliteSession {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn created_at(&self) -> Result<i64> {
+        Ok(self.created_at)
+    }
+
+    async fn send(&self, content: String, request_id: Option<String>) -> Result<()> {
+        self.run_turn(content, request_id).await
+    }
+
+    async fn raw_history(&self) -> Result<Vec<(i64, SessionItem)>> {
+        self.store.read_raw(&self.session_uuid).await
+    }
+}
+
+/// SQLite-backed session manager: one instance per persona, created by the
+/// composition root with the storage root, system prompt, shared tool
+/// registry, and the routing/approval ports.
+pub struct SqliteSessionManager {
+    root: PathBuf,
+    persona_name: String,
+    system: String,
+    context: String,
+    tools: Arc<ToolRegistry>,
+    manager: Arc<ConversationManager>,
+    permissions: Arc<PermissionRegistry>,
+    llm: Arc<dyn ChatLlm>,
+    stores: Mutex<HashMap<String, Arc<SqliteSessionStore>>>,
+    sessions: Mutex<HashMap<String, Arc<SqliteSession>>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CurrentSession {
+    session_id: String,
+}
+
+impl SqliteSessionManager {
+    /// Create the manager for one persona. `root` is the persona's
+    /// conversation directory; sessions live under
+    /// `<root>/<conversation_id>/<uuid>.db`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        root: &Path,
+        persona_name: String,
+        system: String,
+        context: String,
+        tools: Arc<ToolRegistry>,
+        manager: Arc<ConversationManager>,
+        permissions: Arc<PermissionRegistry>,
+        config: LlmConfig,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("creating session root {}", root.display()))?;
+        let llm: Arc<dyn ChatLlm> = Arc::new(OpenAiLlm::new(
+            &config.api_url,
+            &config.api_key,
+            &config.model,
+            config.web_search,
+        ));
+        Self::with_llm(
+            root,
+            persona_name,
+            system,
+            context,
+            tools,
+            manager,
+            permissions,
+            llm,
+        )
+    }
+
+    /// Test seam: construct the manager with a substitute LLM client.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_llm(
+        root: &Path,
+        persona_name: String,
+        system: String,
+        context: String,
+        tools: Arc<ToolRegistry>,
+        manager: Arc<ConversationManager>,
+        permissions: Arc<PermissionRegistry>,
+        llm: Arc<dyn ChatLlm>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("creating session root {}", root.display()))?;
+        Ok(Self {
+            root: root.to_path_buf(),
+            persona_name,
+            system,
+            context,
+            tools,
+            manager,
+            permissions,
+            llm,
+            stores: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn store_for(&self, conversation_id: &str) -> Result<Arc<SqliteSessionStore>> {
+        let mut stores = self.stores.lock().unwrap();
+        if let Some(store) = stores.get(conversation_id) {
+            return Ok(store.clone());
+        }
+        let store = Arc::new(SqliteSessionStore::new(&self.root.join(conversation_id))?);
+        stores.insert(conversation_id.to_string(), store.clone());
+        Ok(store)
+    }
+
+    fn current_path(&self, conversation_id: &str) -> PathBuf {
+        self.root.join(conversation_id).join("current.json")
+    }
+
+    async fn save_current(&self, conversation_id: &str, id: &str) -> Result<()> {
+        let path = self.current_path(conversation_id);
+        tokio::fs::write(&path, serde_json::to_string(&CurrentSession {
+            session_id: id.to_string(),
+        })?)
+        .await
+        .with_context(|| format!("writing current session pointer {}", path.display()))?;
+        Ok(())
+    }
+
+    async fn read_current(&self, conversation_id: &str) -> Result<Option<String>> {
+        let path = self.current_path(conversation_id);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => match serde_json::from_str::<CurrentSession>(&content) {
+                Ok(current) if !current.session_id.is_empty() => Ok(Some(current.session_id)),
+                _ => {
+                    log::warn!("invalid current session file: {}", path.display());
+                    Ok(None)
+                }
+            },
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn build_session(
+        &self,
+        conversation_id: &str,
+        session_uuid: &str,
+    ) -> Result<Arc<SqliteSession>> {
+        let store = self.store_for(conversation_id)?;
+        let session = Arc::new(
+            SqliteSession::new(
+                conversation_id,
+                session_uuid.to_string(),
+                self.persona_name.clone(),
+                self.system.clone(),
+                self.tools.clone(),
+                self.manager.clone(),
+                self.permissions.clone(),
+                self.llm.clone(),
+                store,
+            )
+            .await?,
+        );
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
+        Ok(session)
+    }
+}
+
+#[async_trait]
+impl SessionManager for SqliteSessionManager {
+    async fn create(&self, conversation_id: &str) -> Result<Arc<dyn Session>> {
+        let store = self.store_for(conversation_id)?;
+        let uuid = store.create().await?;
+        let session = self.build_session(conversation_id, &uuid).await?;
+        if !self.context.is_empty() {
+            store
+                .append(
+                    &uuid,
+                    &[SessionItem::Message {
+                        role: MessageRole::Context,
+                        content: self.context.clone(),
+                    }],
+                )
+                .await?;
+        }
+        self.save_current(conversation_id, &session.id).await?;
         Ok(session)
     }
 
-    /// Get an existing session by id, or `None` if it does not exist.
-    pub async fn session(&self, id: &str) -> Result<Option<Arc<LlmSession>>> {
+    async fn current(&self, conversation_id: &str) -> Result<Option<Arc<dyn Session>>> {
+        match self.read_current(conversation_id).await? {
+            Some(id) => self.load(&id).await,
+            None => Ok(None),
+        }
+    }
+
+    async fn load(&self, id: &str) -> Result<Option<Arc<dyn Session>>> {
         let key = id.to_string();
-        if let Some(session) = self.current.lock().unwrap().get(&key).cloned() {
+        if let Some(session) = self.sessions.lock().unwrap().get(&key).cloned() {
             return Ok(Some(session));
         }
-        if !self.store.has(id) {
+        let Some((conversation_id, session_uuid)) = id.split_once('/') else {
+            return Ok(None);
+        };
+        let store = self.store_for(conversation_id)?;
+        if !store.has(session_uuid) {
             return Ok(None);
         }
-        let session = Arc::new(LlmSession::new(key.clone(), self.store.clone()));
-        self.current.lock().unwrap().insert(key, session.clone());
-        Ok(Some(session))
+        Ok(Some(
+            self.build_session(conversation_id, session_uuid).await?,
+        ))
     }
 
-    /// Every session in this store: `(id, seq, created_at)`, in creation
-    /// order.
-    pub async fn list(&self) -> Result<Vec<(String, i64, i64)>> {
-        self.store.list().await
+    async fn archive(&self, id: &str) -> Result<()> {
+        let Some((conversation_id, session_uuid)) = id.split_once('/') else {
+            anyhow::bail!("invalid session id: {id}");
+        };
+        let store = self.store_for(conversation_id)?;
+        store.archive(session_uuid).await
     }
 
-    /// Raw history of a session by id: `(row_id, item)`.
-    pub async fn raw_history(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<(i64, LlmItem)>> {
-        self.store.read_raw(session_id).await
+    async fn list(&self, conversation_id: &str) -> Result<Vec<Arc<dyn Session>>> {
+        let store = self.store_for(conversation_id)?;
+        let mut out = Vec::new();
+        for (session_uuid, _seq, _created_at) in store.list().await? {
+            let id = format!("{conversation_id}/{session_uuid}");
+            if let Some(session) = self.load(&id).await? {
+                out.push(session);
+            }
+        }
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::MessageRole;
-    use uuid::Uuid;
+    use nota_core::session::ToolCall;
+    use nota_core::tool::{Tool, ToolParams};
+    use std::collections::VecDeque;
 
-    fn temp_base(tag: &str) -> std::path::PathBuf {
+    fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "nota_llm_{tag}_{}",
+            "nota_llm_session_{tag}_{}",
             std::process::id()
         ));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn user_item(content: &str) -> LlmItem {
-        LlmItem::Message {
-            role: MessageRole::User,
-            content: content.to_string(),
+    /// Mock LLM: pops the next canned response per chat call.
+    struct MockLlm(Mutex<VecDeque<LlmResponse>>);
+
+    impl MockLlm {
+        fn new(responses: Vec<LlmResponse>) -> Self {
+            Self(Mutex::new(responses.into()))
         }
     }
 
-    #[tokio::test]
-    async fn create_uses_uuid_and_get_roundtrips() {
-        let base = temp_base("uuid");
-        let manager = LlmSessionManager::new(&base).unwrap();
+    #[async_trait]
+    impl ChatLlm for MockLlm {
+        async fn chat(
+            &self,
+            _system: &str,
+            _items: &[SessionItem],
+            _tools: &[ToolDef],
+        ) -> Result<LlmResponse> {
+            self.0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("mock llm exhausted"))
+        }
+    }
 
-        let s1 = manager.create().await.unwrap();
-        assert!(Uuid::parse_str(&s1.id).is_ok(), "session id must be a uuid");
-
-        // Retrieval is explicit: the id resolves, anything else is None.
-        let got = manager.session(&s1.id).await.unwrap().expect("session exists");
-        assert_eq!(got.id, s1.id);
-        assert!(manager.session("missing-session").await.unwrap().is_none());
-
-        // One flat file per session in the caller-specified directory.
-        let sessions = manager.list().await.unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, s1.id);
-        assert!(base.join(format!("{}.db", s1.id)).exists());
-
-        std::fs::remove_dir_all(&base).ok();
+    fn manager_with(
+        root: &Path,
+        llm: Arc<dyn ChatLlm>,
+    ) -> (Arc<SqliteSessionManager>, Arc<ConversationManager>) {
+        let manager = Arc::new(ConversationManager::new());
+        let sm = Arc::new(
+            SqliteSessionManager::with_llm(
+                root,
+                "bob".to_string(),
+                "system".to_string(),
+                "persona context".to_string(),
+                Arc::new(ToolRegistry::new()),
+                manager.clone(),
+                Arc::new(PermissionRegistry::new()),
+                llm,
+            )
+            .unwrap(),
+        );
+        (sm, manager)
     }
 
     #[tokio::test]
-    async fn append_and_context_roundtrip() {
-        let base = temp_base("roundtrip");
-        let manager = LlmSessionManager::new(&base).unwrap();
+    async fn create_and_current_roundtrip() {
+        let root = temp_root("roundtrip");
+        let (sm, _) = manager_with(&root, Arc::new(MockLlm::new(vec![])));
 
-        let s = manager.create().await.unwrap();
-        let items = vec![user_item("hello"), user_item("world")];
-        s.append(&items).await.unwrap();
+        let s1 = sm.create("onebot_private_42").await.unwrap();
+        assert!(
+            s1.id().starts_with("onebot_private_42/"),
+            "session id must be conversation-namespaced: {}",
+            s1.id()
+        );
 
-        assert_eq!(s.context().await.unwrap(), items);
-        let raw = s.raw_history().await.unwrap();
-        assert_eq!(raw.len(), 2);
-        assert!(raw[0].0 < raw[1].0, "row ids must ascend");
-        assert_eq!(raw[1].1, user_item("world"));
+        let current = sm.current("onebot_private_42").await.unwrap().unwrap();
+        assert_eq!(current.id(), s1.id());
+        assert!(sm.current("other_chat").await.unwrap().is_none());
+        assert!(sm.load("missing-session").await.unwrap().is_none());
 
-        std::fs::remove_dir_all(&base).ok();
+        let list = sm.list("onebot_private_42").await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id(), s1.id());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn send_persists_user_and_assistant_items_and_response_id() {
+        let root = temp_root("send");
+        let llm = Arc::new(MockLlm::new(vec![LlmResponse {
+            id: Some("resp_x".to_string()),
+            content: Some("hi back".to_string()),
+            tool_calls: vec![],
+        }]));
+        let (sm, _) = manager_with(&root, llm);
+
+        let s = sm.create("conv1").await.unwrap();
+        s.send("hello".to_string(), Some("req_1".to_string()))
+            .await
+            .unwrap();
+
+        let history = s.raw_history().await.unwrap();
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[0].1,
+            SessionItem::Message {
+                role: MessageRole::Context,
+                content: "persona context".to_string(),
+            }
+        );
+        assert_eq!(
+            history[1].1,
+            SessionItem::Message {
+                role: MessageRole::User,
+                content: "hello".to_string(),
+            }
+        );
+        assert_eq!(
+            history[2].1,
+            SessionItem::Message {
+                role: MessageRole::Assistant,
+                content: "hi back".to_string(),
+            }
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn send_runs_tool_loop_with_live_registry() {
+        let root = temp_root("tools");
+        // First call: tool call; second call: final content.
+        let llm = Arc::new(MockLlm::new(vec![
+            LlmResponse {
+                id: Some("r1".to_string()),
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+            },
+            LlmResponse {
+                id: Some("r2".to_string()),
+                content: Some("done".to_string()),
+                tool_calls: vec![],
+            },
+        ]));
+        let manager = Arc::new(ConversationManager::new());
+        let tools = Arc::new(ToolRegistry::new());
+        // The tool is registered AFTER the manager is built: the loop must
+        // resolve it live from the registry.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        struct EchoTool {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Tool for EchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "echo tool"
+            }
+            fn parameters(&self) -> ToolParams {
+                ToolParams::object(HashMap::new(), vec![])
+            }
+            async fn run(&self, _args: &str, ctx: ToolContext) -> Result<String> {
+                self.seen.lock().unwrap().push(format!(
+                    "{}|{}|{:?}",
+                    ctx.persona_name,
+                    ctx.conversation_id.as_deref().unwrap_or("none"),
+                    ctx.request_id
+                ));
+                Ok("tool result".to_string())
+            }
+        }
+        tools
+            .register(Arc::new(EchoTool {
+                seen: seen.clone(),
+            }))
+            .unwrap();
+
+        let sm = Arc::new(
+            SqliteSessionManager::with_llm(
+                &root,
+                "bob".to_string(),
+                "system".to_string(),
+                "persona context".to_string(),
+                tools,
+                manager.clone(),
+                Arc::new(PermissionRegistry::new()),
+                llm,
+            )
+            .unwrap(),
+        );
+
+        let s = sm.create("conv1").await.unwrap();
+        s.send("please".to_string(), Some("req_9".to_string()))
+            .await
+            .unwrap();
+
+        let history = s.raw_history().await.unwrap();
+        let kinds: Vec<&str> = history
+            .iter()
+            .map(|(_, i)| match i {
+                SessionItem::Message { .. } => "message",
+                SessionItem::FunctionCall(_) => "function_call",
+                SessionItem::FunctionCallOutput { .. } => "function_call_output",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "message",
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].starts_with("bob|conv1|Some(\"req_9\")"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
     async fn sessions_persist_across_restart() {
-        let base = temp_base("persist");
-        let manager = LlmSessionManager::new(&base).unwrap();
+        let root = temp_root("persist");
+        let llm = || {
+            Arc::new(MockLlm::new(vec![LlmResponse {
+                id: Some("resp_x".to_string()),
+                content: Some("hi".to_string()),
+                tool_calls: vec![],
+            }])) as Arc<dyn ChatLlm>
+        };
+        let (sm, _) = manager_with(&root, llm());
+        let s1 = sm.create("conv1").await.unwrap();
+        s1.send("hello".to_string(), None).await.unwrap();
+        let s1_id = s1.id().to_string();
 
-        let s1 = manager.create().await.unwrap();
-        s1.append(&[user_item("hello")]).await.unwrap();
-        s1.set_response_id("resp_x").await.unwrap();
-        let s2 = manager.create().await.unwrap();
+        // A fresh manager over the same root resumes the current session.
+        let (sm2, _) = manager_with(&root, llm());
+        let resumed = sm2.current("conv1").await.unwrap().unwrap();
+        assert_eq!(resumed.id(), s1_id);
+        assert_eq!(resumed.raw_history().await.unwrap().len(), 3);
 
-        // A fresh manager over the same directory still finds both sessions
-        // by id; the caller decides which one is current.
-        let manager2 = LlmSessionManager::new(&base).unwrap();
-        let resumed = manager2
-            .session(&s1.id)
-            .await
-            .unwrap()
-            .expect("s1 exists after restart");
-        assert_eq!(resumed.response_id().await.unwrap().as_deref(), Some("resp_x"));
-        assert_eq!(resumed.context().await.unwrap(), vec![user_item("hello")]);
-
-        let sessions = manager2.list().await.unwrap();
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].0, s1.id);
-        assert_eq!(sessions[1].0, s2.id);
-
-        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]
-    async fn directories_are_isolated() {
-        let base_a = temp_base("iso_a");
-        let base_b = temp_base("iso_b");
-        let a = LlmSessionManager::new(&base_a).unwrap();
-        let b = LlmSessionManager::new(&base_b).unwrap();
+    async fn archive_keeps_session_readable() {
+        let root = temp_root("archive");
+        let (sm, _) = manager_with(&root, Arc::new(MockLlm::new(vec![])));
 
-        a.create().await.unwrap();
-        assert_eq!(a.list().await.unwrap().len(), 1);
-        assert!(b.list().await.unwrap().is_empty());
+        let s1 = sm.create("conv1").await.unwrap();
+        let s2 = sm.create("conv1").await.unwrap();
+        assert_ne!(s1.id(), s2.id());
 
-        std::fs::remove_dir_all(&base_a).ok();
-        std::fs::remove_dir_all(&base_b).ok();
+        sm.archive(&s1.id()).await.unwrap();
+        // Archived sessions stay readable via list; current points at s2.
+        assert!(sm.load(&s1.id()).await.unwrap().is_some());
+        let list = sm.list("conv1").await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(sm.current("conv1").await.unwrap().unwrap().id(), s2.id());
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }

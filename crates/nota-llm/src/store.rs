@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::llm::LlmItem;
+use nota_core::session::SessionItem;
 
 pub struct SqliteSessionStore {
     dir: PathBuf,
@@ -103,11 +103,9 @@ impl SqliteSessionStore {
         let key = key.to_string();
         self.with_conn(&session_id, |conn| {
             let raw = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key = ?1",
-                    params![key],
-                    |r| r.get::<_, String>(0),
-                )
+                .query_row("SELECT value FROM meta WHERE key = ?1", params![key], |r| {
+                    r.get::<_, String>(0)
+                })
                 .optional()?;
             raw.map(|v| {
                 v.parse::<i64>()
@@ -118,7 +116,7 @@ impl SqliteSessionStore {
     }
 
     /// Append dialogue items to a session, verbatim, in order.
-    pub async fn append(&self, session_id: &str, items: &[LlmItem]) -> Result<()> {
+    pub async fn append(&self, session_id: &str, items: &[SessionItem]) -> Result<()> {
         let session_id = session_id.to_string();
         let now = chrono::Utc::now().timestamp();
         self.with_conn(&session_id, |conn| {
@@ -135,7 +133,7 @@ impl SqliteSessionStore {
     }
 
     /// The full dialogue of a session, oldest first.
-    pub async fn read_items(&self, session_id: &str) -> Result<Vec<LlmItem>> {
+    pub async fn read_items(&self, session_id: &str) -> Result<Vec<SessionItem>> {
         Ok(self
             .read_raw(session_id)
             .await?
@@ -145,10 +143,7 @@ impl SqliteSessionStore {
     }
 
     /// All items of a session with their row ids, oldest first.
-    pub async fn read_raw(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<(i64, LlmItem)>> {
+    pub async fn read_raw(&self, session_id: &str) -> Result<Vec<(i64, SessionItem)>> {
         let session_id = session_id.to_string();
         self.with_conn(&session_id, |conn| {
             let mut stmt = conn.prepare("SELECT id, item FROM messages ORDER BY id")?;
@@ -158,7 +153,7 @@ impl SqliteSessionStore {
             let mut out = Vec::new();
             for row in rows {
                 let (id, raw) = row?;
-                match serde_json::from_str::<LlmItem>(&raw) {
+                match serde_json::from_str::<SessionItem>(&raw) {
                     Ok(item) => out.push((id, item)),
                     Err(e) => log::warn!("skipping unparseable session item: {e}"),
                 }
@@ -189,6 +184,27 @@ impl SqliteSessionStore {
                 "INSERT INTO meta (key, value) VALUES ('response_id', ?1)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 params![id],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Creation time of a session (Unix millis), from its metadata.
+    pub(crate) async fn created_at(&self, session_id: &str) -> Result<i64> {
+        self.meta_i64(session_id, "created_at")
+            .await
+            .map(|v| v.unwrap_or(0))
+    }
+
+    /// Mark a session as archived. Archived sessions stay readable via
+    /// `list` / `load`; only the current pointer is moved away.
+    pub(crate) async fn archive(&self, session_id: &str) -> Result<()> {
+        let session_id = session_id.to_string();
+        self.with_conn(&session_id, |conn| {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('archived', '1')
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [],
             )?;
             Ok(())
         })

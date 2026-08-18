@@ -14,12 +14,15 @@
 
 ## Current Architecture (2026-08)
 
-Workspace `nota-cli → nota-infra → nota-core`, plus
-`nota-onebot → nota-llm → nota-core` (onebot implements tools against
-`nota-llm`) and `nota-infra → nota-llm → nota-core`. Hexagonal ports &
+`nota-cli → nota-infra → nota-core`, `nota-cli → nota-llm → nota-core`, and
+`nota-cli → nota-onebot → nota-core`. Only the composition root references
+`nota-llm`; infra/onebot hold the core abstractions. Hexagonal ports &
 adapters; see `AGENTS.md` and `.agent/guide.md` for the full layout.
 
-### LLM purification (2026-08-17, user-directed)
+### LLM purification (2026-08-17, user-directed) — superseded
+
+Superseded by "Session manager + tool contract in core" below (2026-08-18);
+kept for history.
 
 The llm module was purified:
 - **Sessions are one dialogue, conversation-agnostic.** `LlmSession` has only
@@ -54,7 +57,11 @@ The llm module was purified:
 - Old per-conversation `~/.nota/sessions/<id>/history.db` files are left
   untouched (user handles migration themselves; no automatic migration).
 
-### Terminology (2026-08-17)
+### Terminology (2026-08-17) — superseded
+
+Superseded by the current terminology in `AGENTS.md` / `CONTRIBUTING.md`
+(session = one conversation-namespaced LLM dialogue, managed via the core
+`SessionManager` abstraction).
 
 - **session** = one LLM-level dialogue: an ordered list of OpenAI-style
   message items (messages + tool calls/results; system prompt excluded),
@@ -93,6 +100,79 @@ untouched; new code never writes them.
   `LlmItem`/`MessageRole`, … model the domain directly. No raw
   `serde_json::Value` or `String` as parameter types in core.
 
+### Explicit sending + tool registry fail-fast (2026-08-18, user-directed)
+
+Learned from the dsh-onebot plugin design:
+- **No auto-send**: `PersonaRuntime` no longer routes the final assistant
+  text back to the conversation at the end of a turn. Sending is explicit:
+  `reply` delivers into the current conversation; `onebot_send_msg` sends to
+  a specific QQ chat (`target = private:<id>` / `group:<id>`). Each call
+  sends immediately and can be repeated within one turn.
+- **`skip_reply` removed**: with no auto-send there is nothing to suppress;
+  the `suppress_reply` flag was dropped from `ToolContext` and the tool no
+  longer exists. Staying silent = not calling a send tool (「不要回答」).
+- **Tool registration fails fast**: `ToolRegistry::register` returns
+  `Result<()>` and errors on a duplicate name; every registration site
+  (`register_builtin_tools`, `register_chat_tools`,
+  `OneBotBridge::register_tools`) propagates it, so startup aborts instead of
+  silently shadowing the earlier tool (the registry is a HashMap insert —
+  shadowing used to be silent).
+- **OneBot toolset renamed to `onebot_*`** (dsh-style):
+  `send_message` → `reply` (+ `onebot_send_msg`), `read_group_chat` →
+  `onebot_get_msg_history` (now `target`-based, private + group), `get_msg`
+  → `onebot_get_content`, `get_login_info` → `onebot_status` (adds
+  connection state), `get_voice_text` → `onebot_voice_text`. Built-in
+  runtime names stay reserved (`file_read` / `file_write` / `schedule` /
+  `status` / `reply`).
+- Slash-command acks (`//clear`, `//allow_read`) are still routed directly
+  by `PersonaRuntime` — runtime feedback, not model speech.
+
+### Session manager + tool contract in core (2026-08-18, user-directed)
+
+Architectural reversal of the 2026-08-17 "tools into llm" decision: the llm
+crate is now a pure **session implementation**, and other modules never
+reference it.
+- **Core owns the abstractions**: `nota-core` gains `session.rs`
+  (`Session` / `SessionManager` traits + `SessionItem`/`MessageRole`/
+  `ToolCall`) and `tool.rs` (`Tool` / `ToolContext` / `ToolParams` /
+  `PropertyDef` + a concrete in-memory `ToolRegistry` — the trait/impl split
+  is gone). `ToolContext` lives with the routing/approval types it needs, so
+  the old llm→core concrete coupling disappears. Core adds `serde` (allowed).
+- **No `LlmClient`, no `AgentRunner`**: the LLM call and the turn loop moved
+  inside `SqliteSession` (`send(content, request_id)` runs the whole turn:
+  append user item → LLM call with system prompt + live tool list → execute
+  tool calls with a per-session `ToolContext` → persist items/response id).
+  The Responses client is internal (`ChatLlm` is a crate-private test seam).
+- **`SqliteSessionManager` is the only public llm surface**: one per persona,
+  constructed by `nota-cli` with the storage root, system prompt (built once
+  at startup from `solo.md`/`memory.md`), shared `ToolRegistry`, and the
+  `ConversationManager`/`PermissionRegistry` ports. API:
+  `create(conversation_id)` / `current(conversation_id)` / `load(id)` /
+  `archive(id)` / `list(conversation_id)`; `current.json` moved inside the
+  manager.
+- **Storage layout change (breaking)**: sessions now live at
+  `~/.nota/conversation/<persona>/<conversation_id>/<uuid>.db` (was
+  `conversation/<conversation_id>/<uuid>.db`); ids are
+  `<conversation_id>/<uuid>`. Old history dirs are orphaned — dev phase,
+  accepted.
+- **Roles are numeric (breaking)**: `MessageRole` is a `u8` — `0` reserved,
+  `1` user, `2` assistant, `3` context — serialized as plain numbers in
+  sqlite/JSON, not strings. The `System` role was **removed** — the system
+  prompt is not a stored role: it is passed to `SessionManager` at
+  construction (a fixed constant, deliberately **not** derived from persona
+  files) and sent as `instructions` per request. The remaining roles were
+  renumbered (`1` user, `2` assistant, `3` context), so rows written with the
+  old numbering shift or fail on deserialization — dev phase, accepted.
+  Persona content (`solo.md` / `memory.md`) is injected at session creation
+  as `Context` items and emitted as `system` input messages at call time. The
+  llm crate maps roles to wire strings only when building the API request.
+- **Dependency graph**: `nota-cli → nota-infra → nota-core`,
+  `nota-cli → nota-llm → nota-core`, `nota-cli → nota-onebot → nota-core`.
+  `nota-infra`/`nota-onebot` dropped the llm dependency; `nota-cli` gained it
+  (composition root). Infra's `PersonaRuntime` holds `Arc<dyn SessionManager>`
+  and only calls `current/create/send`; the chatlog API reads history through
+  the same abstraction.
+
 ## History & storage
 
 - **Persona workspaces** are plain files:
@@ -100,15 +180,15 @@ untouched; new code never writes them.
   `FilePersonaStore` (mtime-cached reads, write-through). Workspace files are
   read generically by filename; `solo.md`/`memory.md` are conveniences.
 - **Sessions are one SQLite file each** (`rusqlite` bundled, owned by
-  `nota-llm`), stored flat as `<session_id>.db` in a caller-specified
-  directory: `PersonaRuntime` uses `~/.nota/conversation/<conversation_id>/`
-  (one dir per conversation — delete the dir to wipe the conversation). Each
-  file has a `meta(key, value)` table (`created_at`, monotonic `seq`,
-  `response_id`) and a `messages(id, item, timestamp)` table. The current
-  session id lives in `current.json` (`{"session_id": "…"}`) in the same
-  directory, written by the caller. `//clear` calls `create()` — nothing is
-  deleted — and the model context is the current session's items. The raw
-  history of **all** sessions of a conversation is served by
+  `nota-llm`), stored as `<uuid>.db` under
+  `~/.nota/conversation/<persona>/<conversation_id>/` (delete the
+  conversation dir to wipe it). Each file has a `meta(key, value)` table
+  (`created_at`, monotonic `seq`, `response_id`, `archived`) and a
+  `messages(id, item, timestamp)` table. The current session id lives in
+  `current.json` (`{"session_id": "…"}`) in the same directory, written by
+  the session manager. `//clear` archives the old session and creates a
+  fresh one — nothing is deleted. The raw history of **all** sessions of a
+  conversation is served by
   `GET /api/personas/{name}/chatlog/{conversation_id}` as a list of
   `{session_id, created_at, messages: [(row_id, item)]}`.
   Adapter-assigned conversation ids: `onebot_private_<id>` /
@@ -139,43 +219,47 @@ untouched; new code never writes them.
 
 - `nota-llm::responses::OpenAiLlm` speaks **only** `POST {api_url}/responses`
   (the Chat Completions path and `Config.api_mode` were removed).
-- System prompt → top-level `instructions`; history `LlmItem`s map 1:1 onto
-  `input` items; tools use the flat Responses shape
+- System prompt (from `SessionManager` construction) → top-level
+  `instructions`; history `SessionItem`s map 1:1 onto `input` items
+  (`Context` items as role `system`); tools use the flat Responses shape
   `{"type":"function", name, description, parameters}`.
 - DeepSeek requires each `function_call_output` to directly follow its matching
-  `function_call`, so `AgentRunner` emits interleaved pairs
+  `function_call`, so the session turn loop emits interleaved pairs
   (`[fc, output, fc, output]`) — adjacency holds by construction.
 - Output parsing: `output[]` message items → reply text; `function_call` →
   `ToolCall` via `call_id` (fallback `id`); `reasoning` / `web_search_call` /
   unknown items are ignored.
 - Built-in `web_search` tool (DeepSeek executes it server-side) is attached
   when `Config.web_search` (default `true`); the wizard asks for it.
-- LLM sessions are managed by `nota-llm::LlmSessionManager` (`create` /
-  `session(id)` / `latest` / `list`, no default store path — the caller
-  supplies the directory); `LlmSession` exposes `append` (verbatim
-  `LlmItem`s, OpenAI message-item shape), `context` (the session's full item
-  list), `response_id`/`set_response_id`, and `raw_history`. The system
-  prompt is injected per request by `PersonaRuntime` (`build_system_prompt`
-  from `solo.md` / `memory.md`), never stored in the session.
+- Sessions are managed by `nota-llm::SqliteSessionManager` (implements the
+  core `SessionManager` trait; created per persona by `nota-cli` with the
+  storage root, system prompt, tool registry, and routing/approval ports).
+  `Session::send(content, request_id)` runs the whole turn; `raw_history`
+  exposes items for the chatlog API. The system prompt is fixed at manager
+  creation (built once from `solo.md` / `memory.md`), so persona file edits
+  apply on restart.
 - **Caching & cost (2026-08-17)**: DeepSeek's Responses endpoint is
   **stateless** — `previous_response_id`/`conversation`/`store` are not
   supported. Cost savings come from DeepSeek's automatic prefix cache
   (enabled by default): the request prefix must be **byte-identical** between
   turns. We keep the prefix stable by (a) appending history in stored order,
-  (b) sorting the tool list by name in `ToolRegistryImpl::list` (HashMap order
-  used to be random — a silent cache killer), and (c) keeping `instructions`
-  built deterministically from persona files. The response `id` is parsed and
-  persisted per session in the `sessions.response_id` column for future
-  stateful providers; DeepSeek's `usage.prompt_cache_hit_tokens` /
-  `prompt_cache_miss_tokens` are logged at DEBUG.
+  (b) sorting the tool list by name in `ToolRegistry::list` (HashMap order
+  used to be random — a silent cache killer), and (c) keeping the request
+  prefix deterministic (fixed `instructions`, persona `Context` items first
+  in `input`). The response `id` is parsed and persisted per session in the
+  `sessions.response_id` column for future stateful providers; DeepSeek's
+  `usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` are logged at
+  DEBUG.
 
 ## Tool system
 
 - Tool loop: max 16 iterations, LLM → tool_calls → execute → append results.
-  `AgentRunner` and `ToolDef` + `ToolCall` + `LlmResponse` live in `nota-llm`.
-- `Tool` / `ToolRegistry` / `ToolRegistryImpl` / `ToolContext` live in
-  `nota-llm::tool`; infra and onebot register their tools on a shared
-  `ToolRegistryImpl` instance (created in `nota-cli`, injected via `Arc`).
+  It lives inside `SqliteSession::send` (`nota-llm`); the Responses wire
+  types (`ToolDef` / `LlmResponse`) are internal to `nota-llm`.
+- `Tool` / `ToolContext` / `ToolParams` / `PropertyDef` and the concrete
+  in-memory `ToolRegistry` live in `nota-core::tool`; infra and onebot
+  register their tools on a shared `ToolRegistry` instance (created in
+  `nota-cli`, injected via `Arc`, resolved live on every call).
 - Built-ins (`nota-infra`, registered by `register_builtin_tools`):
   `file_read`/`file_write` (sandboxed to the persona workspace; `//allow_read
   <path>` grants workspace-external reads without per-call approval, unlisted
@@ -184,8 +268,8 @@ untouched; new code never writes them.
   `sender = "scheduler"`), `status` (version, platform, pid, uptime, current
   persona/conversation/request).
 - Slash commands are intercepted in `PersonaRuntime::run` before anything
-  reaches the LLM: `//clear` (rotates to a fresh LLM session, acks), 
-  `//allow_read <path>`.
+  reaches the session: `//clear` (archives the current session and creates a
+  fresh one, acks), `//allow_read <path>`.
 
 ## Wizard & config
 
@@ -208,19 +292,20 @@ untouched; new code never writes them.
 
 ## OneBot 11 (2026-08)
 
-- Adapter in `nota-onebot` (depends on `nota-llm` for the tool trait and on
-  `nota-core`), **forward WebSocket
+- Adapter in `nota-onebot` (depends only on `nota-core` — the `Tool` trait
+  now lives in core), **forward WebSocket
   only** (`mode = "ws"`, default `ws://127.0.0.1:3001`; auth via
   `Authorization: Bearer <token>`). `OnebotConfig` in `config.toml [onebot]`:
   `enabled`, `mode`, `ws_url`, `access_token`, `persona` (empty = first persona
   found), `prefix`, `friend_ids`, `group_ids`. `enabled = true` requires ≥ 1
   persona (or a valid `persona` name) or the server refuses to start.
 - Routing: inbound message → targeted persona inbox carrying the
-  `Conversation` (`onebot_private_<id>` / `onebot_group_<id>`); replies are
-  auto-routed back by conversation id, and `send_message(target, content)`
-  sends explicitly to any allowlisted conversation. Final text is auto-routed
-  as the reply; `skip_reply` or empty output suppress it — "不要回答" is
-  honored. Sends re-check the allowlist and are chunked at 4000 chars.
+  `Conversation` (`onebot_private_<id>` / `onebot_group_<id>`); sending is
+  **explicit** — `reply` delivers into the current conversation,
+  `onebot_send_msg` sends to another allowlisted QQ chat. Nothing is
+  auto-routed at turn end and there is no `skip_reply`; "不要回答" is honored
+  by the persona simply not calling a send tool. Sends re-check the
+  allowlist and are chunked at 4000 chars.
 - Allowlist: only `friend_ids` / `group_ids` reach the persona or get replies;
   empty list = nobody in that category. Outbound to a non-allowlisted target
   triggers a permission oneshot resolved by plain `同意` / `拒绝` (or `同意N` /
@@ -229,12 +314,15 @@ untouched; new code never writes them.
   `[image msg id:123]`; `reply` quotes become `[reply msg id:…]`); text keeps
   its content. Inbound headers: `[好友 昵称(id)]` (private) / `[群 群号 昵称(id)]`
   (group). Voice → `[record msg id:<id>]`, transcribed on demand via
-  `get_voice_text` (NapCat `fetch_ptt_text`, retries 3× 2s apart, id sent as
-  string).
-- Tools: `read_group_chat` (NapCat `get_group_msg_history`; reading any group
-  is not allowlist-gated), `get_msg`, `get_login_info`; registered via
-  `OneBotBridge::register_tools`. OneBot has no interactive approval channel,
-  so tool permission requests are auto-denied with a notice to the chat.
+  `onebot_voice_text` (NapCat `fetch_ptt_text`, retries 3× 2s apart, id sent
+  as string).
+- Tools (all `onebot_*` prefixed): `onebot_send_msg`, `onebot_get_msg_history`
+  (`target` = private/group, via NapCat `get_group_msg_history` /
+  `get_friend_msg_history`; reading any chat is not allowlist-gated),
+  `onebot_get_content`, `onebot_status` (connection + login info),
+  `onebot_voice_text`; registered via `OneBotBridge::register_tools` (fails
+  on name collision). OneBot has no interactive approval channel, so tool
+  permission requests are auto-denied with a notice to the chat.
 - NapCat quirks (verified live 2026-08-13): it resets the WS connection when
   the **client** sends an unsolicited Ping — only pong the server's pings.
   It must listen on `0.0.0.0` for LAN clients; it does not queue events for
@@ -244,14 +332,14 @@ untouched; new code never writes them.
 ### solo.md template + conversation message DEBUG logs (2026-08-14)
 - `nota-infra/assets/solo.md` template rewritten (user-approved): identity,
   chat-style reply rules, honesty + "不要回答" silence contract, tool/memory
-  usage (`file_read/write` in workspace, `schedule`, `send_message`,
+  usage (`file_read/write` in workspace, `schedule`, `reply`,
   `status`, memory.md), and session context (independent sessions, identity
   headers like `[好友 昵称(id)]`). Only affects newly created personas —
   existing `~/.nota/personas/*/solo.md` are user config and untouched.
 - File logs at DEBUG now carry the conversation message flow:
   `ConversationManager` logs `[in] conversation '…' -> persona '…' from '…':
   <content>` (deliver) and `[out] conversation '…' target '…': <content>`
-  (route_outbound, covers replies, `send_message`, slash acks). Core stays on
+  (route_outbound, covers `reply` / `onebot_send_msg`, slash acks). Core stays on
   the `log::*` facade.
 - Transport-crate DEBUG noise is filtered out of the file layer with
   **`Targets`** (built-in): `with_default(INFO)` + the five `nota_*` crates at

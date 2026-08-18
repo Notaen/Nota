@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 nota-core = { path = "../nota-core" }
 nota-infra = { path = "../nota-infra" }
+nota-llm = { path = "../nota-llm" }
 nota-onebot = { path = "../nota-onebot" }
 
 anyhow.workspace = true

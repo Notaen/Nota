@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 nota-core = { path = "../nota-core" }
-nota-llm = { path = "../nota-llm" }
 
 anyhow.workspace = true
 async-trait.workspace = true

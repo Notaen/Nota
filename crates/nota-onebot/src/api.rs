@@ -6,6 +6,7 @@
 //! resolves it when the WS client sees the matching action response.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,14 +21,20 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct OneBotApi {
     actions: UnboundedSender<ActionRequest>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<ActionResponse>>>>,
+    connected: Arc<AtomicBool>,
 }
 
 impl OneBotApi {
     pub fn new(
         actions: UnboundedSender<ActionRequest>,
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<ActionResponse>>>>,
+        connected: Arc<AtomicBool>,
     ) -> Self {
-        Self { actions, pending }
+        Self {
+            actions,
+            pending,
+            connected,
+        }
     }
 
     pub(crate) fn pending(&self) -> Arc<Mutex<HashMap<String, oneshot::Sender<ActionResponse>>>> {
@@ -36,6 +43,15 @@ impl OneBotApi {
 
     pub(crate) fn sender(&self) -> UnboundedSender<ActionRequest> {
         self.actions.clone()
+    }
+
+    pub(crate) fn connected(&self) -> Arc<AtomicBool> {
+        self.connected.clone()
+    }
+
+    /// Whether the WebSocket to the OneBot implementation is currently up.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 
     /// Send an action and await the implementation's response, matched by echo.

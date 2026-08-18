@@ -15,4 +15,6 @@ pub mod types;
 pub use api::OneBotApi;
 pub use bridge::{OneBotBridge, Outbound};
 pub use config::OnebotConfig;
-pub use tools::{GetLoginInfoTool, GetMsgTool, ReadGroupChatTool};
+pub use tools::{
+    OneBotGetContentTool, OneBotGetMsgHistoryTool, OneBotSendMsgTool, OneBotStatusTool,
+};

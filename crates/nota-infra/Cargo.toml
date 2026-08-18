@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 nota-core = { path = "../nota-core" }
-nota-llm = { path = "../nota-llm" }
 nota-onebot = { path = "../nota-onebot" }
 
 anyhow.workspace = true

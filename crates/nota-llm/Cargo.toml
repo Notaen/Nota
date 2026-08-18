@@ -15,6 +15,7 @@ reqwest = { workspace = true, features = ["json"] }
 rusqlite = { workspace = true, features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]

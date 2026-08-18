@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -20,6 +21,16 @@ use crate::types::{ActionRequest, ActionResponse, PostEvent};
 
 pub(crate) type PendingResponses =
     Arc<Mutex<HashMap<String, oneshot::Sender<ActionResponse>>>>;
+
+/// Sets the shared connected flag back to `false` when the connection
+/// attempt ends (any path), so tools can report live connection state.
+struct ConnectedGuard<'a>(&'a AtomicBool);
+
+impl Drop for ConnectedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
 
 /// A connection surviving this long is considered healthy, so the reconnect
 /// backoff resets.
@@ -42,11 +53,12 @@ pub async fn run_ws_loop(
     event_tx: UnboundedSender<PostEvent>,
     mut action_rx: UnboundedReceiver<ActionRequest>,
     pending: PendingResponses,
+    connected: Arc<AtomicBool>,
 ) {
     let mut backoff = Duration::from_secs(1);
 
     loop {
-        match connect_and_run(&cfg, &event_tx, &mut action_rx, &pending).await {
+        match connect_and_run(&cfg, &event_tx, &mut action_rx, &pending, &connected).await {
             Ok(WsEnd::Gone(up)) => {
                 if up >= STABLE_CONNECTION {
                     backoff = Duration::from_secs(1);
@@ -67,6 +79,7 @@ async fn connect_and_run(
     event_tx: &UnboundedSender<PostEvent>,
     action_rx: &mut UnboundedReceiver<ActionRequest>,
     pending: &PendingResponses,
+    connected: &AtomicBool,
 ) -> Result<WsEnd> {
     let started = Instant::now();
 
@@ -79,6 +92,8 @@ async fn connect_and_run(
     }
 
     let (mut socket, response) = tokio_tungstenite::connect_async(request).await?;
+    connected.store(true, Ordering::SeqCst);
+    let _connected_guard = ConnectedGuard(connected);
     log::info!(
         "OneBot connected to {} (status {})",
         cfg.ws_url,
@@ -206,8 +221,15 @@ mod tests {
             friend_ids: Vec::new(),
             group_ids: Vec::new(),
         };
+        let connected: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
-        let client = tokio::spawn(run_ws_loop(cfg, event_tx, action_rx, pending.clone()));
+        let client = tokio::spawn(run_ws_loop(
+            cfg,
+            event_tx,
+            action_rx,
+            pending.clone(),
+            connected,
+        ));
 
         // The event must arrive on the bridge side.
         let event = event_rx.recv().await.unwrap();

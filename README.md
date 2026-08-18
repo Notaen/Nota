@@ -7,6 +7,10 @@ personality, and it will reply on OneBot, the web, and other channels like a rea
 person — with memory, tools (web search, file access, scheduled reminders),
 and an allowlist so it only speaks where you want it to.
 
+> **Development status**: Nota is under active development. Breaking changes
+> (config keys, CLI commands, tool names, storage layout) can land at any
+> time without notice — pin the version you depend on.
+
 - Multiple personas: independent memory and personality per persona
 - OneBot support: works with NapCat and other OneBot 11 implementations
   (native Rust, no JS runtime)

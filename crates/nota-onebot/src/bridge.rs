@@ -3,25 +3,29 @@
 //! There is no global bus anymore: the bridge subscribes to the `onebot`
 //! adapter channel of the [`ConversationManager`]. Inbound OneBot messages are
 //! delivered straight to the target persona's inbox; outbound events
-//! (automatic replies, `send_message`) and permission requests come back
-//! through the adapter channel. The bridge owns the OneBot allowlist and the
-//! approve/deny round-trip for anything leaving the allowlist.
+//! (explicit `reply` / `onebot_send_msg` calls) and permission requests come
+//! back through the adapter channel. The bridge owns the OneBot allowlist
+//! and the approve/deny round-trip for anything leaving the allowlist.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use nota_core::conversation::{
     AdapterEvent, Conversation, ConversationManager, PermissionEvent,
 };
 use nota_core::permissions::PermissionRegistry;
-use nota_llm::tool::ToolRegistry;
+use nota_core::tool::ToolRegistry;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
 use crate::api::OneBotApi;
 use crate::client::{self, PendingResponses};
 use crate::config::OnebotConfig;
-use crate::tools::{GetLoginInfoTool, GetMsgTool, GetVoiceTextTool, ReadGroupChatTool};
+use crate::tools::{
+    OneBotGetContentTool, OneBotGetMsgHistoryTool, OneBotSendMsgTool, OneBotStatusTool,
+    OneBotVoiceTextTool,
+};
 use crate::types::{
     ActionRequest, MessageEvent, PostEvent, ReplyRoute, chunk_text, identity,
 };
@@ -101,7 +105,8 @@ impl OneBotBridge {
     ) -> Self {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
         let pending: PendingResponses = Arc::new(std::sync::Mutex::new(HashMap::new()));
-        let api = OneBotApi::new(action_tx, pending);
+        let connected: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let api = OneBotApi::new(action_tx, pending, connected);
         Self {
             manager,
             permissions,
@@ -119,12 +124,18 @@ impl OneBotBridge {
         self.api.clone()
     }
 
-    /// Register every OneBot tool into `registry`.
-    pub fn register_tools(&self, registry: &dyn ToolRegistry) {
-        registry.register(Arc::new(ReadGroupChatTool::new(self.api())));
-        registry.register(Arc::new(GetLoginInfoTool::new(self.api())));
-        registry.register(Arc::new(GetMsgTool::new(self.api())));
-        registry.register(Arc::new(GetVoiceTextTool::new(self.api())));
+    /// Register every OneBot tool into `registry`. Fails on a name
+    /// collision so startup aborts instead of shadowing an existing tool.
+    pub fn register_tools(&self, registry: &ToolRegistry) -> anyhow::Result<()> {
+        registry.register(Arc::new(OneBotSendMsgTool))?;
+        registry.register(Arc::new(OneBotGetMsgHistoryTool::new(self.api())))?;
+        registry.register(Arc::new(OneBotGetContentTool::new(self.api())))?;
+        registry.register(Arc::new(OneBotStatusTool::new(
+            self.api(),
+            self.cfg.ws_url.clone(),
+        )))?;
+        registry.register(Arc::new(OneBotVoiceTextTool::new(self.api())))?;
+        Ok(())
     }
 
     /// Run the bridge forever: deliver inbound events to the persona inbox
@@ -138,10 +149,11 @@ impl OneBotBridge {
             .expect("bridge action receiver present");
         let action_tx = self.api.sender();
         let pending = self.api.pending();
+        let connected = self.api.connected();
 
         let ws_cfg = self.cfg.clone();
         tokio::spawn(async move {
-            client::run_ws_loop(ws_cfg, event_tx, action_rx, pending).await;
+            client::run_ws_loop(ws_cfg, event_tx, action_rx, pending, connected).await;
         });
 
         loop {
@@ -201,7 +213,8 @@ impl OneBotBridge {
 
         let Some(content) = msg.message else { return };
         // 非文本段统一渲染为 [{segment_type} msg id:<id>]，persona 需要时
-        // 自己调用工具（如 get_voice_text / get_msg）获取内容，不在桥接层自动处理。
+        // 自己调用工具（如 onebot_voice_text / onebot_get_content）获取内容，
+        // 不在桥接层自动处理。
         let mut text = content.to_text_with_id(&msg.message_id.to_string());
         if text.trim().is_empty() {
             return;
@@ -268,8 +281,8 @@ impl OneBotBridge {
         match event {
             AdapterEvent::Outbound(e) => {
                 if let Some(target) = e.target.as_deref() {
-                    // send_message: `target` is the destination, `conversation_id`
-                    // is the source for the approval notice.
+                    // onebot_send_msg: `target` is the destination,
+                    // `conversation_id` is the source for the approval notice.
                     let Some(route) = target_to_route(target) else {
                         log::warn!("OneBot outbound event has no usable target: '{target}'");
                         return;
@@ -288,7 +301,8 @@ impl OneBotBridge {
                         .await;
                     }
                 } else if let Some(cid) = e.conversation_id.as_deref() {
-                    // Automatic reply: the conversation is the destination.
+                    // Explicit reply to the current conversation
+                    // (`reply`): the conversation is the destination.
                     let Some(route) = conversation_to_route(cid) else { return };
                     if self.route_allowed(&route) {
                         if let Err(err) = self.send_route(action_tx, &route, &e.content) {
@@ -671,7 +685,7 @@ mod tests {
         bridge.handle_onebot_event(voice_event(42)).await;
 
         let msg = inbox.recv().await.unwrap();
-        assert_eq!(msg.content, "[record msg id:99]");
+        assert_eq!(msg.content, "[record msg id:99 file=voice.amr]");
         assert_eq!(msg.conversation.conversation_id, "onebot_private_42");
     }
 
@@ -705,7 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_routes_persona_reply_by_conversation() {
+    async fn routes_explicit_reply_by_conversation() {
         let (mut bridge, _) = test_bridge();
         bridge.cfg.friend_ids = vec![42];
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();
@@ -741,7 +755,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_send_message_target() {
+    async fn routes_onebot_send_msg_target() {
         let (mut bridge, _) = test_bridge();
         bridge.cfg.group_ids = vec![30003];
         let (action_tx, mut action_rx) = mpsc::unbounded_channel();

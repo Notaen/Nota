@@ -8,9 +8,7 @@ use chrono::DateTime;
 use nota_core::conversation::Conversation;
 use nota_core::permissions::PathPolicy;
 use nota_core::scheduler::Scheduler;
-use nota_llm::tool::{
-    PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry, ToolRegistryImpl,
-};
+use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
 
 pub struct FileReadTool {
     personas_dir: PathBuf,
@@ -309,16 +307,17 @@ impl Tool for StatusTool {
 }
 
 pub fn register_builtin_tools(
-    registry: &ToolRegistryImpl,
+    registry: &ToolRegistry,
     personas_dir: PathBuf,
     scheduler: Arc<dyn Scheduler>,
     policy: Arc<PathPolicy>,
-) {
+) -> Result<()> {
     registry.register(Arc::new(FileReadTool::new(
         personas_dir.clone(),
         policy.clone(),
-    )));
-    registry.register(Arc::new(FileWriteTool::new(personas_dir)));
-    registry.register(Arc::new(ScheduleTool::new(scheduler)));
-    registry.register(Arc::new(StatusTool::new()));
+    )))?;
+    registry.register(Arc::new(FileWriteTool::new(personas_dir)))?;
+    registry.register(Arc::new(ScheduleTool::new(scheduler)))?;
+    registry.register(Arc::new(StatusTool::new()))?;
+    Ok(())
 }

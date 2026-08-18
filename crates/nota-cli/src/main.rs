@@ -1,4 +1,5 @@
 use std::fs::create_dir_all;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -24,11 +25,13 @@ use nota_core::conversation::ConversationManager;
 use nota_core::permissions::{PathPolicy, PermissionRegistry};
 use nota_core::persona::{Persona, PersonaStore};
 use nota_core::scheduler::Scheduler;
+use nota_core::session::SessionManager;
+use nota_core::tool::ToolRegistry;
+use nota_llm::{LlmConfig, SqliteSessionManager};
 use nota_onebot::{OneBotBridge, OnebotConfig};
 use nota_infra::{
-    ApiState, AppContext, ConfigStore, FilePersonaStore, LlmClient,
-    OpenAiLlm, PersonaRuntime, ToolRegistryImpl, TokioScheduler, http_serve,
-    register_builtin_tools, register_chat_tools,
+    ApiState, AppContext, ConfigStore, FilePersonaStore, PersonaRuntime,
+    TokioScheduler, http_serve, register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -60,6 +63,15 @@ enum PersonaCommand {
 #[derive(Clone)]
 struct ChronoLocalTimer;
 
+const SOLO_FILENAME: &str = "solo.md";
+const MEMORY_FILENAME: &str = "memory.md";
+const PERSONA_FILES: &[&str] = &[SOLO_FILENAME, MEMORY_FILENAME];
+/// The system prompt is deliberately **not** derived from persona files:
+/// persona content is injected per-session as context (role `Context`).
+const SYSTEM_PROMPT: &str = "You are Nota, an AI agent. Chat like a real \
+    person rather than an assistant — natural, concise, honest — and follow \
+    the persona and memory injected as context.";
+
 impl FormatTime for ChronoLocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
         write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
@@ -71,6 +83,21 @@ fn ensure_dir(base: &Path) -> Result<()> {
     create_dir_all(base.join(".logs"))?;
     create_dir_all(base.join("personas"))?;
     Ok(())
+}
+
+/// Build the injected context for a persona from its persona files (solo.md
+/// + memory.md), fixed at startup and seeded into every new session as a Context item.
+async fn build_context_prompt(store: &dyn PersonaStore, name: &str) -> String {
+    let mut parts = Vec::new();
+    for filename in PERSONA_FILES {
+        match store.read_persona_file(name, filename).await {
+            Ok(content) if !content.is_empty() => {
+                parts.push(format!("# {filename}\n{content}"));
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n\n")
 }
 
 fn init_tracing(base: &Path) -> Result<non_blocking::WorkerGuard> {
@@ -178,24 +205,17 @@ async fn run_server(
     let path_policy = Arc::new(PathPolicy::new());
 
     let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
-    let conversation_dir = base.join("conversation");
     let manager = Arc::new(ConversationManager::new());
     let scheduler: Arc<dyn Scheduler> = Arc::new(TokioScheduler::new(manager.clone()));
-    let llm: Arc<dyn LlmClient> = Arc::new(OpenAiLlm::new(
-        &config.api_url,
-        &config.api_key,
-        &config.model,
-        config.web_search,
-    ));
 
-    let tool_registry: Arc<ToolRegistryImpl> = Arc::new(ToolRegistryImpl::new());
+    let tool_registry: Arc<ToolRegistry> = Arc::new(ToolRegistry::new());
     register_builtin_tools(
-        &tool_registry,
+        tool_registry.as_ref(),
         base.join("personas"),
         scheduler.clone(),
         path_policy.clone(),
-    );
-    register_chat_tools(tool_registry.as_ref());
+    )?;
+    register_chat_tools(&tool_registry)?;
 
     let persona_names = persona_store.list_personas().await?;
     if persona_names.is_empty() {
@@ -204,23 +224,36 @@ async fn run_server(
         );
     }
 
+    let mut session_managers: HashMap<String, Arc<dyn SessionManager>> = HashMap::new();
     for name in &persona_names {
+        let context = build_context_prompt(persona_store.as_ref(), name).await;
+        let session_manager: Arc<dyn SessionManager> = Arc::new(SqliteSessionManager::new(
+            &base.join("conversation").join(name),
+            name.clone(),
+            SYSTEM_PROMPT.to_string(),
+            context,
+            tool_registry.clone(),
+            manager.clone(),
+            permissions.clone(),
+            LlmConfig {
+                api_url: config.api_url.clone(),
+                api_key: config.api_key.clone(),
+                model: config.model.clone(),
+                web_search: config.web_search,
+            },
+        )?);
+        session_managers.insert(name.clone(), session_manager.clone());
+
         let persona = Persona { name: name.clone() };
         let runtime = Arc::new(PersonaRuntime::new(
             persona,
-            persona_store.clone(),
-            conversation_dir.clone(),
-            llm.clone(),
-            tool_registry.clone(),
-            permissions.clone(),
+            session_manager,
+            manager.clone(),
             path_policy.clone(),
         ));
 
         let persona_loop_runtime = runtime.clone();
-        let manager_for_task = manager.clone();
-        tokio::spawn(async move {
-            persona_loop_runtime.run(manager_for_task).await;
-        });
+        tokio::spawn(async move { persona_loop_runtime.run().await });
 
         info!("Persona '{}' started", name);
     }
@@ -242,7 +275,7 @@ async fn run_server(
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
         persona_store,
-        conversation_dir,
+        session_managers,
         config: config_arc,
         config_path,
     });
@@ -268,7 +301,7 @@ async fn start_onebot(
     manager: Arc<ConversationManager>,
     permissions: Arc<PermissionRegistry>,
     persona_store: Arc<dyn PersonaStore>,
-    tool_registry: Arc<ToolRegistryImpl>,
+    tool_registry: Arc<ToolRegistry>,
     cfg: &OnebotConfig,
 ) -> Result<()> {
     if cfg.mode != "ws" {
@@ -296,7 +329,7 @@ async fn start_onebot(
     };
 
     let bridge = OneBotBridge::new(manager, permissions, persona.clone(), cfg.clone());
-    bridge.register_tools(tool_registry.as_ref());
+    bridge.register_tools(&tool_registry)?;
     tokio::spawn(async move { bridge.run().await });
     info!(
         "OneBot bridge started (mode={}, url={}, persona={persona})",
