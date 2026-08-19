@@ -1,9 +1,10 @@
 //! Channel-agnostic chat tools available to every persona.
 //!
-//! Sending is **explicit**: nothing is delivered automatically at the end of
-//! a turn. `reply` delivers a message into the conversation that created it.
-//! The bus carries the intent and the owning adapter bridge (e.g. OneBot)
-//! performs the actual delivery and enforces its allowlist.
+//! The turn's final assistant text is delivered directly into its
+//! conversation by `PersonaRuntime`; `reply` covers explicit or intermediate
+//! sends into the conversation that created it. The bus carries the intent
+//! and the owning adapter bridge (e.g. OneBot) performs the actual delivery
+//! and enforces its allowlist.
 //!
 //! `reply` is a **conversation-layer** tool: the conversation layer bakes the
 //! conversation id into the tool instance and registers it in that

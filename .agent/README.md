@@ -1,25 +1,18 @@
 # .agent/
 
-**Read this first.** Files in this directory are project-specific instructions for AI agents.
+Agent-facing depth and history, organized **by topic**. The agent entry point
+is `AGENTS.md` (required reading, commands, hard rules, general lessons); the
+canonical system reference is `CONTRIBUTING.md`.
 
-Human docs (start here for context): `README.md` / `README.zh.md` (what Nota
-does, quick start) and `CONTRIBUTING.md` (full architecture, HTTP API,
-directory layout).
-
-## Hard Rules (non-negotiable)
-
-1. **Never delete or modify existing code comments** without explicit approval.
-   Chinese comments are authoritative — they may be self-criticism, TODOs, or design context. When in doubt, ask.
-2. **Ask before guessing**. Propose a brief plan first, wait for confirmation, then implement.
-3. **Commit only when asked**, using [Conventional Commits](https://www.conventionalcommits.org/) (`feat/fix/refactor/docs/chore(scope): description`).
-4. **Proactively fix** English grammar, typos, and code style issues. Call out tech choices, naming, or design problems you disagree with.
+One fact lives in exactly one doc: `CONTRIBUTING.md` is canonical, this
+directory holds agent-facing depth and history. When a behavior changes,
+update the single owning file plus any code docstrings — not several copies.
 
 ## Files
 
 | File | Read when... | Purpose |
 |------|--------------|---------|
-| `notes.md` | **Always** | Hard rules, current architecture, design decisions. |
-| `guide.md` | Working on code (Rust, API, WS) | Architecture, routing, pitfalls (HTTP API / tech stack: see `CONTRIBUTING.md`). |
-| `retrospective.md` | Optional | Past session lessons — mistakes to avoid. |
-
-Start with `notes.md`. Read `guide.md` before writing Rust code.
+| `session.md` | Touching `nota-llm`, sessions, storage, `web_search` | Session manager, turn loop, storage schema, Responses API wire details, tool args validation, debug CLI |
+| `tool.md` | Touching tools, `ToolRegistry`, `reply` | Tool contract, registry, built-ins, chat tools, naming/registration |
+| `onebot.md` | Touching `nota-onebot` | OneBot 11 config, routing, allowlist, tools, NapCat quirks |
+| `decision.md` | Before reversing or extending a past decision | Design decisions & refactor history |
