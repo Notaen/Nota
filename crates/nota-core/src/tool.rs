@@ -16,14 +16,89 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::conversation::ConversationManager;
 use crate::permissions::PermissionRegistry;
 
+/// A JSON-like value owned by `nota-core`, mirroring the shape of
+/// `serde_json::Value` so tools can inspect parsed arguments without core
+/// depending on `serde_json`. Serialization to/from JSON happens at the
+/// boundary: the llm layer parses the model's raw arguments into this type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Value {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<Value>),
+    Object(HashMap<String, Value>),
+}
+
+impl Value {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The value as an integer, when it is a whole number.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Value::Number(n)
+                if n.fract() == 0.0 && *n >= i64::MIN as f64 && *n <= i64::MAX as f64 =>
+            {
+                Some(*n as i64)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Number(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&HashMap<String, Value>> {
+        match self {
+            Value::Object(map) => Some(map),
+            _ => None,
+        }
+    }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    pub fn is_bool(&self) -> bool {
+        matches!(self, Value::Bool(_))
+    }
+
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Number(_))
+    }
+
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::String(_))
+    }
+
+    pub fn is_array(&self) -> bool {
+        matches!(self, Value::Array(_))
+    }
+
+    pub fn is_object(&self) -> bool {
+        matches!(self, Value::Object(_))
+    }
+}
+
 /// Per-turn execution context passed to every tool call: who the persona is,
-/// which conversation the turn belongs to, how to route outbound messages,
-/// and how to request user approval.
+/// how to route outbound messages, and how to request user approval. It is
+/// **conversation-agnostic** — conversation-bound tools (e.g. `reply`) carry
+/// their own conversation id and are registered per conversation.
 #[derive(Clone)]
 pub struct ToolContext {
     pub persona_name: String,
@@ -31,8 +106,6 @@ pub struct ToolContext {
     pub manager: Arc<ConversationManager>,
     pub request_id: Option<String>,
     pub permissions: Arc<PermissionRegistry>,
-    /// The user-visible conversation this turn belongs to (adapter-assigned).
-    pub conversation_id: Option<String>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -40,26 +113,20 @@ impl std::fmt::Debug for ToolContext {
         f.debug_struct("ToolContext")
             .field("persona_name", &self.persona_name)
             .field("request_id", &self.request_id)
-            .field("conversation_id", &self.conversation_id)
             .finish()
     }
 }
 
 impl ToolContext {
     /// Send a permission request to the user and await their decision.
+    /// `conversation_id` identifies the chat to ask in; conversation-bound
+    /// tools know it from their own construction.
     /// Returns `true` if approved, `false` if denied or on timeout.
-    pub async fn request_permission(&self, prompt: String) -> bool {
+    pub async fn request_permission(&self, conversation_id: &str, prompt: String) -> bool {
         let (id, rx) = self.permissions.register().await;
-        if let Some(conversation_id) = &self.conversation_id {
-            self.manager
-                .send_permission(
-                    conversation_id,
-                    &id,
-                    &prompt,
-                    self.request_id.clone(),
-                )
-                .await;
-        }
+        self.manager
+            .send_permission(conversation_id, &id, &prompt, self.request_id.clone())
+            .await;
         rx.await.unwrap_or(false)
     }
 }
@@ -99,7 +166,11 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> ToolParams;
-    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String>;
+    /// Execute the tool with parsed, validated arguments. The session layer
+    /// resolves the model's raw JSON arguments against [`Tool::parameters`]
+    /// before calling; values are core's own [`Value`], mirroring the
+    /// declared JSON Schema property types.
+    async fn run(&self, args: HashMap<String, Value>, ctx: ToolContext) -> Result<String>;
 }
 
 /// Default in-memory tool registry, shareable across session managers and
@@ -182,7 +253,11 @@ mod tests {
             ToolParams::object(HashMap::new(), vec![])
         }
 
-        async fn run(&self, _args: &str, _ctx: ToolContext) -> Result<String> {
+        async fn run(
+            &self,
+            _args: HashMap<String, Value>,
+            _ctx: ToolContext,
+        ) -> Result<String> {
             Ok("ok".to_string())
         }
     }

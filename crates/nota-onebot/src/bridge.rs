@@ -126,16 +126,12 @@ impl OneBotBridge {
 
     /// Register every OneBot tool into `registry`. Fails on a name
     /// collision so startup aborts instead of shadowing an existing tool.
-    pub fn register_tools(&self, registry: &ToolRegistry) -> anyhow::Result<()> {
-        registry.register(Arc::new(OneBotSendMsgTool))?;
-        registry.register(Arc::new(OneBotGetMsgHistoryTool::new(self.api())))?;
-        registry.register(Arc::new(OneBotGetContentTool::new(self.api())))?;
-        registry.register(Arc::new(OneBotStatusTool::new(
-            self.api(),
-            self.cfg.ws_url.clone(),
-        )))?;
-        registry.register(Arc::new(OneBotVoiceTextTool::new(self.api())))?;
-        Ok(())
+    pub fn register_tools(
+        &self,
+        registry: &ToolRegistry,
+        conversation_id: Option<String>,
+    ) -> anyhow::Result<()> {
+        register_onebot_tools(registry, self.api(), &self.cfg.ws_url, conversation_id)
     }
 
     /// Run the bridge forever: deliver inbound events to the persona inbox
@@ -466,6 +462,26 @@ impl OneBotBridge {
             }
         }
     }
+}
+
+/// Register every OneBot tool into a per-conversation registry. The `api`
+/// handle and `ws_url` come from a bridge; `conversation_id` is baked into
+/// the send tool so outbound events can be traced back for approval.
+pub fn register_onebot_tools(
+    registry: &ToolRegistry,
+    api: OneBotApi,
+    ws_url: &str,
+    conversation_id: Option<String>,
+) -> anyhow::Result<()> {
+    registry.register(Arc::new(OneBotSendMsgTool::new(conversation_id)))?;
+    registry.register(Arc::new(OneBotGetMsgHistoryTool::new(api.clone())))?;
+    registry.register(Arc::new(OneBotGetContentTool::new(api.clone())))?;
+    registry.register(Arc::new(OneBotStatusTool::new(
+        api.clone(),
+        ws_url.to_string(),
+    )))?;
+    registry.register(Arc::new(OneBotVoiceTextTool::new(api)))?;
+    Ok(())
 }
 
 impl OneBotBridge {

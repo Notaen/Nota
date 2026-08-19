@@ -1,46 +1,144 @@
 //! Persona runtime: the conversation layer that turns inbound chat messages
 //! into session turns.
 //!
-//! It holds the core [`SessionManager`] abstraction (the concrete SQLite
-//! manager lives in `nota-llm` and is injected by the composition root) and
-//! knows nothing about the LLM client or the turn loop: for every inbound
-//! message it resolves the conversation's current session (or creates one)
-//! and feeds the content in. Slash commands (`//clear`, `//allow_read`) are
-//! handled here, before anything reaches the session: `//clear` archives the
-//! current session and starts a fresh one.
+//! It is the **caller** of the core [`SessionManager`] abstraction: sessions
+//! are conversation-agnostic (flat uuid files), so this runtime owns the
+//! conversation → session mapping. For every conversation it lazily creates
+//! one session manager rooted at that conversation's directory and injects
+//! the conversation's tool set (including a conversation-bound `reply` tool)
+//! through the injected `make_manager` closure. The current session id per
+//! conversation is persisted in `current.json` inside the conversation
+//! directory; `//clear` archives the current session and starts a fresh one.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
 use nota_core::conversation::{Conversation, ConversationManager};
 use nota_core::permissions::PathPolicy;
 use nota_core::persona::Persona;
-use nota_core::session::SessionManager;
+use nota_core::session::{Session, SessionManager};
+use serde::{Deserialize, Serialize};
+
+/// Builds the session manager for one conversation (rooted at the
+/// conversation's directory, with the conversation's tool set). Injected by
+/// the composition root — `nota-infra` itself never references the llm crate.
+pub type ManagerFactory =
+    Arc<dyn Fn(&str) -> Result<Arc<dyn SessionManager>> + Send + Sync>;
+
+#[derive(Serialize, Deserialize)]
+struct CurrentSession {
+    session_id: String,
+}
 
 pub struct PersonaRuntime {
     persona: Persona,
-    session_manager: Arc<dyn SessionManager>,
+    make_manager: ManagerFactory,
     manager: Arc<ConversationManager>,
     policy: Arc<PathPolicy>,
+    conversations_root: PathBuf,
+    managers: Mutex<HashMap<String, Arc<dyn SessionManager>>>,
 }
 
 impl PersonaRuntime {
     pub fn new(
         persona: Persona,
-        session_manager: Arc<dyn SessionManager>,
+        make_manager: ManagerFactory,
         manager: Arc<ConversationManager>,
         policy: Arc<PathPolicy>,
+        conversations_root: PathBuf,
     ) -> Self {
         Self {
             persona,
-            session_manager,
+            make_manager,
             manager,
             policy,
+            conversations_root,
+            managers: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn name(&self) -> &str {
         &self.persona.name
+    }
+
+    fn current_path(&self, conversation_id: &str) -> PathBuf {
+        self.conversations_root
+            .join(conversation_id)
+            .join("current.json")
+    }
+
+    fn manager_for(&self, conversation_id: &str) -> Result<Arc<dyn SessionManager>> {
+        if let Some(manager) = self
+            .managers
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .cloned()
+        {
+            return Ok(manager);
+        }
+        let manager = (self.make_manager)(conversation_id)?;
+        self.managers
+            .lock()
+            .unwrap()
+            .insert(conversation_id.to_string(), manager.clone());
+        Ok(manager)
+    }
+
+    async fn read_current(&self, conversation_id: &str) -> Result<Option<String>> {
+        let path = self.current_path(conversation_id);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => match serde_json::from_str::<CurrentSession>(&content) {
+                Ok(current) if !current.session_id.is_empty() => Ok(Some(current.session_id)),
+                _ => {
+                    log::warn!("invalid current session file: {}", path.display());
+                    Ok(None)
+                }
+            },
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn save_current(&self, conversation_id: &str, id: &str) -> Result<()> {
+        let path = self.current_path(conversation_id);
+        tokio::fs::write(
+            &path,
+            serde_json::to_string(&CurrentSession {
+                session_id: id.to_string(),
+            })?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// The current session of a conversation, creating one on first contact
+    /// and persisting the pointer.
+    async fn resolve_current_session(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Arc<dyn Session>> {
+        let manager = self.manager_for(conversation_id)?;
+        if let Some(current) = self.read_current(conversation_id).await?
+            && let Some(session) = manager.load(&current).await?
+        {
+            return Ok(session);
+        }
+        let session = manager.create().await?;
+        self.save_current(conversation_id, session.id()).await?;
+        Ok(session)
+    }
+
+    /// Every session of a conversation, oldest first (active + archived),
+    /// for the chatlog API. Unknown conversations return an empty list.
+    pub async fn sessions(&self, conversation_id: &str) -> Result<Vec<Arc<dyn Session>>> {
+        let dir = self.conversations_root.join(conversation_id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let manager = self.manager_for(conversation_id)?;
+        manager.list().await
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -62,17 +160,8 @@ impl PersonaRuntime {
                 continue;
             }
 
-            let session = match self.session_manager.current(&conversation_id).await {
-                Ok(Some(session)) => session,
-                Ok(None) => match self.session_manager.create(&conversation_id).await {
-                    Ok(session) => session,
-                    Err(e) => {
-                        log::error!(
-                            "failed to create session for conversation '{conversation_id}': {e:#}"
-                        );
-                        continue;
-                    }
-                },
+            let session = match self.resolve_current_session(&conversation_id).await {
+                Ok(session) => session,
                 Err(e) => {
                     log::error!(
                         "failed to resolve session for conversation '{conversation_id}': {e:#}"
@@ -92,14 +181,20 @@ impl PersonaRuntime {
         let conversation_id = conversation.conversation_id.clone();
         match cmd {
             SlashCommand::Clear => {
-                if let Ok(Some(current)) = self.session_manager.current(&conversation_id).await
-                    && let Err(e) = self.session_manager.archive(current.id()).await
-                {
-                    log::warn!("//clear archive failed: {e:#}");
+                let result = async {
+                    let manager = self.manager_for(&conversation_id)?;
+                    if let Some(current) = self.read_current(&conversation_id).await?
+                        && let Some(session) = manager.load(&current).await?
+                    {
+                        manager.archive(session.id()).await?;
+                    }
+                    let session = manager.create().await?;
+                    self.save_current(&conversation_id, session.id()).await?;
+                    Ok::<(), anyhow::Error>(())
                 }
-                match self.session_manager.create(&conversation_id).await {
-                    Ok(_) => {}
-                    Err(e) => log::warn!("//clear session creation failed: {e:#}"),
+                .await;
+                if let Err(e) = result {
+                    log::warn!("//clear failed: {e:#}");
                 }
                 self.manager
                     .route_outbound(

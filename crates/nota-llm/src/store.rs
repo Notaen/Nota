@@ -5,7 +5,8 @@
 //! `<session_id>.db` files, so a caller can give each conversation its own
 //! directory and clean up a whole conversation by removing that directory.
 //! Each file holds the session's metadata (`meta`) and its dialogue items
-//! (`messages`) verbatim as OpenAI-style message items (JSON).
+//! (`item`) as typed rows: `message` / `reasoning` / `tool_call` /
+//! `tool_call_output`, with per-type columns.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,13 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use nota_core::session::SessionItem;
+use nota_core::session::{MessageRole, SessionItem, ToolCall, ToolCallKind};
+
+/// `item.type` values (`0` reserved, mirroring the core enums).
+const ITEM_MESSAGE: i64 = 1;
+const ITEM_REASONING: i64 = 2;
+const ITEM_TOOL_CALL: i64 = 3;
+const ITEM_TOOL_CALL_OUTPUT: i64 = 4;
 
 pub struct SqliteSessionStore {
     dir: PathBuf,
@@ -73,6 +80,12 @@ impl SqliteSessionStore {
                 "INSERT INTO meta (key, value) VALUES ('seq', ?1)",
                 params![seq.to_string()],
             )?;
+            // Program version of the writer, so a future release can detect
+            // older session files and convert them.
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('version', ?1)",
+                params![env!("CARGO_PKG_VERSION")],
+            )?;
             Ok(())
         })?;
         Ok(id)
@@ -122,9 +135,21 @@ impl SqliteSessionStore {
         self.with_conn(&session_id, |conn| {
             let tx = conn.unchecked_transaction()?;
             for item in items {
+                let ItemRow {
+                    ty,
+                    role,
+                    content,
+                    kind,
+                    call_id,
+                    name,
+                    arguments,
+                    output,
+                } = item_row(item);
                 tx.execute(
-                    "INSERT INTO messages (item, timestamp) VALUES (?1, ?2)",
-                    params![serde_json::to_string(item)?, now],
+                    "INSERT INTO item \
+                     (type, role, content, kind, call_id, name, arguments, output, timestamp) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![ty, role, content, kind, call_id, name, arguments, output, now],
                 )?;
             }
             tx.commit()?;
@@ -146,17 +171,40 @@ impl SqliteSessionStore {
     pub async fn read_raw(&self, session_id: &str) -> Result<Vec<(i64, SessionItem)>> {
         let session_id = session_id.to_string();
         self.with_conn(&session_id, |conn| {
-            let mut stmt = conn.prepare("SELECT id, item FROM messages ORDER BY id")?;
+            let mut stmt = conn.prepare(
+                "SELECT id, type, role, content, kind, call_id, name, arguments, output \
+                 FROM item ORDER BY id",
+            )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (id, raw) = row?;
-                match serde_json::from_str::<SessionItem>(&raw) {
-                    Ok(item) => out.push((id, item)),
-                    Err(e) => log::warn!("skipping unparseable session item: {e}"),
-                }
+                let (id, ty, role, content, kind, call_id, name, arguments, output) = row?;
+                let Some(item) = row_to_item(ItemRow {
+                    ty,
+                    role,
+                    content,
+                    kind,
+                    call_id,
+                    name,
+                    arguments,
+                    output,
+                }) else {
+                    log::warn!("skipping unparseable session item row {id}");
+                    continue;
+                };
+                out.push((id, item));
             }
             Ok(out)
         })
@@ -241,12 +289,112 @@ fn ensure_schema(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS messages (
+        CREATE TABLE IF NOT EXISTS item (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item TEXT NOT NULL,
+            type INTEGER NOT NULL,
+            role INTEGER,
+            content TEXT,
+            kind INTEGER,
+            call_id TEXT,
+            name TEXT,
+            arguments TEXT,
+            output TEXT,
             timestamp INTEGER NOT NULL
         );
         ",
     )?;
     Ok(())
+}
+
+/// The `item` row columns for a session item: the `type` plus per-kind
+/// payload fields.
+struct ItemRow {
+    ty: i64,
+    role: Option<i64>,
+    content: Option<String>,
+    kind: Option<i64>,
+    call_id: Option<String>,
+    name: Option<String>,
+    arguments: Option<String>,
+    output: Option<String>,
+}
+
+fn item_row(item: &SessionItem) -> ItemRow {
+    match item {
+        SessionItem::Message { role, content } => ItemRow {
+            ty: ITEM_MESSAGE,
+            role: Some(*role as u8 as i64),
+            content: Some(content.clone()),
+            kind: None,
+            call_id: None,
+            name: None,
+            arguments: None,
+            output: None,
+        },
+        SessionItem::Reasoning { content } => ItemRow {
+            ty: ITEM_REASONING,
+            role: None,
+            content: Some(content.clone()),
+            kind: None,
+            call_id: None,
+            name: None,
+            arguments: None,
+            output: None,
+        },
+        SessionItem::ToolCall(call) => ItemRow {
+            ty: ITEM_TOOL_CALL,
+            role: None,
+            content: None,
+            kind: Some(call.kind as u8 as i64),
+            call_id: Some(call.id.clone()),
+            name: call.name.clone(),
+            arguments: call.arguments.clone(),
+            output: None,
+        },
+        SessionItem::ToolCallOutput { call_id, output } => ItemRow {
+            ty: ITEM_TOOL_CALL_OUTPUT,
+            role: None,
+            content: None,
+            kind: None,
+            call_id: Some(call_id.clone()),
+            name: None,
+            arguments: None,
+            output: Some(output.clone()),
+        },
+    }
+}
+
+/// Rebuild a `SessionItem` from `item` row columns; `None` on an unknown
+/// type or an invalid role/kind number.
+fn row_to_item(row: ItemRow) -> Option<SessionItem> {
+    let ItemRow {
+        ty,
+        role,
+        content,
+        kind,
+        call_id,
+        name,
+        arguments,
+        output,
+    } = row;
+    match ty {
+        ITEM_MESSAGE => Some(SessionItem::Message {
+            role: MessageRole::try_from(role? as u8).ok()?,
+            content: content.unwrap_or_default(),
+        }),
+        ITEM_REASONING => Some(SessionItem::Reasoning {
+            content: content.unwrap_or_default(),
+        }),
+        ITEM_TOOL_CALL => Some(SessionItem::ToolCall(ToolCall {
+            id: call_id.unwrap_or_default(),
+            kind: ToolCallKind::try_from(kind? as u8).ok()?,
+            name,
+            arguments,
+        })),
+        ITEM_TOOL_CALL_OUTPUT => Some(SessionItem::ToolCallOutput {
+            call_id: call_id.unwrap_or_default(),
+            output: output.unwrap_or_default(),
+        }),
+        _ => None,
+    }
 }

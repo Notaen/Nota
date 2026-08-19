@@ -37,29 +37,79 @@ impl Serialize for MessageRole {
     }
 }
 
-impl<'de> Deserialize<'de> for MessageRole {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let n = u8::deserialize(d)?;
+impl TryFrom<u8> for MessageRole {
+    type Error = anyhow::Error;
+
+    fn try_from(n: u8) -> Result<Self, Self::Error> {
         match n {
             1 => Ok(MessageRole::User),
             2 => Ok(MessageRole::Assistant),
             3 => Ok(MessageRole::Context),
-            _ => Err(D::Error::custom(format!("invalid message role: {n}"))),
+            _ => Err(anyhow::anyhow!("invalid message role: {n}")),
         }
     }
 }
 
-/// A tool call requested by the model, to be executed by the session.
+impl<'de> Deserialize<'de> for MessageRole {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let n = u8::deserialize(d)?;
+        MessageRole::try_from(n).map_err(D::Error::custom)
+    }
+}
+
+/// The kind of a tool call, mirroring the provider's output item types.
+/// Stored as a plain number (`0` reserved, `1` function_call,
+/// `2` web_search_call) like [`MessageRole`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ToolCallKind {
+    /// An ordinary function call: the session executes the matching tool.
+    FunctionCall = 1,
+    /// A built-in `web_search` call: the provider executes it server-side,
+    /// so the session records it but runs nothing.
+    WebSearchCall = 2,
+}
+
+impl Serialize for ToolCallKind {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u8(*self as u8)
+    }
+}
+
+impl TryFrom<u8> for ToolCallKind {
+    type Error = anyhow::Error;
+
+    fn try_from(n: u8) -> Result<Self, Self::Error> {
+        match n {
+            1 => Ok(ToolCallKind::FunctionCall),
+            2 => Ok(ToolCallKind::WebSearchCall),
+            _ => Err(anyhow::anyhow!("invalid tool call kind: {n}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolCallKind {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let n = u8::deserialize(d)?;
+        ToolCallKind::try_from(n).map_err(D::Error::custom)
+    }
+}
+
+/// A tool call requested by the model. Fields are per-kind: function calls
+/// carry `name` / `arguments`; built-in calls such as `web_search` carry
+/// the call id and, when the provider returns one, the search query as
+/// `arguments` (`{"query": …}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
-    pub name: String,
-    pub arguments: String,
+    pub kind: ToolCallKind,
+    pub name: Option<String>,
+    pub arguments: Option<String>,
 }
 
-/// One unit of a dialogue, mirroring the OpenAI message-item model: text
-/// messages (`{role, content}`), function calls, and function outputs.
-/// Sessions store items verbatim in this JSON shape.
+/// One unit of a dialogue, mirroring the provider's output item model: text
+/// messages, reasoning, tool calls, and tool outputs. Sessions store items
+/// in this shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionItem {
@@ -67,8 +117,13 @@ pub enum SessionItem {
         role: MessageRole,
         content: String,
     },
-    FunctionCall(ToolCall),
-    FunctionCallOutput {
+    /// Model reasoning text, persisted for the record but never re-sent as
+    /// input.
+    Reasoning {
+        content: String,
+    },
+    ToolCall(ToolCall),
+    ToolCallOutput {
         call_id: String,
         output: String,
     },
@@ -76,10 +131,12 @@ pub enum SessionItem {
 
 /// One LLM-level dialogue. The caller's only interaction is feeding new
 /// content (`send`) and reading history; everything else — the LLM call, the
-/// tool loop, the per-session execution context — is internal.
+/// tool loop, the per-session execution context — is internal. Sessions are
+/// **conversation-agnostic**: a plain uuid id and flat storage; mapping
+/// conversations to sessions is the caller's job.
 #[async_trait]
 pub trait Session: Send + Sync {
-    /// The session id, unique within its manager (conversation-namespaced).
+    /// The session id (a plain uuid), unique within its manager.
     fn id(&self) -> &str;
 
     /// Creation time of this session (Unix millis), from its metadata.
@@ -94,25 +151,24 @@ pub trait Session: Send + Sync {
     async fn raw_history(&self) -> Result<Vec<(i64, SessionItem)>>;
 }
 
-/// Owns the sessions of one conversation scope. The concrete implementation
-/// is supplied with a storage path, the system prompt, and the shared tool
-/// registry at construction; tools are resolved live from the registry on
-/// every call, so mutating the registry takes effect immediately.
+/// Owns the sessions of one scope (typically one persona). The concrete
+/// implementation is supplied with a storage path, the system prompt, and
+/// the shared tool registry at construction; tools are resolved live from
+/// the registry on every call, so mutating the registry takes effect
+/// immediately. Sessions are conversation-agnostic: plain uuid ids and flat
+/// files — mapping conversations to sessions is the caller's job.
 #[async_trait]
 pub trait SessionManager: Send + Sync {
-    /// Create a fresh session for a conversation and make it the current one.
-    async fn create(&self, conversation_id: &str) -> Result<Arc<dyn Session>>;
-
-    /// The current session of a conversation, if a pointer exists.
-    async fn current(&self, conversation_id: &str) -> Result<Option<Arc<dyn Session>>>;
+    /// Create a fresh session.
+    async fn create(&self) -> Result<Arc<dyn Session>>;
 
     /// Load an existing session by id, or `None` if it does not exist.
     async fn load(&self, id: &str) -> Result<Option<Arc<dyn Session>>>;
 
-    /// Archive a session (e.g. `//clear`): it stays readable via `list` /
-    /// `load` but is no longer current.
+    /// Archive a session: it stays readable via `list` / `load` but is no
+    /// longer current (a caller-side concern).
     async fn archive(&self, id: &str) -> Result<()>;
 
-    /// Every session of a conversation, oldest first (active + archived).
-    async fn list(&self, conversation_id: &str) -> Result<Vec<Arc<dyn Session>>>;
+    /// Every session, oldest first (active + archived).
+    async fn list(&self) -> Result<Vec<Arc<dyn Session>>>;
 }

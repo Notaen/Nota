@@ -169,9 +169,12 @@ reference it.
 - **Dependency graph**: `nota-cli → nota-infra → nota-core`,
   `nota-cli → nota-llm → nota-core`, `nota-cli → nota-onebot → nota-core`.
   `nota-infra`/`nota-onebot` dropped the llm dependency; `nota-cli` gained it
-  (composition root). Infra's `PersonaRuntime` holds `Arc<dyn SessionManager>`
-  and only calls `current/create/send`; the chatlog API reads history through
-  the same abstraction.
+  (composition root). `PersonaRuntime` is the **conversation layer**: it
+  lazily creates one session manager per conversation (via an injected
+  factory) with that conversation's tool set — including a conversation-bound
+  `reply` tool whose `conversation_id` is baked into the struct, so the
+  session and `ToolContext` never reference conversations. The chatlog API
+  reads history through the same runtime.
 
 ## History & storage
 
@@ -181,14 +184,22 @@ reference it.
   read generically by filename; `solo.md`/`memory.md` are conveniences.
 - **Sessions are one SQLite file each** (`rusqlite` bundled, owned by
   `nota-llm`), stored as `<uuid>.db` under
-  `~/.nota/conversation/<persona>/<conversation_id>/` (delete the
-  conversation dir to wipe it). Each file has a `meta(key, value)` table
-  (`created_at`, monotonic `seq`, `response_id`, `archived`) and a
-  `messages(id, item, timestamp)` table. The current session id lives in
-  `current.json` (`{"session_id": "…"}`) in the same directory, written by
-  the session manager. `//clear` archives the old session and creates a
-  fresh one — nothing is deleted. The raw history of **all** sessions of a
-  conversation is served by
+  the manager's root — sessions are **conversation-agnostic** (plain uuid
+  ids, no conversation naming). Each file has a `meta(key, value)` table
+  (`created_at`, monotonic `seq`, `version`, `response_id`, `archived`) and
+  an `item` table (`id, type, role, content, kind, call_id, name, arguments,
+  output, timestamp`) where `type` is a plain number (`0` reserved,
+  `1` message, `2` reasoning, `3` tool_call, `4` tool_call_output) and
+  `tool_call.kind` is also numeric (`1` function_call, `2` web_search_call);
+  per-kind payload columns are used, the rest stay `NULL`. `meta.version`
+  records the writer's program version (`env!("CARGO_PKG_VERSION")`) so a
+  future release can detect old files and convert them.
+  `PersonaRuntime` gives each conversation its own directory
+  (`~/.nota/conversation/<persona>/<conversation_id>/`, delete the
+  conversation dir to wipe it) and writes `current.json`
+  (`{"session_id": "…"}`) inside it. `//clear` archives the old session and
+  creates a fresh one — nothing is deleted. The raw history of **all**
+  sessions of a conversation is served by
   `GET /api/personas/{name}/chatlog/{conversation_id}` as a list of
   `{session_id, created_at, messages: [(row_id, item)]}`.
   Adapter-assigned conversation ids: `onebot_private_<id>` /
@@ -221,16 +232,54 @@ reference it.
   (the Chat Completions path and `Config.api_mode` were removed).
 - System prompt (from `SessionManager` construction) → top-level
   `instructions`; history `SessionItem`s map 1:1 onto `input` items
-  (`Context` items as role `system`); tools use the flat Responses shape
+  (`Context` items as role `system`; `reasoning` items are passed back as
+  `reasoning` input items — DeepSeek thinking mode requires every prior
+  `reasoning_text` to be echoed, including empty ones; `web_search_call`
+  items are passed back as `web_search_call` input items so DeepSeek
+  restores the server-side search results); tools use the flat Responses
+  shape
   `{"type":"function", name, description, parameters}`.
 - DeepSeek requires each `function_call_output` to directly follow its matching
   `function_call`, so the session turn loop emits interleaved pairs
   (`[fc, output, fc, output]`) — adjacency holds by construction.
 - Output parsing: `output[]` message items → reply text; `function_call` →
-  `ToolCall` via `call_id` (fallback `id`); `reasoning` / `web_search_call` /
-  unknown items are ignored.
+  `ToolCall` (kind `function_call`) via `call_id` (fallback `id`);
+  `reasoning` → `LlmResponse.reasoning` (persisted as a `Reasoning` item and
+  echoed back as a `reasoning` input item); `web_search_call` → `ToolCall`
+  (kind `web_search_call`, recorded but never executed locally); unknown
+  items are ignored.
 - Built-in `web_search` tool (DeepSeek executes it server-side) is attached
   when `Config.web_search` (default `true`); the wizard asks for it.
+- **web_search turn loop (2026-08-19)**: a response may contain a
+  `web_search_call` **and** the final text at once. The loop only continues
+  when it executed a local `function_call`; a response with only built-in
+  calls (web_search, …) uses its text and ends the turn instead of issuing a
+  wasteful second request and discarding the answer.
+- **web_search_call persists the query (2026-08-19, user-directed)**: the
+  `web_search_call` output item is stored as a `tool_call` row (kind
+  `web_search_call`) with `name = "web_search"` and `arguments =
+  {"query": …}` taken from `action.query` — the only content the provider
+  returns (results are injected into the model context; DeepSeek ignores
+  `include`, so there is no `tool_call_output` to produce or save). When
+  rebuilding `input`, `web_search_call` items are passed back as-is (type +
+  id + action.query) — DeepSeek restores the search results from the call
+  id, so follow-up turns keep the search context.
+- **Tool args contract (2026-08-19)**: `Tool::run` receives parsed
+  `HashMap<String, Value>` using core's own JSON-like `Value` type (no
+  `serde_json` in core — the llm layer deserializes the model's raw
+  arguments into it), replacing the per-tool `serde_json::from_str(...)`
+  boilerplate. The session validates against the tool's `parameters` before
+  calling — required present, no unknown properties, type and enum match.
+  Rejections are split in two: a diagnostic (provider / model / raw output /
+  reasons) goes to the operator log, while the `function_call_output` handed
+  back to the model re-sends the full tool definition verbatim so it can
+  self-correct.
+- Debug CLI: `cargo run -p nota-llm --example chat -- <args>`
+  (`examples/chat.rs`) creates / loads sessions against a live API; session
+  files land in the current working directory, and missing `--url` /
+  `--model` / `--key` options fall back to `.nota/config.toml` (cwd first,
+  then home) via `nota-infra` as a dev-dependency. Handy for reproducing
+  provider-side issues such as `web_search` handling.
 - Sessions are managed by `nota-llm::SqliteSessionManager` (implements the
   core `SessionManager` trait; created per persona by `nota-cli` with the
   storage root, system prompt, tool registry, and routing/approval ports).

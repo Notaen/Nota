@@ -20,7 +20,7 @@ pub use config::{
 pub use http::{api::ApiState, serve as http_serve, AppContext};
 pub use nota_core::session::{Session, SessionManager};
 pub use nota_core::tool::ToolRegistry;
-pub use persona_runtime::PersonaRuntime;
+pub use persona_runtime::{ManagerFactory, PersonaRuntime};
 pub use persona_store::FilePersonaStore;
 pub use scheduler::TokioScheduler;
 pub use tool::{builtin::register_builtin_tools, chat::register_chat_tools};

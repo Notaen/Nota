@@ -37,12 +37,15 @@ Commits use [Conventional Commits](https://www.conventionalcommits.org/):
   constant injected per request and not stored, while persona context is
   stored as `Context` items), abstracted in `nota-core` (`Session` /
   `SessionManager`) and implemented by `nota-llm`'s `SqliteSessionManager`.
-  Ids are conversation-namespaced (`<conversation_id>/<uuid>`), stored as
-  `<uuid>.db` under `~/.nota/conversation/<persona>/<conversation_id>/`. The
-  manager tracks the current session per conversation (`current.json`) and
-  archives old sessions on `//clear`; callers only `send(content,
-  request_id)` into a session — the turn loop, tools, and delivery are
-  internal to the session.
+  Sessions are **conversation-agnostic**: plain uuid ids, stored flat as
+  `<uuid>.db` under the manager's storage path. `PersonaRuntime` (the
+  conversation layer) gives each conversation its own directory
+  (`~/.nota/conversation/<persona>/<conversation_id>/`), lazily creates one
+  session manager per conversation with its own tool set (including a
+  conversation-bound `reply` tool), and persists the current session id in
+  `current.json` inside that directory; `//clear` archives the old session
+  and starts a fresh one. Callers only `send(content, request_id)` into a
+  session — the turn loop, tools, and delivery are internal to the session.
 - **conversation** = the user-visible chat (OneBot private/group, web) owned by an
   adapter; `nota-core`'s `Conversation` / `ConversationManager` routes by it.
 
@@ -99,23 +102,28 @@ without per-call approval.
 
 ### LLM sessions & caching
 
-The composition root creates one `SqliteSessionManager` per persona with a
-storage root (`~/.nota/conversation/<persona>/`), a fixed system prompt (not
-derived from persona files), the persona context (`solo.md` / `memory.md`,
-seeded into every new session as `Context` items), the shared core
-`ToolRegistry`, and the routing/approval ports, then injects it as
-`Arc<dyn SessionManager>`.
-Sessions are conversation-namespaced (`<conversation_id>/<uuid>`, files at
-`<root>/<conversation_id>/<uuid>.db`); the manager tracks the current session
-per conversation in `current.json` and `archive()` marks old ones on
-`//clear`. Each session stores its last Responses API id in its `meta` table
-(for future stateful providers). Tools are resolved **live** from the
-registry on every call, so registering/unregistering takes effect
-immediately. Roles (`MessageRole`) are stored as plain numbers — `0`
+`nota-cli` (composition root) builds a per-persona manager factory and
+injects it into `PersonaRuntime`; for every conversation the runtime lazily
+creates one `SqliteSessionManager` rooted at the conversation's directory
+(`~/.nota/conversation/<persona>/<conversation_id>/`, flat `<uuid>.db`
+files), with a fixed system prompt (not derived from persona files), the
+persona context (`solo.md` / `memory.md`, seeded into every new session as
+`Context` items), and that conversation's tool set — built-ins, adapter
+tools, and a conversation-bound `reply` tool. The runtime persists the
+current session id in `current.json` inside the directory and `archive()`
+marks old ones on `//clear`. Each session stores its last Responses API id
+in its `meta` table (for future stateful providers). Tools are resolved
+**live** from the registry on every call, so registering/unregistering
+takes effect immediately. Roles (`MessageRole`) are stored as plain numbers
+— `0`
 reserved, `1` user, `2` assistant, `3` context — and the llm crate maps them
 to provider string roles only when building a request (the system prompt is a
 `SessionManager` constructor argument sent as `instructions`, never a stored
 role; persona `Context` items are emitted as `system` input messages).
+Session dialogue rows live in an `item` table whose `type` is also a plain
+number (`1` message, `2` reasoning, `3` tool_call, `4` tool_call_output;
+`tool_call.kind` distinguishes `function_call` / `web_search_call`), and
+`meta.version` stores the writer's program version for future conversions.
 DeepSeek's Responses endpoint is stateless, so cost savings rely on its
 automatic prefix cache: keep the request prefix byte-identical (stored
 history order, tool list sorted by name). Cache hit/miss tokens are logged

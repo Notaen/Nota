@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use nota_core::session::{MessageRole, SessionItem, ToolCall};
+use nota_core::session::{MessageRole, SessionItem, ToolCall, ToolCallKind};
 use nota_core::tool::ToolParams;
 
 // ── LLM-facing wire shapes (internal) ────────────────────────────────
@@ -25,6 +25,10 @@ pub struct LlmResponse {
     /// Saved per session for future stateful continuations.
     pub id: Option<String>,
     pub content: Option<String>,
+    /// Reasoning text emitted by the model (e.g. DeepSeek `reasoning`
+    /// items), persisted per session and passed back verbatim on subsequent
+    /// requests — DeepSeek's thinking mode requires it.
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
@@ -60,6 +64,9 @@ enum ResponsesInputItem {
         role: String,
         content: Vec<ResponsesContentPart>,
     },
+    Reasoning {
+        content: Vec<ResponsesContentPart>,
+    },
     FunctionCall {
         call_id: String,
         name: String,
@@ -69,13 +76,31 @@ enum ResponsesInputItem {
         call_id: String,
         output: String,
     },
+    WebSearchCall {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<ResponsesWebSearchCallAction>,
+    },
 }
 
 #[derive(Serialize, Debug, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 enum ResponsesContentPart {
-    InputText { text: String },
-    OutputText { text: String },
+    #[serde(rename = "input_text")]
+    Input { text: String },
+    #[serde(rename = "output_text")]
+    Output { text: String },
+    #[serde(rename = "reasoning_text")]
+    Reasoning { text: String },
+}
+
+/// The action payload of a `web_search_call` input item: the query that was
+/// searched. Passing the call back as-is lets DeepSeek restore the
+/// server-side search results on later turns.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesWebSearchCallAction {
+    WebSearchCallAction { query: String },
 }
 
 /// Tools in the Responses API. Function tools are flat (`type`, `name`,
@@ -133,6 +158,49 @@ enum ResponsesOutputItem {
         name: String,
         arguments: String,
     },
+    Reasoning {
+        #[serde(default)]
+        content: Vec<ResponsesReasoningPart>,
+        #[serde(default)]
+        summary: Vec<ResponsesSummaryPart>,
+    },
+    WebSearchCall {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        action: Option<WebSearchCallAction>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// The action payload of a `web_search_call` output item: the provider runs
+/// the search server-side, so only the query is returned to the client.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WebSearchCallAction {
+    WebSearchCallAction {
+        #[serde(default)]
+        query: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Reasoning text parts inside a `reasoning` output item.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesReasoningPart {
+    ReasoningText { text: String },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Summary text parts inside a `reasoning` output item.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResponsesSummaryPart {
+    SummaryText { text: String },
     #[serde(other)]
     Unknown,
 }
@@ -208,6 +276,8 @@ impl OpenAiLlm {
         }
 
         let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut reasoning_present = false;
         let mut tool_calls = Vec::new();
 
         for item in parsed.output {
@@ -233,7 +303,46 @@ impl OpenAiLlm {
                     };
                     tool_calls.push(ToolCall {
                         id: call_id,
-                        name,
+                        kind: ToolCallKind::FunctionCall,
+                        name: Some(name),
+                        arguments: Some(arguments),
+                    });
+                }
+                ResponsesOutputItem::Reasoning { content: parts, summary } => {
+                    // Keep even empty reasoning: DeepSeek thinking mode
+                    // requires every prior reasoning item to be passed back,
+                    // including empty ones on tool-call turns.
+                    reasoning_present = true;
+                    for part in parts {
+                        if let ResponsesReasoningPart::ReasoningText { text } = part {
+                            reasoning.push_str(&text);
+                        }
+                    }
+                    for part in summary {
+                        if let ResponsesSummaryPart::SummaryText { text } = part {
+                            reasoning.push_str(&text);
+                        }
+                    }
+                }
+                ResponsesOutputItem::WebSearchCall { id, action } => {
+                    let Some(id) = id else {
+                        log::warn!("Responses API returned web_search_call without an id");
+                        continue;
+                    };
+                    // The search runs server-side; the only content returned
+                    // is the query. Save it as the call's arguments for the
+                    // record — there is no tool_call_output (the results are
+                    // injected into the model context, not returned).
+                    let arguments = match action {
+                        Some(WebSearchCallAction::WebSearchCallAction {
+                            query: Some(query),
+                        }) => Some(serde_json::json!({ "query": query }).to_string()),
+                        _ => None,
+                    };
+                    tool_calls.push(ToolCall {
+                        id,
+                        kind: ToolCallKind::WebSearchCall,
+                        name: Some("web_search".to_string()),
                         arguments,
                     });
                 }
@@ -255,9 +364,12 @@ impl OpenAiLlm {
             );
         }
 
+        let reasoning = reasoning_present.then_some(reasoning);
+
         Ok(LlmResponse {
             id: parsed.id,
             content,
+            reasoning,
             tool_calls,
         })
     }
@@ -303,10 +415,10 @@ fn to_responses_input(items: &[SessionItem]) -> Vec<ResponsesInputItem> {
             SessionItem::Message { role, content } => {
                 let role = wire_role(*role)?;
                 let part = match role {
-                    "user" | "system" => ResponsesContentPart::InputText {
+                    "user" | "system" => ResponsesContentPart::Input {
                         text: content.clone(),
                     },
-                    "assistant" => ResponsesContentPart::OutputText {
+                    "assistant" => ResponsesContentPart::Output {
                         text: content.clone(),
                     },
                     _ => unreachable!("wire_role only returns user/assistant/system"),
@@ -316,12 +428,38 @@ fn to_responses_input(items: &[SessionItem]) -> Vec<ResponsesInputItem> {
                     content: vec![part],
                 })
             }
-            SessionItem::FunctionCall(call) => Some(ResponsesInputItem::FunctionCall {
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                arguments: call.arguments.clone(),
+            SessionItem::Reasoning { content } => Some(ResponsesInputItem::Reasoning {
+                content: vec![ResponsesContentPart::Reasoning {
+                    text: content.clone(),
+                }],
             }),
-            SessionItem::FunctionCallOutput { call_id, output } => {
+            SessionItem::ToolCall(call) if call.kind == ToolCallKind::FunctionCall => {
+                let (Some(name), Some(arguments)) = (&call.name, &call.arguments) else {
+                    log::warn!("function_call item missing name or arguments; skipped");
+                    return None;
+                };
+                Some(ResponsesInputItem::FunctionCall {
+                    call_id: call.id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                })
+            }
+            // Pass built-in web_search calls back as input items: DeepSeek
+            // restores the server-side search results from the call id, so
+            // follow-up turns keep the search context.
+            SessionItem::ToolCall(call) if call.kind == ToolCallKind::WebSearchCall => {
+                let action = call.arguments.as_deref().and_then(|raw| {
+                    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+                    let query = value.get("query")?.as_str()?.to_string();
+                    Some(ResponsesWebSearchCallAction::WebSearchCallAction { query })
+                });
+                Some(ResponsesInputItem::WebSearchCall {
+                    id: call.id.clone(),
+                    action,
+                })
+            }
+            SessionItem::ToolCall(_) => None,
+            SessionItem::ToolCallOutput { call_id, output } => {
                 Some(ResponsesInputItem::FunctionCallOutput {
                     call_id: call_id.clone(),
                     output: output.clone(),
@@ -363,21 +501,23 @@ mod tests {
         // is immediately followed by its function_call_output.
         let items = vec![
             msg(MessageRole::User, "hi"),
-            SessionItem::FunctionCall(ToolCall {
+            SessionItem::ToolCall(ToolCall {
                 id: "call_A".to_string(),
-                name: "foo".to_string(),
-                arguments: "{}".to_string(),
+                kind: ToolCallKind::FunctionCall,
+                name: Some("foo".to_string()),
+                arguments: Some("{}".to_string()),
             }),
-            SessionItem::FunctionCallOutput {
+            SessionItem::ToolCallOutput {
                 call_id: "call_A".to_string(),
                 output: "result A".to_string(),
             },
-            SessionItem::FunctionCall(ToolCall {
+            SessionItem::ToolCall(ToolCall {
                 id: "call_B".to_string(),
-                name: "bar".to_string(),
-                arguments: "{}".to_string(),
+                kind: ToolCallKind::FunctionCall,
+                name: Some("bar".to_string()),
+                arguments: Some("{}".to_string()),
             }),
-            SessionItem::FunctionCallOutput {
+            SessionItem::ToolCallOutput {
                 call_id: "call_B".to_string(),
                 output: "result B".to_string(),
             },
@@ -388,8 +528,10 @@ mod tests {
             .iter()
             .map(|item| match item {
                 ResponsesInputItem::Message { .. } => "message",
+                ResponsesInputItem::Reasoning { .. } => "reasoning",
                 ResponsesInputItem::FunctionCall { .. } => "function_call",
                 ResponsesInputItem::FunctionCallOutput { .. } => "function_call_output",
+                ResponsesInputItem::WebSearchCall { .. } => "web_search_call",
             })
             .collect();
 
@@ -548,6 +690,11 @@ mod tests {
             "status": "completed",
             "output": [
                 {
+                    "type": "reasoning",
+                    "summary": [{ "type": "summary_text", "text": "step by step" }],
+                    "content": [{ "type": "reasoning_text", "text": "keep going" }],
+                },
+                {
                     "type": "message",
                     "role": "assistant",
                     "content": [{ "type": "output_text", "text": "hi there" }],
@@ -565,12 +712,14 @@ mod tests {
                     "name": "other",
                     "arguments": "{}",
                 },
+                { "type": "web_search_call", "id": "ws_1" },
                 { "type": "reasoning", "summary": [] },
             ]
         });
 
         let parsed: ResponsesResponse = serde_json::from_value(body).unwrap();
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut calls = Vec::new();
         for item in parsed.output {
             match item {
@@ -590,17 +739,198 @@ mod tests {
                     let id = call_id.or(id).expect("call id");
                     calls.push(ToolCall {
                         id,
-                        name,
+                        kind: ToolCallKind::FunctionCall,
+                        name: Some(name),
+                        arguments: Some(arguments),
+                    });
+                }
+                ResponsesOutputItem::WebSearchCall { id, action } => {
+                    let arguments = match action {
+                        Some(WebSearchCallAction::WebSearchCallAction {
+                            query: Some(query),
+                        }) => Some(serde_json::json!({ "query": query }).to_string()),
+                        _ => None,
+                    };
+                    calls.push(ToolCall {
+                        id: id.expect("web_search call id"),
+                        kind: ToolCallKind::WebSearchCall,
+                        name: Some("web_search".to_string()),
                         arguments,
                     });
+                }
+                ResponsesOutputItem::Reasoning { content: parts, summary } => {
+                    for part in parts {
+                        if let ResponsesReasoningPart::ReasoningText { text } = part {
+                            reasoning.push_str(&text);
+                        }
+                    }
+                    for part in summary {
+                        if let ResponsesSummaryPart::SummaryText { text } = part {
+                            reasoning.push_str(&text);
+                        }
+                    }
                 }
                 ResponsesOutputItem::Unknown => {}
             }
         }
 
         assert_eq!(content, "hi there");
-        assert_eq!(calls.len(), 2);
+        assert_eq!(reasoning, "keep goingstep by step");
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].kind, ToolCallKind::FunctionCall);
         assert_eq!(calls[1].id, "fc_2");
+        assert_eq!(calls[2].id, "ws_1");
+        assert_eq!(calls[2].kind, ToolCallKind::WebSearchCall);
+    }
+
+    #[test]
+    fn parses_web_search_call_action_query_as_arguments() {
+        let body = serde_json::json!({
+            "status": "completed",
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {
+                        "type": "web_search_call_action",
+                        "query": "today's weather in shanghai",
+                    },
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_2",
+                    "action": { "type": "web_search_call_action" },
+                },
+            ]
+        });
+
+        let parsed: ResponsesResponse = serde_json::from_value(body).unwrap();
+        let mut calls = Vec::new();
+        for item in parsed.output {
+            if let ResponsesOutputItem::WebSearchCall { id, action } = item {
+                let arguments = match action {
+                    Some(WebSearchCallAction::WebSearchCallAction {
+                        query: Some(query),
+                    }) => Some(serde_json::json!({ "query": query }).to_string()),
+                    _ => None,
+                };
+                calls.push(ToolCall {
+                    id: id.expect("web_search call id"),
+                    kind: ToolCallKind::WebSearchCall,
+                    name: Some("web_search".to_string()),
+                    arguments,
+                });
+            }
+        }
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "ws_1");
+        assert_eq!(calls[0].kind, ToolCallKind::WebSearchCall);
+        assert_eq!(calls[0].name.as_deref(), Some("web_search"));
+        assert_eq!(
+            calls[0].arguments.as_deref(),
+            Some(r#"{"query":"today's weather in shanghai"}"#)
+        );
+        // A call without a query is still recorded, just without arguments.
+        assert_eq!(calls[1].id, "ws_2");
+        assert_eq!(calls[1].arguments, None);
+    }
+
+    #[test]
+    fn input_passes_back_reasoning_and_web_search_call() {
+        let items = vec![
+            SessionItem::Reasoning {
+                content: "think".to_string(),
+            },
+            SessionItem::ToolCall(ToolCall {
+                id: "ws_1".to_string(),
+                kind: ToolCallKind::WebSearchCall,
+                name: Some("web_search".to_string()),
+                arguments: Some(r#"{"query":"news"}"#.to_string()),
+            }),
+            SessionItem::ToolCall(ToolCall {
+                id: "call_1".to_string(),
+                kind: ToolCallKind::FunctionCall,
+                name: Some("foo".to_string()),
+                arguments: Some("{}".to_string()),
+            }),
+            SessionItem::ToolCallOutput {
+                call_id: "call_1".to_string(),
+                output: "ok".to_string(),
+            },
+        ];
+
+        let wire = to_responses_input(&items);
+        assert_eq!(wire.len(), 4);
+        assert!(matches!(
+            &wire[0],
+            ResponsesInputItem::Reasoning { content } if matches!(
+                &content[..],
+                [ResponsesContentPart::Reasoning { text }] if text == "think"
+            )
+        ));
+        assert!(matches!(
+            &wire[1],
+            ResponsesInputItem::WebSearchCall { id, .. } if id == "ws_1"
+        ));
+        assert!(matches!(
+            &wire[2],
+            ResponsesInputItem::FunctionCall { call_id, .. } if call_id == "call_1"
+        ));
+        assert!(matches!(
+            &wire[3],
+            ResponsesInputItem::FunctionCallOutput { call_id, .. } if call_id == "call_1"
+        ));
+    }
+
+    #[test]
+    fn web_search_call_serializes_back_with_action_query() {
+        let items = vec![
+            SessionItem::ToolCall(ToolCall {
+                id: "ws_1".to_string(),
+                kind: ToolCallKind::WebSearchCall,
+                name: Some("web_search".to_string()),
+                arguments: Some(r#"{"query":"today's weather"}"#.to_string()),
+            }),
+            SessionItem::ToolCall(ToolCall {
+                id: "ws_2".to_string(),
+                kind: ToolCallKind::WebSearchCall,
+                name: Some("web_search".to_string()),
+                arguments: None,
+            }),
+        ];
+        let value = serde_json::to_value(to_responses_input(&items)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "action": {
+                        "type": "web_search_call_action",
+                        "query": "today's weather",
+                    },
+                },
+                { "type": "web_search_call", "id": "ws_2" },
+            ])
+        );
+    }
+
+    #[test]
+    fn reasoning_serializes_as_reasoning_input_item() {
+        let wire = to_responses_input(&[SessionItem::Reasoning {
+            content: "think".to_string(),
+        }]);
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "type": "reasoning",
+                    "content": [{ "type": "reasoning_text", "text": "think" }],
+                },
+            ])
+        );
     }
 }

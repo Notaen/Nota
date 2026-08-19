@@ -8,20 +8,36 @@ use chrono::DateTime;
 use nota_core::conversation::Conversation;
 use nota_core::permissions::PathPolicy;
 use nota_core::scheduler::Scheduler;
-use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry};
+use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, ToolRegistry, Value};
 
 pub struct FileReadTool {
     personas_dir: PathBuf,
     policy: Arc<PathPolicy>,
+    conversation_id: Option<String>,
 }
 
 impl FileReadTool {
-    pub fn new(personas_dir: PathBuf, policy: Arc<PathPolicy>) -> Self {
-        Self { personas_dir, policy }
+    pub fn new(
+        personas_dir: PathBuf,
+        policy: Arc<PathPolicy>,
+        conversation_id: Option<String>,
+    ) -> Self {
+        Self {
+            personas_dir,
+            policy,
+            conversation_id,
+        }
     }
 
     fn workspace(&self, name: &str) -> PathBuf {
         self.personas_dir.join(name)
+    }
+
+    async fn ask_permission(&self, ctx: &ToolContext, prompt: String) -> bool {
+        match &self.conversation_id {
+            Some(conversation_id) => ctx.request_permission(conversation_id, prompt).await,
+            None => false,
+        }
     }
 }
 
@@ -48,10 +64,14 @@ impl Tool for FileReadTool {
         ToolParams::object(props, vec!["path".to_string()])
     }
 
-    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let rel = args["path"]
-            .as_str()
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        ctx: ToolContext,
+    ) -> Result<String> {
+        let rel = args
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'path' argument"))?;
 
         let workspace = self.workspace(&ctx.persona_name);
@@ -70,7 +90,7 @@ impl Tool for FileReadTool {
                             ctx.persona_name,
                             resolved.display()
                         );
-                        let approved = ctx.request_permission(prompt).await;
+                        let approved = self.ask_permission(&ctx, prompt).await;
                         if !approved {
                             anyhow::bail!("permission denied");
                         }
@@ -88,7 +108,7 @@ impl Tool for FileReadTool {
                 ctx.persona_name,
                 resolved.display()
             );
-            let approved = ctx.request_permission(prompt).await;
+            let approved = self.ask_permission(&ctx, prompt).await;
             if !approved {
                 anyhow::bail!("permission denied");
             }
@@ -101,11 +121,15 @@ impl Tool for FileReadTool {
 
 pub struct FileWriteTool {
     personas_dir: PathBuf,
+    conversation_id: Option<String>,
 }
 
 impl FileWriteTool {
-    pub fn new(personas_dir: PathBuf) -> Self {
-        Self { personas_dir }
+    pub fn new(personas_dir: PathBuf, conversation_id: Option<String>) -> Self {
+        Self {
+            personas_dir,
+            conversation_id,
+        }
     }
 
     fn workspace(&self, name: &str) -> PathBuf {
@@ -144,13 +168,18 @@ impl Tool for FileWriteTool {
         ToolParams::object(props, vec!["path".to_string(), "content".to_string()])
     }
 
-    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let rel = args["path"]
-            .as_str()
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        ctx: ToolContext,
+    ) -> Result<String> {
+        let rel = args
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'path' argument"))?;
-        let content = args["content"]
-            .as_str()
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("missing 'content' argument"))?;
 
         let workspace = self.workspace(&ctx.persona_name);
@@ -173,7 +202,10 @@ impl Tool for FileWriteTool {
                 ctx.persona_name,
                 resolved.display()
             );
-            let approved = ctx.request_permission(prompt).await;
+            let approved = match &self.conversation_id {
+                Some(conversation_id) => ctx.request_permission(conversation_id, prompt).await,
+                None => false,
+            };
             if !approved {
                 anyhow::bail!("permission denied");
             }
@@ -189,11 +221,15 @@ impl Tool for FileWriteTool {
 
 pub struct ScheduleTool {
     scheduler: Arc<dyn Scheduler>,
+    conversation_id: Option<String>,
 }
 
 impl ScheduleTool {
-    pub fn new(scheduler: Arc<dyn Scheduler>) -> Self {
-        Self { scheduler }
+    pub fn new(scheduler: Arc<dyn Scheduler>, conversation_id: Option<String>) -> Self {
+        Self {
+            scheduler,
+            conversation_id,
+        }
     }
 }
 
@@ -231,19 +267,24 @@ impl Tool for ScheduleTool {
         )
     }
 
-    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let message = args["message"]
-            .as_str()
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        ctx: ToolContext,
+    ) -> Result<String> {
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'message'"))?;
-        let trigger_at = args["trigger_at"]
-            .as_str()
+        let trigger_at = args
+            .get("trigger_at")
+            .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing 'trigger_at'"))?;
         let parsed = DateTime::parse_from_rfc3339(trigger_at)
             .map_err(|e| anyhow::anyhow!("invalid trigger_at (expected ISO 8601): {e}"))?;
-        let conversation_id = ctx
+        let conversation_id = self
             .conversation_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no conversation available for scheduling"))?;
@@ -257,19 +298,21 @@ impl Tool for ScheduleTool {
 
 pub struct StatusTool {
     started: std::time::Instant,
+    conversation_id: Option<String>,
 }
 
 impl StatusTool {
-    pub fn new() -> Self {
+    pub fn new(conversation_id: Option<String>) -> Self {
         Self {
             started: std::time::Instant::now(),
+            conversation_id,
         }
     }
 }
 
 impl Default for StatusTool {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -287,7 +330,11 @@ impl Tool for StatusTool {
         ToolParams::object(HashMap::new(), vec![])
     }
 
-    async fn run(&self, _args: &str, ctx: ToolContext) -> Result<String> {
+    async fn run(
+        &self,
+        _args: HashMap<String, Value>,
+        ctx: ToolContext,
+    ) -> Result<String> {
         let status = serde_json::json!({
             "name": "nota",
             "version": env!("CARGO_PKG_VERSION"),
@@ -299,7 +346,7 @@ impl Tool for StatusTool {
             "pid": std::process::id(),
             "uptime_secs": self.started.elapsed().as_secs(),
             "persona": ctx.persona_name,
-            "conversation_id": ctx.conversation_id,
+            "conversation_id": self.conversation_id,
             "request_id": ctx.request_id,
         });
         Ok(serde_json::to_string_pretty(&status)?)
@@ -311,13 +358,18 @@ pub fn register_builtin_tools(
     personas_dir: PathBuf,
     scheduler: Arc<dyn Scheduler>,
     policy: Arc<PathPolicy>,
+    conversation_id: Option<String>,
 ) -> Result<()> {
     registry.register(Arc::new(FileReadTool::new(
         personas_dir.clone(),
         policy.clone(),
+        conversation_id.clone(),
     )))?;
-    registry.register(Arc::new(FileWriteTool::new(personas_dir)))?;
-    registry.register(Arc::new(ScheduleTool::new(scheduler)))?;
-    registry.register(Arc::new(StatusTool::new()))?;
+    registry.register(Arc::new(FileWriteTool::new(
+        personas_dir,
+        conversation_id.clone(),
+    )))?;
+    registry.register(Arc::new(ScheduleTool::new(scheduler, conversation_id.clone())))?;
+    registry.register(Arc::new(StatusTool::new(conversation_id)))?;
     Ok(())
 }

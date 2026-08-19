@@ -32,9 +32,10 @@ axum/reqwest/tungstenite/rusqlite and holds no LLM wire types. See
 - **session** = one LLM-level dialogue (OpenAI-style message items: messages
   and tool calls/results), abstracted in `nota-core` (`Session` /
   `SessionManager`) and implemented by `nota-llm`'s `SqliteSessionManager`.
-  Ids are conversation-namespaced (`<conversation_id>/<uuid>`), one SQLite
-  file per session. The manager tracks the current session per conversation
-  (`current.json`) and archives old ones on `//clear`; callers only
+  Ids are **plain uuids** — sessions are conversation-agnostic, one flat
+  SQLite file per session. The conversation layer (`PersonaRuntime`) maps
+  conversations to sessions and persists the current one in `current.json`;
+  `//clear` archives the old session and starts a fresh one. Callers only
   `send(content, request_id)` into a session.
 - **conversation** = the user-visible chat (OneBot private/group, web) owned by an
   adapter; `nota-core` routes by conversation. A conversation can rotate
@@ -109,14 +110,15 @@ other's messages.
 
 ## LLM Sessions
 
-`nota-cli` creates one `SqliteSessionManager` per persona (storage root
-`~/.nota/conversation/<persona>/`, a fixed system prompt plus the persona
-context from `solo.md` / `memory.md`, shared core `ToolRegistry`,
-routing/approval ports) and injects it as `Arc<dyn SessionManager>`. Sessions are
-conversation-namespaced (`<conversation_id>/<uuid>`, files at
-`<root>/<conversation_id>/<uuid>.db`); the manager tracks the current session
-per conversation in `current.json`, and `//clear` archives the old session
-and creates a fresh one. Roles are plain numbers (`0` reserved, `1` user,
+`nota-cli` builds a per-persona manager factory (fixed system prompt plus
+the persona context from `solo.md` / `memory.md`, routing/approval ports)
+and injects it into `PersonaRuntime`. Sessions are **conversation-
+agnostic**: `PersonaRuntime` lazily creates one `SqliteSessionManager` per
+conversation, rooted at that conversation's directory (flat `<uuid>.db`
+files), with its own tool set — built-ins, adapter tools, and a
+conversation-bound `reply` tool — and persists the current session id in
+`current.json` inside the directory; `//clear` archives the old session and
+creates a fresh one. Roles are plain numbers (`0` reserved, `1` user,
 `2` assistant, `3` context); the system prompt is a `SessionManager`
 constructor argument, never a stored role. Persona context is seeded as
 `Context` items and emitted as `system` input messages, and the llm crate

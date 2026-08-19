@@ -21,9 +21,10 @@ cargo run -p nota-cli -- onboard     # configure API + create a persona
 cargo check                          # type-check
 cargo check -p nota-core             # type-check single crate
 cargo clippy --all-targets           # lint
+cargo test --workspace               # run all tests
 ```
 
-No tests, no CI exists in this repo.
+Tests live next to the code (unit tests per crate); there is no CI yet.
 
 ## Cross-compilation (linux-arm64)
 
@@ -65,7 +66,7 @@ and `nota-onebot` hold the core abstractions (`SessionManager` / `Tool` /
 |-------|--------------|
 | `nota-core` | Domain types + port traits (`PersonaStore`, `Scheduler`, `SessionManager`/`Session`), `ConversationManager` (user-visible chat routing), `PermissionRegistry`, `PathPolicy`, and the tool contract (`Tool`/`ToolContext`/`ToolParams`/`ToolRegistry`, in-memory). Pure: no I/O deps, no LLM wire types. |
 | `nota-llm` | Concrete session manager (`SqliteSessionManager`, implements core `SessionManager`; one `<uuid>.db` per session; runs the whole turn — LLM call + tool loop — internally) and the internal Responses API client. No public `LlmClient`/`AgentRunner`; only `nota-cli` references this crate. |
-| `nota-infra` | Adapters: `axum` HTTP (REST + WebSocket), filesystem persona store, `PersonaRuntime` (conversation → session turn + slash commands), TOML config, built-in tools (registered on the shared core `ToolRegistry`), scheduler. |
+| `nota-infra` | Adapters: `axum` HTTP (REST + WebSocket), filesystem persona store, `PersonaRuntime` (the conversation layer: lazily creates one session manager per conversation, owns conversation → session mapping + `current.json`, slash commands), TOML config, built-in tools, scheduler. |
 | `nota-onebot` | OneBot 11 forward-WS transport: `OnebotConfig`, protocol types, WS client, bus bridge, `onebot_*` tools. Depends only on `nota-core`. |
 | `nota-cli` | Binary (`nota`). Wires adapters into core, subcommands `onboard` / (default) run server. |
 
@@ -74,12 +75,16 @@ and `nota-onebot` hold the core abstractions (`SessionManager` / `Tool` /
 - **session** = one LLM-level dialogue (OpenAI-style message items, system
   prompt excluded), abstracted in `nota-core` (`Session` / `SessionManager`)
   and implemented by `nota-llm`'s `SqliteSessionManager`. Ids are
-  conversation-namespaced (`<conversation_id>/<uuid>`), stored as
-  `<uuid>.db` under `~/.nota/conversation/<persona>/<conversation_id>/`, so a
-  whole conversation can be cleaned up by removing its directory. The
-  manager tracks the current session per conversation (`current.json`) and
-  archives old ones on `//clear`. Callers only `send(content, request_id)`
-  into a session — the turn loop, tools, and delivery are internal.
+  **plain uuids** — sessions are conversation-agnostic and stored flat as
+  `<uuid>.db` under the manager's storage path. `PersonaRuntime` gives each
+  conversation its own directory (`~/.nota/conversation/<persona>/<conversation_id>/`
+  with flat `<uuid>.db` files), persists the current session id in
+  `current.json` inside that directory, and `//clear` archives the old
+  session and starts a fresh one. Each conversation's manager is created
+  with its own tool set, including a conversation-bound `reply` tool —
+  sessions never know which conversation they belong to. Callers only
+  `send(content, request_id)` into a session — the turn loop, tools, and
+  delivery are internal.
 - **conversation** = the user-visible chat (OneBot private/group, web) owned by an
   adapter; core routes by conversation.
 
@@ -102,8 +107,12 @@ they belong in `CONTRIBUTING.md` and `.agent/`.
 - **Do not delete or modify comments** without understanding them. Chinese comments are authoritative.
 - **Keep core pure**: never add `axum`, `reqwest`, `serde_json`, `tracing`,
   `dialoguer`, `dirs`, `walkdir`, `tokio-tungstenite`, `rusqlite` to
-  `nota-core`. `tokio` (sync only) and `serde` are fine. LLM wire types and
-  I/O (Responses API, SQLite) live in `nota-llm`; the session and tool
+  `nota-core`. `tokio` (sync only) and `serde` are fine. The `Tool` contract
+  carries parsed arguments as `HashMap<String, Value>` using core's own
+  JSON-like `Value` type (mirroring `serde_json::Value`'s shape; the llm
+  layer deserializes the model's raw arguments into it and validates them
+  against the tool's `parameters` before calling). LLM wire types and I/O
+  (Responses API, SQLite) live in `nota-llm`; the session and tool
   abstractions live in `nota-core`.
 - **Domain types over generic wrappers**: `nota-core` defines its own types for domain concepts (e.g. `ToolParams`, `PropertyDef` for JSON Schema). Do NOT use `serde_json::Value` or raw `String` as parameter types — model the domain directly. Serialization to/from JSON happens at the infra boundary.
 - **Logging boundary**: core/infra use `log::*` facade; only `nota-cli` uses `tracing`. `tracing-log::LogTracer` bridges them.

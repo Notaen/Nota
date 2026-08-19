@@ -2,7 +2,7 @@ use std::fs::create_dir_all;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use chrono::Local;
@@ -28,9 +28,9 @@ use nota_core::scheduler::Scheduler;
 use nota_core::session::SessionManager;
 use nota_core::tool::ToolRegistry;
 use nota_llm::{LlmConfig, SqliteSessionManager};
-use nota_onebot::{OneBotBridge, OnebotConfig};
+use nota_onebot::{OneBotBridge, OnebotConfig, register_onebot_tools};
 use nota_infra::{
-    ApiState, AppContext, ConfigStore, FilePersonaStore, PersonaRuntime,
+    ApiState, AppContext, ConfigStore, FilePersonaStore, ManagerFactory, PersonaRuntime,
     TokioScheduler, http_serve, register_builtin_tools, register_chat_tools,
 };
 
@@ -208,14 +208,11 @@ async fn run_server(
     let manager = Arc::new(ConversationManager::new());
     let scheduler: Arc<dyn Scheduler> = Arc::new(TokioScheduler::new(manager.clone()));
 
-    let tool_registry: Arc<ToolRegistry> = Arc::new(ToolRegistry::new());
-    register_builtin_tools(
-        tool_registry.as_ref(),
-        base.join("personas"),
-        scheduler.clone(),
-        path_policy.clone(),
-    )?;
-    register_chat_tools(&tool_registry)?;
+    // One conversation = one session manager, rooted at the conversation's
+    // directory, with a tool set that includes that conversation's `reply`
+    // tool. The OneBot bridge fills its tools into a shared slot once it
+    // starts, so lazily created per-conversation registries can include them.
+    let onebot_registrar: ToolRegistrarSlot = Arc::new(Mutex::new(None));
 
     let persona_names = persona_store.list_personas().await?;
     if persona_names.is_empty() {
@@ -224,33 +221,36 @@ async fn run_server(
         );
     }
 
-    let mut session_managers: HashMap<String, Arc<dyn SessionManager>> = HashMap::new();
+    let mut persona_runtimes: HashMap<String, Arc<PersonaRuntime>> = HashMap::new();
     for name in &persona_names {
         let context = build_context_prompt(persona_store.as_ref(), name).await;
-        let session_manager: Arc<dyn SessionManager> = Arc::new(SqliteSessionManager::new(
-            &base.join("conversation").join(name),
-            name.clone(),
+        let conversations_root = base.join("conversation").join(name);
+        let make_manager = build_manager_factory(
+            base,
+            name,
             SYSTEM_PROMPT.to_string(),
             context,
-            tool_registry.clone(),
             manager.clone(),
             permissions.clone(),
+            scheduler.clone(),
+            path_policy.clone(),
             LlmConfig {
                 api_url: config.api_url.clone(),
                 api_key: config.api_key.clone(),
                 model: config.model.clone(),
                 web_search: config.web_search,
             },
-        )?);
-        session_managers.insert(name.clone(), session_manager.clone());
+            onebot_registrar.clone(),
+        )?;
 
-        let persona = Persona { name: name.clone() };
         let runtime = Arc::new(PersonaRuntime::new(
-            persona,
-            session_manager,
+            Persona { name: name.clone() },
+            make_manager,
             manager.clone(),
             path_policy.clone(),
+            conversations_root,
         ));
+        persona_runtimes.insert(name.clone(), runtime.clone());
 
         let persona_loop_runtime = runtime.clone();
         tokio::spawn(async move { persona_loop_runtime.run().await });
@@ -265,7 +265,7 @@ async fn run_server(
             manager.clone(),
             permissions.clone(),
             persona_store.clone(),
-            tool_registry.clone(),
+            onebot_registrar.clone(),
             onebot,
         )
         .await?;
@@ -275,7 +275,7 @@ async fn run_server(
     let config_arc = Arc::new(tokio::sync::RwLock::new(config));
     let api_state = Arc::new(ApiState {
         persona_store,
-        session_managers,
+        persona_runtimes,
         config: config_arc,
         config_path,
     });
@@ -296,12 +296,71 @@ async fn run_server(
     Ok(())
 }
 
+/// Registers one adapter's tools (e.g. OneBot) on a per-conversation tool
+/// registry, given that conversation's id.
+type ToolRegistrar = Arc<dyn Fn(&ToolRegistry, Option<String>) -> Result<()> + Send + Sync>;
+/// Shared slot filled once the OneBot bridge starts.
+type ToolRegistrarSlot = Arc<Mutex<Option<ToolRegistrar>>>;
+
+/// Build the per-conversation manager factory for one persona: each
+/// conversation gets its own directory (flat `<uuid>.db` sessions) and its
+/// own tool set — built-ins, adapter tools, and a conversation-bound
+/// `reply` tool.
+#[allow(clippy::too_many_arguments)]
+fn build_manager_factory(
+    base: &Path,
+    persona_name: &str,
+    system: String,
+    context: String,
+    manager: Arc<ConversationManager>,
+    permissions: Arc<PermissionRegistry>,
+    scheduler: Arc<dyn Scheduler>,
+    policy: Arc<PathPolicy>,
+    config: LlmConfig,
+    onebot_registrar: ToolRegistrarSlot,
+) -> Result<ManagerFactory> {
+    let conversations_root = base.join("conversation").join(persona_name);
+    let personas_dir = base.join("personas");
+    let persona = persona_name.to_string();
+    let manager = manager.clone();
+    let permissions = permissions.clone();
+    let scheduler = scheduler.clone();
+    let policy = policy.clone();
+    let config = config.clone();
+    let onebot_registrar = onebot_registrar.clone();
+    Ok(Arc::new(move |conversation_id: &str| -> Result<Arc<dyn SessionManager>> {
+        let root = conversations_root.join(conversation_id);
+        let tools = Arc::new(ToolRegistry::new());
+        register_builtin_tools(
+            &tools,
+            personas_dir.clone(),
+            scheduler.clone(),
+            policy.clone(),
+            Some(conversation_id.to_string()),
+        )?;
+        if let Some(registrar) = onebot_registrar.lock().unwrap().clone() {
+            registrar(&tools, Some(conversation_id.to_string()))?;
+        }
+        register_chat_tools(&tools, conversation_id)?;
+        Ok(Arc::new(SqliteSessionManager::new(
+            &root,
+            persona.clone(),
+            system.clone(),
+            context.clone(),
+            tools,
+            manager.clone(),
+            permissions.clone(),
+            config.clone(),
+        )?))
+    }))
+}
+
 /// Wire the OneBot 11 adapter: resolve the target persona and start the bridge.
 async fn start_onebot(
     manager: Arc<ConversationManager>,
     permissions: Arc<PermissionRegistry>,
     persona_store: Arc<dyn PersonaStore>,
-    tool_registry: Arc<ToolRegistry>,
+    onebot_registrar: ToolRegistrarSlot,
     cfg: &OnebotConfig,
 ) -> Result<()> {
     if cfg.mode != "ws" {
@@ -329,7 +388,12 @@ async fn start_onebot(
     };
 
     let bridge = OneBotBridge::new(manager, permissions, persona.clone(), cfg.clone());
-    bridge.register_tools(&tool_registry)?;
+    let api = bridge.api();
+    let ws_url = cfg.ws_url.clone();
+    let registrar: ToolRegistrar = Arc::new(move |registry: &ToolRegistry, conversation_id| {
+        register_onebot_tools(registry, api.clone(), &ws_url, conversation_id)
+    });
+    *onebot_registrar.lock().unwrap() = Some(registrar);
     tokio::spawn(async move { bridge.run().await });
     info!(
         "OneBot bridge started (mode={}, url={}, persona={persona})",

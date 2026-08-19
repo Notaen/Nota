@@ -8,16 +8,18 @@ use axum::{
     routing::{delete, get},
 };
 use nota_core::persona::PersonaStore;
-use nota_core::session::{SessionItem, SessionManager};
+use nota_core::session::SessionItem;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::config::{Config, ConfigStore};
+use crate::persona_runtime::PersonaRuntime;
 
 pub struct ApiState {
     pub persona_store: Arc<dyn PersonaStore>,
-    /// Per-persona session managers, assembled by the composition root.
-    pub session_managers: HashMap<String, Arc<dyn SessionManager>>,
+    /// Per-persona runtimes (conversation layer), assembled by the
+    /// composition root.
+    pub persona_runtimes: HashMap<String, Arc<PersonaRuntime>>,
     pub config: Arc<RwLock<Config>>,
     pub config_path: std::path::PathBuf,
 }
@@ -142,12 +144,12 @@ async fn read_history(
     State(state): State<Arc<ApiState>>,
     Path((name, conversation_id)): Path<(String, String)>,
 ) -> Result<Json<Vec<SessionLog>>, (StatusCode, Json<ErrorBody>)> {
-    let session_manager = state
-        .session_managers
+    let runtime = state
+        .persona_runtimes
         .get(&name)
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("persona not found: {name}")))?;
-    let sessions = session_manager
-        .list(&conversation_id)
+    let sessions = runtime
+        .sessions(&conversation_id)
         .await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut logs = Vec::new();

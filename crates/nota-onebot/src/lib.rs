@@ -13,7 +13,7 @@ pub mod tools;
 pub mod types;
 
 pub use api::OneBotApi;
-pub use bridge::{OneBotBridge, Outbound};
+pub use bridge::{OneBotBridge, Outbound, register_onebot_tools};
 pub use config::OnebotConfig;
 pub use tools::{
     OneBotGetContentTool, OneBotGetMsgHistoryTool, OneBotSendMsgTool, OneBotStatusTool,

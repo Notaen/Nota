@@ -19,4 +19,6 @@ tokio = { workspace = true, features = ["fs", "sync"] }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+nota-infra = { path = "../nota-infra" }
+toml.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "sync"] }

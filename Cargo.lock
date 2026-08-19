@@ -1227,11 +1227,13 @@ dependencies = [
  "chrono",
  "log",
  "nota-core",
+ "nota-infra",
  "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "uuid",
 ]
 

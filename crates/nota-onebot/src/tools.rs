@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::TimeZone;
-use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams};
+use nota_core::tool::{PropertyDef, Tool, ToolContext, ToolParams, Value};
 
 use crate::api::OneBotApi;
 use crate::types::{
@@ -28,8 +28,23 @@ const FRIEND_HISTORY_HINT: &str =
 /// conversation bus; the bridge enforces the allowlist and the user
 /// approval round-trip for non-allowlisted targets. Positioning: chats
 /// OTHER than the current one — reply in the current chat with `reply`.
-#[derive(Default)]
-pub struct OneBotSendMsgTool;
+/// Send a message to a specific OneBot chat. Carries the conversation this
+/// session belongs to, so outbound events can be traced back for approval.
+pub struct OneBotSendMsgTool {
+    conversation_id: Option<String>,
+}
+
+impl OneBotSendMsgTool {
+    pub fn new(conversation_id: Option<String>) -> Self {
+        Self { conversation_id }
+    }
+}
+
+impl Default for OneBotSendMsgTool {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 #[async_trait]
 impl Tool for OneBotSendMsgTool {
@@ -66,23 +81,28 @@ impl Tool for OneBotSendMsgTool {
         ToolParams::object(props, vec!["target".to_string(), "content".to_string()])
     }
 
-    async fn run(&self, args: &str, ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let target = args["target"]
-            .as_str()
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        ctx: ToolContext,
+    ) -> Result<String> {
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
             .filter(|t| is_valid_target(t))
             .ok_or_else(|| {
                 anyhow::anyhow!("missing or invalid 'target' (expected private:<id> or group:<id>)")
             })?
             .to_string();
-        let content = args["content"]
-            .as_str()
+        let content = args
+            .get("content")
+            .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("missing or empty 'content'"))?;
 
         ctx.manager
             .route_outbound(
-                ctx.conversation_id.as_deref(),
+                self.conversation_id.as_deref(),
                 Some(&target),
                 content,
                 ctx.request_id.clone(),
@@ -148,10 +168,14 @@ impl Tool for OneBotGetMsgHistoryTool {
         ToolParams::object(props, vec!["target".to_string()])
     }
 
-    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let target = args["target"]
-            .as_str()
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        _ctx: ToolContext,
+    ) -> Result<String> {
+        let target = args
+            .get("target")
+            .and_then(|v| v.as_str())
             .filter(|t| is_valid_target(t))
             .ok_or_else(|| {
                 anyhow::anyhow!("missing or invalid 'target' (expected private:<id> or group:<id>)")
@@ -247,12 +271,15 @@ impl Tool for OneBotGetContentTool {
         ToolParams::object(props, vec!["message_id".to_string()])
     }
 
-    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let message_id = args["message_id"]
-            .as_str()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .or_else(|| args["message_id"].as_i64())
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        _ctx: ToolContext,
+    ) -> Result<String> {
+        let message_id = args
+            .get("message_id")
+            .and_then(|v| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            .or_else(|| args.get("message_id").and_then(|v| v.as_i64()))
             .ok_or_else(|| anyhow::anyhow!("missing or invalid 'message_id'"))?;
 
         let resp = self
@@ -319,7 +346,11 @@ impl Tool for OneBotStatusTool {
         ToolParams::object(HashMap::new(), Vec::new())
     }
 
-    async fn run(&self, _args: &str, _ctx: ToolContext) -> Result<String> {
+    async fn run(
+        &self,
+        _args: HashMap<String, Value>,
+        _ctx: ToolContext,
+    ) -> Result<String> {
         let connected = self.api.is_connected();
         let (mut user_id, mut nickname) = (0i64, String::new());
         if connected {
@@ -377,12 +408,15 @@ impl Tool for OneBotVoiceTextTool {
         ToolParams::object(props, vec!["message_id".to_string()])
     }
 
-    async fn run(&self, args: &str, _ctx: ToolContext) -> Result<String> {
-        let args: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-        let message_id = args["message_id"]
-            .as_str()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .or_else(|| args["message_id"].as_i64())
+    async fn run(
+        &self,
+        args: HashMap<String, Value>,
+        _ctx: ToolContext,
+    ) -> Result<String> {
+        let message_id = args
+            .get("message_id")
+            .and_then(|v| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+            .or_else(|| args.get("message_id").and_then(|v| v.as_i64()))
             .ok_or_else(|| anyhow::anyhow!("missing or invalid 'message_id'"))?;
 
         // NapCat 的语音转写偶尔会因语音尚未处理完而临时失败，重试几次再放弃。
@@ -452,6 +486,10 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
+    fn args(json: &str) -> HashMap<String, Value> {
+        serde_json::from_str(json).unwrap()
+    }
+
     fn tool_ctx() -> ToolContext {
         let manager = Arc::new(ConversationManager::new());
         ToolContext {
@@ -459,7 +497,6 @@ mod tests {
             manager,
             request_id: None,
             permissions: Arc::new(PermissionRegistry::new()),
-            conversation_id: Some("onebot_private_42".to_string()),
         }
     }
 
@@ -531,11 +568,11 @@ mod tests {
 
     #[tokio::test]
     async fn onebot_send_msg_routes_target_event() {
-        let tool = OneBotSendMsgTool;
+        let tool = OneBotSendMsgTool::new(Some("onebot_private_42".to_string()));
         let context = tool_ctx();
         let mut rx = context.manager.subscribe_adapter("onebot");
 
-        tool.run(r#"{"target":"group:30003","content":"yo"}"#, context)
+        tool.run(args(r#"{"target":"group:30003","content":"yo"}"#), context)
             .await
             .unwrap();
 
@@ -550,9 +587,9 @@ mod tests {
 
     #[tokio::test]
     async fn onebot_send_msg_rejects_bad_target() {
-        let tool = OneBotSendMsgTool;
+        let tool = OneBotSendMsgTool::default();
         let err = tool
-            .run(r#"{"target":"bogus","content":"yo"}"#, tool_ctx())
+            .run(args(r#"{"target":"bogus","content":"yo"}"#), tool_ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("target"));
@@ -587,7 +624,7 @@ mod tests {
         });
 
         let out = tool
-            .run(r#"{"target":"group:30003","limit":10}"#, tool_ctx())
+            .run(args(r#"{"target":"group:30003","limit":10}"#), tool_ctx())
             .await
             .unwrap();
         assert!(out.contains("Recent messages in group:30003"));
@@ -617,7 +654,7 @@ mod tests {
         });
 
         let out = tool
-            .run(r#"{"target":"private:10001"}"#, tool_ctx())
+            .run(args(r#"{"target":"private:10001"}"#), tool_ctx())
             .await
             .unwrap();
         assert_eq!(out, "chat private:10001 has no readable recent messages");
@@ -645,7 +682,7 @@ mod tests {
             .unwrap();
         });
 
-        let out = tool.run("{}", tool_ctx()).await.unwrap();
+        let out = tool.run(HashMap::new(), tool_ctx()).await.unwrap();
         assert!(out.contains("QQ 20002 (Nota)"));
         assert!(out.contains("connected: true"));
         assert!(out.contains("ws://127.0.0.1:3001"));
@@ -684,8 +721,8 @@ mod tests {
             .unwrap();
         });
 
-        let out = tool
-            .run(r#"{"message_id":"99"}"#, tool_ctx())
+          let out = tool
+            .run(args(r#"{"message_id":"99"}"#), tool_ctx())
             .await
             .unwrap();
         assert_eq!(out, "语音 99 转文字: 今天的天气真好");
@@ -715,8 +752,8 @@ mod tests {
             }
         });
 
-        let err = tool
-            .run(r#"{"message_id":"99"}"#, tool_ctx())
+          let err = tool
+            .run(args(r#"{"message_id":"99"}"#), tool_ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("转写失败（重试 3 次）"));
@@ -759,8 +796,8 @@ mod tests {
             .unwrap();
         });
 
-        let out = tool
-            .run(r#"{"message_id":"1193185804"}"#, tool_ctx())
+          let out = tool
+            .run(args(r#"{"message_id":"1193185804"}"#), tool_ctx())
             .await
             .unwrap();
         assert_eq!(out, "语音 1193185804 转文字: 现在能听见了吗？");
@@ -771,7 +808,7 @@ mod tests {
         let (api, _, _) = test_api();
         let tool = OneBotVoiceTextTool::new(api);
 
-        let err = tool.run("{}", tool_ctx()).await.unwrap_err();
+        let err = tool.run(HashMap::new(), tool_ctx()).await.unwrap_err();
         assert!(err.to_string().contains("message_id"));
     }
 }
