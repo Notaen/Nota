@@ -24,13 +24,19 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use nota_core::conversation::ConversationManager;
 use nota_core::permissions::PermissionRegistry;
-use nota_core::session::{MessageRole, Session, SessionItem, SessionManager, ToolCallKind};
+use nota_core::session::{
+    MessageRole, Session, SessionItem, SessionManager, ToolCall, ToolCallKind,
+};
 use nota_core::tool::{ToolContext, ToolRegistry, Value};
 
 use crate::responses::{ChatLlm, LlmResponse, OpenAiLlm, ToolDef};
 use crate::store::SqliteSessionStore;
 
 const MAX_ITERATIONS: usize = 16;
+/// Reserved name of the conversation-layer `wait` tool. The turn loop treats
+/// a successful call specially: roll the turn back to just the user message,
+/// persist a `Wait` marker as a trace, and stop without any assistant text.
+const WAIT_TOOL_NAME: &str = "wait";
 
 /// LLM provider configuration, passed by the composition root.
 #[derive(Debug, Clone)]
@@ -92,9 +98,13 @@ impl SqliteSession {
             role: MessageRole::User,
             content,
         };
+        // Row boundary of this turn: the `wait` path deletes everything
+        // appended after this point and re-appends only the user message
+        // plus the wait marker, so a held-open turn never pollutes context.
+        let turn_start_row = self.store.last_row_id(&self.id).await?;
         let mut items = self.store.read_items(&self.id).await?;
         items.push(user_item.clone());
-        self.store.append(&self.id, &[user_item]).await?;
+        self.store.append(&self.id, std::slice::from_ref(&user_item)).await?;
 
         let ctx = ToolContext {
             persona_name: self.persona_name.clone(),
@@ -136,14 +146,22 @@ impl SqliteSession {
             // Server-side calls (web_search, ...) may already be answered in
             // this same response, so their text must not be discarded.
             let mut executed_function = false;
+
+            // Persist every call first, then run the tools and persist their
+            // outputs. Grouping mirrors the provider's own response order
+            // (reasoning, all calls, all outputs): DeepSeek reconstructs each
+            // input `function_call` as its own assistant turn, so interleaving
+            // outputs between calls would leave every call after the first
+            // without a preceding reasoning item and fail with "reasoning_text
+            // ... must be passed back". One reasoning item then covers the
+            // whole tool-call turn.
             for tc in &resp.tool_calls {
-                // Each function_call is immediately followed by its
-                // function_call_output: DeepSeek's Responses endpoint
-                // rejects interleaved items between a call and its result.
                 let call_item = SessionItem::ToolCall(tc.clone());
                 items.push(call_item.clone());
                 self.store.append(&self.id, &[call_item]).await?;
+            }
 
+            for tc in &resp.tool_calls {
                 let result = match tc.kind {
                     ToolCallKind::FunctionCall => {
                         executed_function = true;
@@ -184,13 +202,32 @@ impl SqliteSession {
                 };
                 let output_item = SessionItem::ToolCallOutput {
                     call_id: tc.id.clone(),
-                    output: match result {
-                        Ok(out) => out,
+                    output: match &result {
+                        Ok(out) => out.clone(),
                         Err(e) => format!("tool error: {e}"),
                     },
                 };
                 items.push(output_item.clone());
                 self.store.append(&self.id, &[output_item]).await?;
+
+                // A successful `wait` call holds the conversation open:
+                // discard this turn's additions (reasoning, tool calls,
+                // outputs, assistant text), keep the user message plus a
+                // `Wait` marker, and end the turn immediately. The model
+                // will be woken by the next message or the timeout notice.
+                if is_wait_call(tc) && result.is_ok() {
+                    self.store.delete_after(&self.id, turn_start_row).await?;
+                    let wait_item = SessionItem::Wait {
+                        arguments: tc.arguments.clone().unwrap_or_default(),
+                    };
+                    self.store
+                        .append(&self.id, &[user_item.clone(), wait_item])
+                        .await?;
+                    if let Some(id) = last_response_id {
+                        self.store.set_response_id(&self.id, &id).await?;
+                    }
+                    return Ok(());
+                }
             }
 
             if executed_function {
@@ -213,6 +250,10 @@ impl SqliteSession {
         }
         Ok(())
     }
+}
+
+fn is_wait_call(tc: &ToolCall) -> bool {
+    tc.kind == ToolCallKind::FunctionCall && tc.name.as_deref() == Some(WAIT_TOOL_NAME)
 }
 
 #[async_trait]
@@ -623,18 +664,26 @@ mod tests {
     #[tokio::test]
     async fn send_runs_tool_loop_with_live_registry() {
         let root = temp_root("tools");
-        // First call: tool call; second call: final content.
+        // First call: two tool calls; second call: final content.
         let llm = Arc::new(MockLlm::new(vec![
             LlmResponse {
                 id: Some("r1".to_string()),
                 content: None,
                 reasoning: None,
-                tool_calls: vec![ToolCall {
-                    id: "call_1".to_string(),
-                    kind: ToolCallKind::FunctionCall,
-                    name: Some("echo".to_string()),
-                    arguments: Some("{}".to_string()),
-                }],
+                tool_calls: vec![
+                    ToolCall {
+                        id: "call_1".to_string(),
+                        kind: ToolCallKind::FunctionCall,
+                        name: Some("echo".to_string()),
+                        arguments: Some("{}".to_string()),
+                    },
+                    ToolCall {
+                        id: "call_2".to_string(),
+                        kind: ToolCallKind::FunctionCall,
+                        name: Some("echo".to_string()),
+                        arguments: Some("{}".to_string()),
+                    },
+                ],
             },
             LlmResponse {
                 id: Some("r2".to_string()),
@@ -707,6 +756,7 @@ mod tests {
                 SessionItem::Reasoning { .. } => "reasoning",
                 SessionItem::ToolCall(_) => "tool_call",
                 SessionItem::ToolCallOutput { .. } => "tool_call_output",
+                SessionItem::Wait { .. } => "wait",
             })
             .collect();
         assert_eq!(
@@ -715,13 +765,16 @@ mod tests {
                 "message",
                 "message",
                 "tool_call",
+                "tool_call",
                 "tool_call_output",
-                "message"
+                "tool_call_output",
+                "message",
             ]
         );
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.len(), 2);
         assert!(seen[0].starts_with("bob|Some(\"req_9\")"));
+        assert!(seen[1].starts_with("bob|Some(\"req_9\")"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -755,6 +808,7 @@ mod tests {
                 SessionItem::Reasoning { .. } => "reasoning",
                 SessionItem::ToolCall(_) => "tool_call",
                 SessionItem::ToolCallOutput { .. } => "tool_call_output",
+                SessionItem::Wait { .. } => "wait",
             })
             .collect();
         assert_eq!(kinds, vec!["message", "message", "tool_call", "message"]);
@@ -918,6 +972,105 @@ mod tests {
         assert!(!outputs[0].contains("unknown property"));
         assert_eq!(outputs[1], "tool result");
         assert_eq!(seen.lock().unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn wait_call_rolls_back_turn_and_persists_marker() {
+        let root = temp_root("wait");
+        // The mock is called exactly once: a successful wait ends the turn
+        // immediately, so no follow-up request may be issued.
+        let llm = Arc::new(MockLlm::new(vec![LlmResponse {
+            id: Some("r1".to_string()),
+            content: None,
+            reasoning: Some("is this message complete?".to_string()),
+            tool_calls: vec![ToolCall {
+                id: "call_w".to_string(),
+                kind: ToolCallKind::FunctionCall,
+                name: Some("wait".to_string()),
+                arguments: Some(
+                    r#"{"seconds":10,"reason":"message incomplete"}"#.to_string(),
+                ),
+            }],
+        }]));
+        let manager = Arc::new(ConversationManager::new());
+        let tools = Arc::new(ToolRegistry::new());
+        struct WaitStub;
+        #[async_trait]
+        impl Tool for WaitStub {
+            fn name(&self) -> &str {
+                "wait"
+            }
+            fn description(&self) -> &str {
+                "wait tool"
+            }
+            fn parameters(&self) -> ToolParams {
+                let mut props = HashMap::new();
+                props.insert(
+                    "seconds".to_string(),
+                    PropertyDef {
+                        prop_type: "integer".to_string(),
+                        description: String::new(),
+                        r#enum: vec![],
+                    },
+                );
+                props.insert(
+                    "reason".to_string(),
+                    PropertyDef {
+                        prop_type: "string".to_string(),
+                        description: String::new(),
+                        r#enum: vec![],
+                    },
+                );
+                ToolParams::object(props, vec![])
+            }
+            async fn run(
+                &self,
+                _args: HashMap<String, Value>,
+                _ctx: ToolContext,
+            ) -> Result<String> {
+                Ok("ok".to_string())
+            }
+        }
+        tools.register(Arc::new(WaitStub)).unwrap();
+
+        let sm = Arc::new(
+            SqliteSessionManager::with_llm(
+                &root,
+                "bob".to_string(),
+                "system".to_string(),
+                "persona context".to_string(),
+                String::new(),
+                String::new(),
+                tools,
+                manager.clone(),
+                Arc::new(PermissionRegistry::new()),
+                llm,
+            )
+            .unwrap(),
+        );
+
+        let s = sm.create().await.unwrap();
+        s.send("你".to_string(), None).await.unwrap();
+
+        let history = s.raw_history().await.unwrap();
+        // Context + user message + wait marker only: the turn's reasoning,
+        // tool call and output were rolled back.
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history[1].1,
+            SessionItem::Message {
+                role: MessageRole::User,
+                content: "你".to_string(),
+            }
+        );
+        assert_eq!(
+            history[2].1,
+            SessionItem::Wait {
+                arguments: r#"{"seconds":10,"reason":"message incomplete"}"#.to_string(),
+            }
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

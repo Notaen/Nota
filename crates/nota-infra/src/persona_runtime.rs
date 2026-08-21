@@ -23,6 +23,8 @@ use nota_core::session::{Session, SessionManager};
 // restore them with `deliver_assistant_reply` if it is ever re-enabled.
 use serde::{Deserialize, Serialize};
 
+use crate::wait::{WAIT_TIMEOUT_SENDER, WaitHub};
+
 /// Builds the session manager for one conversation (rooted at the
 /// conversation's directory, with the conversation's tool set). Injected by
 /// the composition root — `nota-infra` itself never references the llm crate.
@@ -41,6 +43,7 @@ pub struct PersonaRuntime {
     policy: Arc<PathPolicy>,
     conversations_root: PathBuf,
     managers: Mutex<HashMap<String, Arc<dyn SessionManager>>>,
+    waits: Arc<WaitHub>,
 }
 
 impl PersonaRuntime {
@@ -50,6 +53,7 @@ impl PersonaRuntime {
         manager: Arc<ConversationManager>,
         policy: Arc<PathPolicy>,
         conversations_root: PathBuf,
+        waits: Arc<WaitHub>,
     ) -> Self {
         Self {
             persona,
@@ -58,6 +62,7 @@ impl PersonaRuntime {
             policy,
             conversations_root,
             managers: Mutex::new(HashMap::new()),
+            waits,
         }
     }
 
@@ -153,6 +158,14 @@ impl PersonaRuntime {
                 None => break,
             };
             let conversation_id = msg.conversation.conversation_id.clone();
+
+            // A real inbound message cancels the conversation's pending wait
+            // and resets its consecutive-wait budget; timeout notices are
+            // internal (`sender = "wait_timeout"`) and must not.
+            if msg.sender != WAIT_TIMEOUT_SENDER {
+                self.waits
+                    .cancel(&msg.conversation.persona, &conversation_id);
+            }
 
             // Slash commands are handled here, before anything reaches the
             // session: `//clear` archives the current session and starts a

@@ -31,7 +31,7 @@ use nota_llm::{LlmConfig, SqliteSessionManager};
 use nota_onebot::{OneBotBridge, OnebotConfig, register_onebot_tools};
 use nota_infra::{
     ApiState, AppContext, ConfigStore, FilePersonaStore, ManagerFactory, PersonaRuntime,
-    TokioScheduler, http_serve, register_builtin_tools, register_chat_tools,
+    TokioScheduler, WaitHub, http_serve, register_builtin_tools, register_chat_tools,
 };
 
 mod config_wizard;
@@ -70,7 +70,9 @@ const PERSONA_FILES: &[&str] = &[SOLO_FILENAME, MEMORY_FILENAME];
 /// persona content is injected per-session as context (role `Context`).
 const SYSTEM_PROMPT: &str = "You are Nota, an AI agent. Chat like a real \
     person rather than an assistant — natural, concise, honest — and follow \
-    the persona and memory injected as context.";
+    the persona and memory injected as context. Messages may arrive in \
+    pieces: judge whether the meaning is complete before replying, and use \
+    the wait tool when a message looks incomplete instead of guessing.";
 
 impl FormatTime for ChronoLocalTimer {
     fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
@@ -207,6 +209,7 @@ async fn run_server(
     let persona_store: Arc<dyn PersonaStore> = Arc::new(FilePersonaStore::new(base));
     let manager = Arc::new(ConversationManager::new());
     let scheduler: Arc<dyn Scheduler> = Arc::new(TokioScheduler::new(manager.clone()));
+    let waits = Arc::new(WaitHub::new(manager.clone()));
 
     // One conversation = one session manager, rooted at the conversation's
     // directory, with a tool set that includes that conversation's `reply`
@@ -234,6 +237,7 @@ async fn run_server(
             permissions.clone(),
             scheduler.clone(),
             path_policy.clone(),
+            waits.clone(),
             LlmConfig {
                 api_url: config.api_url.clone(),
                 api_key: config.api_key.clone(),
@@ -249,6 +253,7 @@ async fn run_server(
             manager.clone(),
             path_policy.clone(),
             conversations_root,
+            waits.clone(),
         ));
         persona_runtimes.insert(name.clone(), runtime.clone());
 
@@ -316,6 +321,7 @@ fn build_manager_factory(
     permissions: Arc<PermissionRegistry>,
     scheduler: Arc<dyn Scheduler>,
     policy: Arc<PathPolicy>,
+    waits: Arc<WaitHub>,
     config: LlmConfig,
     onebot_registrar: ToolRegistrarSlot,
 ) -> Result<ManagerFactory> {
@@ -326,6 +332,7 @@ fn build_manager_factory(
     let permissions = permissions.clone();
     let scheduler = scheduler.clone();
     let policy = policy.clone();
+    let waits = waits.clone();
     let config = config.clone();
     let onebot_registrar = onebot_registrar.clone();
     Ok(Arc::new(move |conversation_id: &str| -> Result<Arc<dyn SessionManager>> {
@@ -341,7 +348,7 @@ fn build_manager_factory(
         if let Some(registrar) = onebot_registrar.lock().unwrap().clone() {
             registrar(&tools, Some(conversation_id.to_string()))?;
         }
-        register_chat_tools(&tools, conversation_id)?;
+        register_chat_tools(&tools, conversation_id, waits.clone())?;
         Ok(Arc::new(SqliteSessionManager::new(
             &root,
             persona.clone(),

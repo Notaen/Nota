@@ -261,6 +261,9 @@ fn print_transcript(history: &[(i64, SessionItem)]) {
             SessionItem::ToolCallOutput { call_id, output } => {
                 println!("[{row}] tool_result[{call_id}]: {output}");
             }
+            SessionItem::Wait { arguments } => {
+                println!("[{row}] wait: {arguments}");
+            }
         }
     }
 }

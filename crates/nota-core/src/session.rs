@@ -95,6 +95,37 @@ impl<'de> Deserialize<'de> for ToolCallKind {
     }
 }
 
+/// The storage type code of each [`SessionItem`] variant. Stored as a plain
+/// number (`0` reserved, `1` message, `2` reasoning, `3` tool_call,
+/// `4` tool_call_output, `5` wait) like [`MessageRole`] / [`ToolCallKind`],
+/// so the storage shape is stable and cheap to extend. `SessionItem`
+/// variants carry data, so they cannot carry discriminants themselves — the
+/// mapping lives here, next to the enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SessionItemType {
+    Message = 1,
+    Reasoning = 2,
+    ToolCall = 3,
+    ToolCallOutput = 4,
+    Wait = 5,
+}
+
+impl TryFrom<i64> for SessionItemType {
+    type Error = anyhow::Error;
+
+    fn try_from(n: i64) -> Result<Self, Self::Error> {
+        match n {
+            1 => Ok(SessionItemType::Message),
+            2 => Ok(SessionItemType::Reasoning),
+            3 => Ok(SessionItemType::ToolCall),
+            4 => Ok(SessionItemType::ToolCallOutput),
+            5 => Ok(SessionItemType::Wait),
+            _ => Err(anyhow::anyhow!("invalid session item type: {n}")),
+        }
+    }
+}
+
 /// A tool call requested by the model. Fields are per-kind: function calls
 /// carry `name` / `arguments`; built-in calls such as `web_search` carry
 /// the call id and, when the provider returns one, the search query as
@@ -127,6 +158,26 @@ pub enum SessionItem {
         call_id: String,
         output: String,
     },
+    /// A wait marker: the model asked to hold the conversation open (via the
+    /// `wait` tool) because a message looked incomplete. Stored as a trace
+    /// (`arguments` holds the tool's raw arguments) but **never sent to the
+    /// LLM** — the turn it belongs to is rolled back to just the user message.
+    Wait {
+        arguments: String,
+    },
+}
+
+impl SessionItem {
+    /// The storage type code of this item.
+    pub fn item_type(&self) -> SessionItemType {
+        match self {
+            SessionItem::Message { .. } => SessionItemType::Message,
+            SessionItem::Reasoning { .. } => SessionItemType::Reasoning,
+            SessionItem::ToolCall(_) => SessionItemType::ToolCall,
+            SessionItem::ToolCallOutput { .. } => SessionItemType::ToolCallOutput,
+            SessionItem::Wait { .. } => SessionItemType::Wait,
+        }
+    }
 }
 
 /// One LLM-level dialogue. The caller's only interaction is feeding new

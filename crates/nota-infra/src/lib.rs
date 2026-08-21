@@ -12,6 +12,7 @@ pub mod persona_runtime;
 pub mod persona_store;
 pub mod scheduler;
 pub mod tool;
+pub mod wait;
 
 pub use config::{
     Config, ConfigStore, OnebotConfig,
@@ -24,3 +25,4 @@ pub use persona_runtime::{ManagerFactory, PersonaRuntime};
 pub use persona_store::FilePersonaStore;
 pub use scheduler::TokioScheduler;
 pub use tool::{builtin::register_builtin_tools, chat::register_chat_tools};
+pub use wait::{DEFAULT_WAIT_SECONDS, MAX_CONSECUTIVE_WAITS, WaitHub};

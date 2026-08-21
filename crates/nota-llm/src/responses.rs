@@ -406,8 +406,9 @@ fn wire_role(role: MessageRole) -> Option<&'static str> {
 }
 
 /// Map session items one-to-one onto Responses API input items. The turn
-/// loop already emits each `function_call` immediately followed by its
-/// `function_call_output`, satisfying DeepSeek's strict adjacency rule.
+/// loop already groups a response's `function_call`s before their
+/// `function_call_output`s, mirroring the provider's output order so the
+/// single preceding reasoning item covers the whole tool-call turn.
 fn to_responses_input(items: &[SessionItem]) -> Vec<ResponsesInputItem> {
     items
         .iter()
@@ -465,6 +466,9 @@ fn to_responses_input(items: &[SessionItem]) -> Vec<ResponsesInputItem> {
                     output: output.clone(),
                 })
             }
+            // Wait markers are a local trace only: never re-sent to the LLM.
+            // The turn that produced one was rolled back to the user message.
+            SessionItem::Wait { .. } => None,
         })
         .collect()
 }
@@ -496,27 +500,31 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_keeps_call_and_output_pairing() {
-        // This is exactly the order the turn loop emits: each function_call
-        // is immediately followed by its function_call_output.
+    fn responses_input_groups_calls_before_outputs() {
+        // This is exactly the order the turn loop emits: a response's
+        // function_calls are persisted before their function_call_outputs,
+        // so one reasoning item covers every call of the turn.
         let items = vec![
             msg(MessageRole::User, "hi"),
+            SessionItem::Reasoning {
+                content: "think".to_string(),
+            },
             SessionItem::ToolCall(ToolCall {
                 id: "call_A".to_string(),
                 kind: ToolCallKind::FunctionCall,
                 name: Some("foo".to_string()),
                 arguments: Some("{}".to_string()),
             }),
-            SessionItem::ToolCallOutput {
-                call_id: "call_A".to_string(),
-                output: "result A".to_string(),
-            },
             SessionItem::ToolCall(ToolCall {
                 id: "call_B".to_string(),
                 kind: ToolCallKind::FunctionCall,
                 name: Some("bar".to_string()),
                 arguments: Some("{}".to_string()),
             }),
+            SessionItem::ToolCallOutput {
+                call_id: "call_A".to_string(),
+                output: "result A".to_string(),
+            },
             SessionItem::ToolCallOutput {
                 call_id: "call_B".to_string(),
                 output: "result B".to_string(),
@@ -535,22 +543,24 @@ mod tests {
             })
             .collect();
 
-        // Each function_call_output must directly follow its function_call.
+        // All calls come first, then their outputs, in the provider's own
+        // response order.
         assert_eq!(
             types,
             vec![
                 "message",
+                "reasoning",
+                "function_call",
                 "function_call",
                 "function_call_output",
-                "function_call",
                 "function_call_output",
             ]
         );
 
-        // Each output carries the call id of the call directly before it.
-        assert_eq!(wire.len(), 5);
+        // Each output carries the call id of the call it answers.
+        assert_eq!(wire.len(), 6);
         assert_eq!(
-            wire[1],
+            wire[2],
             ResponsesInputItem::FunctionCall {
                 call_id: "call_A".to_string(),
                 name: "foo".to_string(),
@@ -558,7 +568,7 @@ mod tests {
             }
         );
         assert_eq!(
-            wire[2],
+            wire[4],
             ResponsesInputItem::FunctionCallOutput {
                 call_id: "call_A".to_string(),
                 output: "result A".to_string(),
@@ -932,5 +942,20 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn wait_markers_are_never_sent_to_the_llm() {
+        let wire = to_responses_input(&[
+            SessionItem::Message {
+                role: MessageRole::User,
+                content: "你".to_string(),
+            },
+            SessionItem::Wait {
+                arguments: r#"{"seconds":10}"#.to_string(),
+            },
+        ]);
+        assert_eq!(wire.len(), 1);
+        assert!(matches!(wire[0], ResponsesInputItem::Message { .. }));
     }
 }
