@@ -1,9 +1,10 @@
 # LLM sessions & storage
 
-Agent-facing deep dive. The canonical system description lives in
-`CONTRIBUTING.md` (Terminology, LLM sessions & caching); this file holds the
-wire/storage-level details agents need before touching `nota-llm`, sessions,
-or the SQLite store.
+Topic file for `nota-llm` sessions, storage, and the turn loop — including
+the delivery model (how the turn's final assistant text reaches a chat).
+Overview and terminology: `CONTRIBUTING.md` → Terminology / LLM sessions &
+caching. Facts belonging to another area (tools, OneBot) live in their own
+topic files and are not restated here.
 
 ## Session abstraction
 
@@ -26,8 +27,9 @@ or the SQLite store.
   the root. Which session is current is a caller concern (`current.json`,
   written by `PersonaRuntime`; `//clear` archives and starts fresh).
 - `Session::send(content, request_id)` runs the whole turn internally and
-  returns nothing: delivery happens through tools and through
-  `PersonaRuntime`'s auto-delivery of the final assistant text.
+  returns nothing. The final assistant text is persisted in the session; it
+  reaches a chat only when an explicit send tool is called (see Turn loop,
+  step 7).
 
 ## Turn loop (`SqliteSession::run_turn`)
 
@@ -41,18 +43,33 @@ or the SQLite store.
 4. Persist `reasoning` items verbatim — even empty ones: DeepSeek thinking
    mode requires every prior `reasoning_text` to be echoed.
 5. For each `tool_call`:
+   - Persist **all** `tool_call`s of the response first, then run each tool
+     and persist its `tool_call_output`. Grouping mirrors the provider's
+     output order (reasoning, all calls, all outputs): DeepSeek reconstructs
+     each input `function_call` as its own assistant turn, so interleaving
+     outputs between calls leaves every call after the first without a
+     preceding reasoning item and triggers the "reasoning_text … must be
+     passed back" 400.
    - `function_call`: validate arguments against the tool's `parameters`
      (see Tool args below), execute the tool with a per-session
-     `ToolContext`, and persist the `tool_call` immediately followed by its
-     `tool_call_output` (DeepSeek requires each output to directly follow
-     its call).
+     `ToolContext`, and persist the `tool_call_output`.
    - `web_search_call`: persist the call only — the provider executes the
      search server-side, so no output item is produced.
+   - `wait` (the reserved conversation-layer tool): a **successful** call is
+     special — the turn deletes every item row appended since the turn
+     started (reasoning, tool calls, outputs), re-appends the user message
+     plus a `Wait` marker item, saves the response id, and ends the turn
+     immediately: no assistant text, no further iterations. A **rejected**
+     call (see `.agent/tool.md` for the consecutive-wait budget) is a normal
+     `function_call` error pair and the loop continues.
 6. Only a locally executed `function_call` continues the loop (max
    `MAX_ITERATIONS = 16`). A response with only built-in calls
    (`web_search`, …) uses its final text and ends the turn.
-7. The final assistant `Message` item is persisted; the conversation layer
-   delivers it into the chat.
+7. The final assistant `Message` item is persisted. The turn's final
+   assistant text is **never auto-delivered**: it reaches a chat only
+   through explicit send tools — `reply` (current conversation) and adapter
+   sends such as `onebot_send_msg` (other chats). There is no `skip_reply`:
+   staying silent means producing no assistant text.
 
 ## Storage (`nota-llm::store`)
 
@@ -67,10 +84,12 @@ One SQLite file per session (`rusqlite` bundled). Tables:
   output TEXT, timestamp INTEGER NOT NULL)`.
 
 `type` (numeric, `0` reserved): `1` message, `2` reasoning, `3` tool_call,
-`4` tool_call_output. `role` (numeric): `0` reserved, `1` user,
+`4` tool_call_output, `5` wait. `role` (numeric): `0` reserved, `1` user,
 `2` assistant, `3` context — the system prompt is never stored.
 `kind` for tool calls: `1` function_call, `2` web_search_call. Per-kind
-payload columns are used; the rest stay `NULL`.
+payload columns are used; the rest stay `NULL`. A `wait` row (`type = 5`)
+keeps the tool's raw `arguments` (seconds/reason) as a trace; it is never
+sent to the LLM.
 
 ## Responses API wire details
 
@@ -90,6 +109,8 @@ payload columns are used; the rest stay `NULL`.
     — DeepSeek restores the server-side search results from the id, so
     follow-up turns keep the search context;
   - `function_call_output` → `function_call_output` input item.
+  - `wait` marker items are **skipped** — they are a local trace only and
+    never reach the provider.
 - Output parsing:
   - `message` content parts → reply text;
   - `function_call` → `ToolCall` (kind `function_call`) via `call_id`
@@ -100,10 +121,8 @@ payload columns are used; the rest stay `NULL`.
     the only content the provider returns; results are injected into the
     model context and DeepSeek ignores `include`);
   - unknown items are ignored.
-- DeepSeek is stateless: cost savings come from its automatic prefix cache,
-  so the request prefix must stay byte-identical between turns (stored
-  history order, tool list sorted by name, fixed `instructions`, `Context`
-  items first). Cache hit/miss tokens are logged at DEBUG.
+- DeepSeek prefix-cache requirements: `CONTRIBUTING.md` → LLM sessions &
+  caching / Hard rules #12. Cache hit/miss tokens are logged at DEBUG.
 
 ## Tool args contract
 

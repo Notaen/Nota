@@ -9,14 +9,11 @@ normal usage see [README.md](README.md) (English) or
 - `README.md` — English, end-user focused.
 - `README.zh.md` — Chinese, end-user focused (kept in sync with `README.md`).
 - `CONTRIBUTING.md` — English, developer focused (the system reference).
-- `AGENTS.md` / `.agent/*` — English, for AI coding assistants.
 
-One fact lives in exactly one doc: this file is the canonical system
-reference, and `.agent` holds agent-facing depth and history by topic
-(`session.md`, `tool.md`, `onebot.md`, `decision.md`). When changing docs,
-list the repo root first (`Get-ChildItem -Force`) and keep each file in its
-language and audience. Do not put architecture details in the READMEs —
-they belong here or in the `.agent` topic files.
+This file is the canonical system reference. Keep each file in its language
+and audience; do not duplicate facts across files. When changing docs, list
+the repo root first. Do not put architecture
+details in the READMEs — they belong here.
 
 ## Build & verify
 
@@ -91,10 +88,15 @@ turn: resolve the conversation's current session via the core
 `SessionManager` (creating one on first contact) → `session.send(display,
 request_id)`. The session — inside `nota-llm` — appends the user item, runs
 the LLM + tool loop with the system prompt and tool registry it was created
-with, and persists the result. The turn's final assistant text is then
-delivered directly into the current conversation; `reply` (current
-conversation) and adapter send tools such as `onebot_send_msg` (other
-chats) remain for explicit or intermediate sends. There is no `skip_reply`.
+with, and persists the result.
+
+The model can hold a conversation open instead of replying when a message
+looks incomplete: the `wait` tool ends the turn immediately, keeps only the
+user message in context, and arms a per-conversation timer (up to 3 waits in
+a row). A subsequent real message cancels the timer and starts a fresh turn,
+so the model answers knowing the utterance arrived in pieces; if the wait
+expires, a `[等待超时]` notice is delivered into the conversation and the
+model decides whether to ask (e.g. "？"), wait again, or stay silent.
 
 Slash commands are intercepted by `PersonaRuntime` before anything reaches the
 session: `//clear` archives the current session via the manager and creates a
@@ -125,15 +127,13 @@ role; persona `Context` items are emitted as `system` input messages).
 Session dialogue rows live in an `item` table whose `type` is also a plain
 number (`1` message, `2` reasoning, `3` tool_call, `4` tool_call_output;
 `tool_call.kind` distinguishes `function_call` / `web_search_call`), and
-`meta.version` stores the writer's program version for future conversions.
+`meta.version` stores the writer's program version for future conversions;
+`type = 5` is a local `wait` marker kept as a trace but never sent to the
+LLM.
 DeepSeek's Responses endpoint is stateless, so cost savings rely on its
 automatic prefix cache: keep the request prefix byte-identical (stored
 history order, tool list sorted by name). Cache hit/miss tokens are logged
 at DEBUG.
-
-Wire/storage-level details (Responses input/output shapes, the `item` table
-schema, `web_search` handling, tool args validation, the debug CLI): see
-`.agent/session.md`.
 
 ### Tool system
 
@@ -141,22 +141,19 @@ The tool contract lives in `nota-core`: `Tool` / `ToolContext` /
 `ToolParams` / `PropertyDef` and a concrete in-memory `ToolRegistry` (no
 trait/impl split). Tools are resolved **live** from the registry on every
 call; `register` fails on a duplicate name so startup aborts instead of
-silently shadowing. Built-ins (`file_read` / `file_write` / `schedule` /
-`status`), the conversation-bound `reply` tool, naming, and registration
-rules: see `.agent/tool.md`.
+silently shadowing.
 
 ### OneBot 11
 
 Forward-WebSocket adapter in `nota-onebot` (`mode = "ws"`, default
-`ws://127.0.0.1:3001`; Bearer auth). Config, allowlist, message rendering,
-the `onebot_*` tools, and verified NapCat quirks: see `.agent/onebot.md`.
+`ws://127.0.0.1:3001`; Bearer auth).
 
 ### Wizard & config
 
 `Config` (TOML): `api_url`, `api_key`, `model`, `web_search`, `[onebot]`.
 Provider defaults come from `crates/nota-infra/assets/providers.toml`
 (`include_str!`, used only by the wizard). Secrets use masked input
-(`prompt_masked`, one `*` per char — history in `.agent/decision.md`).
+(`prompt_masked`, one `*` per char).
 `nota onboard` runs the wizard standalone; plain `nota` starts the server
 (auto-wizard if config missing). Missing/corrupt config or zero personas
 fail fast with guidance — things are never auto-created.
@@ -309,37 +306,31 @@ rule.
    features. Adding a version locally lets crates drift apart and duplicate
    the same dependency in the lockfile.
 6. **Tool names are namespaced** — runtime/built-in names (`file_read`,
-   `file_write`, `schedule`, `status`, `reply`) are reserved;
+   `file_write`, `schedule`, `status`, `reply`, `wait`) are reserved;
    adapter tool families use a prefix (the OneBot family is `onebot_*`).
    `ToolRegistry::register` **fails** on a duplicate name and every
    registration site propagates that error, so a conflict stops startup
    instead of silently shadowing the earlier tool.
-7. **Auto-delivered final answer** — the turn's final assistant text is
-   delivered directly into the current conversation by `PersonaRuntime`;
-   `reply` (current conversation) and adapter send tools such as
-   `onebot_send_msg` (other chats) remain for explicit or intermediate
-   sends. There is no `skip_reply`: staying silent means the turn produces
-   no assistant text.
-8. **Logging boundary** — core/llm/infra use the `log::*` facade; only
+7. **Logging boundary** — core/llm/infra use the `log::*` facade; only
    `nota-cli` uses `tracing`, bridged via `tracing-log::LogTracer`.
    Third-party transport noise (e.g. h2 frames) is filtered with tracing's
    built-in `Targets` — hand-rolled `Filter` impls do NOT gate events in
    this setup (verified with a unit test).
-9. **Async blocking** — never call `blocking_*` on a tokio `RwLock` from
+8. **Async blocking** — never call `blocking_*` on a tokio `RwLock` from
    inside an async context; use `.read().await` / `.write().await`.
    `blocking_*` panics the runtime.
-10. **WS ↔ conversation isolation** — the WS handler filters events by its
+9. **WS ↔ conversation isolation** — the WS handler filters events by its
     own `conversation_id`; mismatched events are silently dropped, so
     multiple clients never leak each other's messages.
-11. **No auto-created default persona** — personas are never silently
+10. **No auto-created default persona** — personas are never silently
     created or auto-jumped. Missing/corrupt `config.toml` → error "run
     `nota onboard`"; zero personas → "run `nota persona create` /
     `nota onboard`".
-12. **NapCat drops client pings** — NapCat (and likely other OneBot
+11. **NapCat drops client pings** — NapCat (and likely other OneBot
     implementations) resets the WebSocket connection when the *client*
     sends an unsolicited Ping; the OneBot WS client only pongs the server's
     pings. Verified end-to-end with NapCat on 2026-08-13.
-13. **Byte-identical request prefix** — DeepSeek's Responses endpoint is
+12. **Byte-identical request prefix** — DeepSeek's Responses endpoint is
     stateless; cost savings come from its automatic prefix cache. Keep the
     prefix byte-identical between turns: stored history order, tool list
     sorted by name, fixed `instructions`, `Context` items first.
@@ -347,6 +338,3 @@ rule.
 ## See also
 
 - [README.md](README.md) / [README.zh.md](README.zh.md) — end-user docs
-- `AGENTS.md` — AI assistant entry point
-- `.agent/session.md` / `.agent/tool.md` / `.agent/onebot.md` /
-  `.agent/decision.md` — agent-facing depth & design history

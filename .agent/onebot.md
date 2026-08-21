@@ -1,8 +1,9 @@
 # OneBot 11 adapter
 
-Agent-facing deep dive. The canonical system description lives in
+Agent-facing deep dive. Current behavior is described only in
 `CONTRIBUTING.md` (Runtime model, HTTP API); this file holds the adapter
-details agents need before touching `nota-onebot`.
+details agents need before touching `nota-onebot`, and points back to the
+canonical sections instead of restating them.
 
 ## Config (`[onebot]` in `config.toml`)
 
@@ -17,9 +18,7 @@ first persona found), `prefix` (only answer messages starting with this),
 - Inbound: message → targeted persona inbox carrying the `Conversation`
   (`onebot_private_<id>` / `onebot_group_<id>`).
 - Outbound: `reply` / `onebot_send_msg` → `route_outbound` → the adapter
-  bridge enforces the allowlist and chunks sends at 4000 chars. The turn's
-  final assistant text is auto-routed by `PersonaRuntime` through the same
-  path.
+  bridge enforces the allowlist and chunks sends at 4000 chars.
 - Allowlist: only `friend_ids` / `group_ids` reach the persona or get
   replies; an empty list means nobody in that category. Outbound to a
   non-allowlisted target triggers a permission oneshot answered in the

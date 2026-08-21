@@ -18,7 +18,9 @@ use anyhow::Result;
 use nota_core::conversation::{Conversation, ConversationManager};
 use nota_core::permissions::PathPolicy;
 use nota_core::persona::Persona;
-use nota_core::session::{MessageRole, Session, SessionItem, SessionManager};
+use nota_core::session::{Session, SessionManager};
+// `MessageRole` / `SessionItem` were only used by the auto-delivery feature;
+// restore them with `deliver_assistant_reply` if it is ever re-enabled.
 use serde::{Deserialize, Serialize};
 
 /// Builds the session manager for one conversation (rooted at the
@@ -170,19 +172,25 @@ impl PersonaRuntime {
                 }
             };
 
-            // Snapshot the history length before the turn so the assistant
-            // text this turn produces can be delivered afterwards without
-            // re-delivering earlier messages.
-            let history_before = match session.raw_history().await {
-                Ok(history) => Some(history.len()),
-                Err(e) => {
-                    log::warn!(
-                        "failed to snapshot history before turn for conversation \
-                         '{conversation_id}': {e:#}"
-                    );
-                    None
-                }
-            };
+            // Auto-delivery of the final assistant text is disabled
+            // (2026-08-20): the turn's answer reaches the user only through
+            // explicit send tools (`reply`, adapter sends). The snapshot and
+            // the `deliver_assistant_reply` call below are kept in comments
+            // and can be restored if the feature ever returns.
+            //
+            // // Snapshot the history length before the turn so the assistant
+            // // text this turn produces can be delivered afterwards without
+            // // re-delivering earlier messages.
+            // let history_before = match session.raw_history().await {
+            //     Ok(history) => Some(history.len()),
+            //     Err(e) => {
+            //         log::warn!(
+            //             "failed to snapshot history before turn for conversation \
+            //              '{conversation_id}': {e:#}"
+            //         );
+            //         None
+            //     }
+            // };
 
             let display = format!("{}{}", msg.prefix, msg.content);
             if let Err(e) = session.send(display, msg.request_id.clone()).await {
@@ -190,61 +198,61 @@ impl PersonaRuntime {
                 continue;
             }
 
-            // Directly deliver the LLM's answer into the conversation. The
-            // explicit send tools (`reply`, adapter sends) are untouched;
-            // this only forwards the final assistant text of the turn.
-            if let Some(before) = history_before {
-                self.deliver_assistant_reply(
-                    session.as_ref(),
-                    &conversation_id,
-                    before,
-                    msg.request_id,
-                )
-                .await;
-            }
+            // // Directly deliver the LLM's answer into the conversation. The
+            // // explicit send tools (`reply`, adapter sends) are untouched;
+            // // this only forwards the final assistant text of the turn.
+            // if let Some(before) = history_before {
+            //     self.deliver_assistant_reply(
+            //         session.as_ref(),
+            //         &conversation_id,
+            //         before,
+            //         msg.request_id,
+            //     )
+            //     .await;
+            // }
         }
     }
 
-    /// Deliver the assistant text a turn produced directly into its
-    /// conversation. Only items appended after `before` (the history length
-    /// at turn start) are considered, so earlier assistant messages are
-    /// never re-delivered; empty text is skipped (staying silent means
-    /// producing no text at all).
-    async fn deliver_assistant_reply(
-        &self,
-        session: &dyn Session,
-        conversation_id: &str,
-        before: usize,
-        request_id: Option<String>,
-    ) {
-        let history = match session.raw_history().await {
-            Ok(history) => history,
-            Err(e) => {
-                log::warn!(
-                    "failed to read history after turn for conversation \
-                     '{conversation_id}': {e:#}"
-                );
-                return;
-            }
-        };
-        for (_, item) in history.into_iter().skip(before) {
-            if let SessionItem::Message {
-                role: MessageRole::Assistant,
-                content,
-            } = item
-                && !content.trim().is_empty()
-            {
-                self.manager
-                    .route_outbound(
-                        Some(conversation_id),
-                        None,
-                        &content,
-                        request_id.clone(),
-                    )
-                    .await;
-            }
-        }
-    }
+    // /// Deliver the assistant text a turn produced directly into its
+    // /// conversation. Only items appended after `before` (the history length
+    // /// at turn start) are considered, so earlier assistant messages are
+    // /// never re-delivered; empty text is skipped (staying silent means
+    // /// producing no text at all).
+    // async fn deliver_assistant_reply(
+    //     &self,
+    //     session: &dyn Session,
+    //     conversation_id: &str,
+    //     before: usize,
+    //     request_id: Option<String>,
+    // ) {
+    //     let history = match session.raw_history().await {
+    //         Ok(history) => history,
+    //         Err(e) => {
+    //             log::warn!(
+    //                 "failed to read history after turn for conversation \
+    //                  '{conversation_id}': {e:#}"
+    //             );
+    //             return;
+    //         }
+    //     };
+    //     for (_, item) in history.into_iter().skip(before) {
+    //         if let SessionItem::Message {
+    //             role: MessageRole::Assistant,
+    //             content,
+    //         } = item
+    //             && !content.trim().is_empty()
+    //         {
+    //             self.manager
+    //                 .route_outbound(
+    //                     Some(conversation_id),
+    //                     None,
+    //                     &content,
+    //                     request_id.clone(),
+    //                 )
+    //                 .await;
+    //         }
+    //     }
+    // }
 
     async fn run_command(&self, conversation: &Conversation, cmd: SlashCommand) {
         let conversation_id = conversation.conversation_id.clone();
@@ -311,130 +319,7 @@ fn parse_command(content: &str) -> Option<SlashCommand> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use nota_core::conversation::AdapterEvent;
-
-    struct MockSession {
-        id: String,
-        items: Vec<(i64, SessionItem)>,
-    }
-
-    #[async_trait]
-    impl Session for MockSession {
-        fn id(&self) -> &str {
-            &self.id
-        }
-
-        async fn created_at(&self) -> Result<i64> {
-            Ok(0)
-        }
-
-        async fn send(&self, _content: String, _request_id: Option<String>) -> Result<()> {
-            Ok(())
-        }
-
-        async fn raw_history(&self) -> Result<Vec<(i64, SessionItem)>> {
-            Ok(self.items.clone())
-        }
-    }
-
-    fn test_runtime() -> (Arc<PersonaRuntime>, Arc<ConversationManager>) {
-        let manager = Arc::new(ConversationManager::new());
-        let runtime = Arc::new(PersonaRuntime::new(
-            Persona {
-                name: "bob".to_string(),
-            },
-            Arc::new(|_: &str| -> Result<Arc<dyn SessionManager>> {
-                Err(anyhow::anyhow!("no session manager in this test"))
-            }),
-            manager.clone(),
-            Arc::new(PathPolicy::new()),
-            std::env::temp_dir().join(format!("nota_runtime_test_{}", std::process::id())),
-        ));
-        (runtime, manager)
-    }
-
-    #[tokio::test]
-    async fn delivers_turn_assistant_text_into_conversation() {
-        let (runtime, manager) = test_runtime();
-        let mut rx = manager.subscribe_adapter("web");
-
-        let session = Arc::new(MockSession {
-            id: "s1".to_string(),
-            items: vec![
-                (
-                    1,
-                    SessionItem::Message {
-                        role: MessageRole::User,
-                        content: "hi".to_string(),
-                    },
-                ),
-                (
-                    2,
-                    SessionItem::Message {
-                        role: MessageRole::Assistant,
-                        content: "hello back".to_string(),
-                    },
-                ),
-            ],
-        });
-
-        runtime
-            .deliver_assistant_reply(session.as_ref(), "web_1", 1, Some("req_1".to_string()))
-            .await;
-
-        let event = rx.recv().await.unwrap();
-        let AdapterEvent::Outbound(e) = event else {
-            panic!("expected outbound event");
-        };
-        assert_eq!(e.conversation_id.as_deref(), Some("web_1"));
-        assert_eq!(e.content, "hello back");
-        assert_eq!(e.request_id.as_deref(), Some("req_1"));
-    }
-
-    #[tokio::test]
-    async fn skips_old_and_empty_assistant_text() {
-        let (runtime, manager) = test_runtime();
-        let mut rx = manager.subscribe_adapter("web");
-
-        let session = Arc::new(MockSession {
-            id: "s1".to_string(),
-            items: vec![
-                (
-                    1,
-                    SessionItem::Message {
-                        role: MessageRole::User,
-                        content: "hi".to_string(),
-                    },
-                ),
-                (
-                    2,
-                    SessionItem::Message {
-                        role: MessageRole::Assistant,
-                        content: "old answer".to_string(),
-                    },
-                ),
-                (
-                    3,
-                    SessionItem::Message {
-                        role: MessageRole::Assistant,
-                        content: "   ".to_string(),
-                    },
-                ),
-            ],
-        });
-
-        // before = full history: nothing new to deliver.
-        runtime
-            .deliver_assistant_reply(session.as_ref(), "web_1", 3, None)
-            .await;
-        // before = 2: only the empty assistant item is new; it is skipped.
-        runtime
-            .deliver_assistant_reply(session.as_ref(), "web_1", 2, None)
-            .await;
-
-        // No outbound event should arrive for either call.
-        assert!(rx.try_recv().is_err());
-    }
+    // Auto-delivery tests (and their MockSession / test_runtime scaffolding)
+    // were commented out together with the feature on 2026-08-20; restore
+    // them with `deliver_assistant_reply` if it is ever re-enabled.
 }
